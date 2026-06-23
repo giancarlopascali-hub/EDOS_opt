@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EDOS | Experimental Design, Optimization & Statistics</title>
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+                <div class="banner-container">
+                    <img src="{{ url_for('static', filename='banner.png') }}" alt="EDOS Banner" class="app-banner">
+                    <div class="banner-overlay">
+                        <div class="banner-text-right">
+                            <h1 class="banner-title">EDOS</h1>
+                            <p class="banner-desc">EXPERIMENTAL DESIGN,<br>OPTIMIZATION AND STATISTICS</p>
+                            <p class="author-attribution">by Giancarlo Pascali</p>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem;">
+                    <div style="display: flex; gap: 0.5rem;">
+                        <a href="mailto:g.pascali@unsw.edu.au" class="btn secondary small">Report an Issue</a>
+                        <a href="/guide" target="_blank" class="btn secondary small">Quick Guide</a>
+                        <a href="https://github.com/giancarlopascali-hub/EDOS/releases" target="_blank" class="btn secondary small">Downloads / Releases</a>
+                    </div>
+                    <div style="display: flex; align-items: center;">
+                        <div class="module-switcher">
+                            <button class="module-btn active" data-module="doe">DoE</button>
+                            <button class="module-btn" data-module="bo">BO</button>
+                            <button class="module-btn" data-module="sa">SA</button>
+                        </div>
+                        <button id="shutdown-btn" class="btn secondary small"
+                            style="color: var(--danger-color); border-color: var(--danger-color); opacity: 0.7; margin-left: 1rem;">Shutdown</button>
+                    </div>
+                </div>
+        </header>
+
+        <!-- Common Data Upload (for BO and SA) -->
+        <section id="upload-section" class="card hidden">
+            <div id="drop-zone" class="drop-zone">
+                <p>Drag & Drop CSV file here or</p>
+                <label for="file-input" id="file-picker-label" class="btn secondary" style="cursor: pointer; display: inline-block;">Select File</label>
+                <input type="file" id="file-input" style="display: none;" accept=".csv">
+            </div>
+        </section>
+
+        <!-- Common Data Preview (Initially hidden, common for BO/SA) -->
+        <section id="data-section" class="card hidden">
+            <div class="card-header">
+                <h2 id="data-title">Loaded Data</h2>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button id="clear-data-btn" class="btn small" style="background-color: var(--danger-color); color: white; border-color: var(--danger-color);">Clear All Data</button>
+                    <button id="export-main-btn" class="btn small">Export CSV</button>
+                </div>
+            </div>
+            <div class="table-container">
+                <table id="main-table">
+                    <thead id="main-table-head"></thead>
+                    <tbody id="main-table-body"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- --- MODULE SEGMENTS --- -->
+
+        <!-- 1. DoE MODULE VIEW -->
+        <div id="doe-module" class="module-view">
+            <section class="card">
+                <h2>DoE Setup</h2>
+                <div class="setup-tabs">
+                    <button class="tab-btn active" data-tab="doe-features-tab">Features</button>
+                    <button class="tab-btn" data-tab="doe-objectives-tab">Objectives</button>
+                    <button class="tab-btn" data-tab="doe-tweaks-tab">DoE Tweaks</button>
+                </div>
+
+                <div id="doe-features-tab" class="tab-content">
+                    <table class="setup-table">
+                        <thead>
+                            <tr><th>Name</th><th>Type</th><th>Range / Values</th><th>Action</th></tr>
+                        </thead>
+                        <tbody id="doe-features-list"></tbody>
+                    </table>
+                    <button id="doe-add-feature-btn" class="btn secondary small" style="margin-top: 1rem;">+ Add Feature</button>
+
+                    <!-- Constraints Sub-section for DoE -->
+                    <details class="constraints-collapsible">
+                        <summary class="constraints-toggle">
+                            <span class="constraints-toggle-label">Constraints</span>
+                            <span class="constraints-chevron">&#8250;</span>
+                        </summary>
+                        <div class="constraints-body">
+                            <div style="margin-bottom: 1.5rem;">
+                                <h4 style="margin-bottom: 0.5rem; color: var(--text-secondary);">Numerical Constraints</h4>
+                                <p class="text-secondary" style="font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                    Select features to build an equation (e.g., A + B &lt;= 10). Features cannot be used more than once per equation.
+                                </p>
+                                <table class="setup-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Equation</th>
+                                            <th style="width: 250px;">Add Feature Helper</th>
+                                            <th style="width: 80px;">Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="doe-numerical-constraints-list"></tbody>
+                                </table>
+                                <button id="doe-add-num-constraint-btn" class="btn secondary small" style="margin-top: 0.5rem;" type="button">+ Add Numerical Constraint</button>
+                            </div>
+
+                            <div>
+                                <h4 style="margin-bottom: 0.5rem; color: var(--text-secondary);">Disallowed Combinations</h4>
+                                <p class="text-secondary" style="font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                    Exclude specific combinations of categorical feature values.
+                                </p>
+                                <table class="setup-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Forbidden Combination Definition</th>
+                                            <th style="width: 80px;">Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="doe-disallowed-constraints-list"></tbody>
+                                </table>
+                                <button id="doe-add-disallowed-constraint-btn" class="btn secondary small" style="margin-top: 0.5rem;" type="button">+ Add Disallowed Combination</button>
+                            </div>
+                        </div>
+                    </details>
+                </div>
+                <div id="doe-objectives-tab" class="tab-content hidden">
+                    <table class="setup-table">
+                        <thead>
+                            <tr><th>Name</th><th>Type</th><th>Target</th><th>Importance (%)</th><th>Action</th></tr>
+                        </thead>
+                        <tbody id="doe-objectives-list"></tbody>
+                    </table>
+                    <button id="doe-add-objective-btn" class="btn secondary small" style="margin-top: 1rem;">+ Add Objective</button>
+                </div>
+                <div id="doe-tweaks-tab" class="tab-content hidden">
+                    <div class="tweak-grid">
+                        <div class="tweak-item">
+                            <label>Model Type</label>
+                            <select id="doe-model-select">
+                                <option value="bbdesign">Box-Behnken</option>
+                                <option value="ccdesign">Central Composite</option>
+                                <option value="fracfact">Fractional Factorial</option>
+                                <option value="def_screening">Definitive Screening</option>
+                                <option value="lhs">Latin Hypercube Sampling (LHS)</option>
+                            </select>
+                        </div>
+                        <div class="tweak-item">
+                            <label>Max Experiments</label>
+                            <input type="number" id="doe-max-runs" value="50" min="1">
+                        </div>
+                    </div>
+                </div>
+            </section>
+            <div class="run-container">
+                <button id="doe-run-btn" class="btn primary x-large">Create table of experiments</button>
+            </div>
+            
+            <section id="doe-results-section" class="card hidden">
+                <div class="card-header">
+                    <h2>Suggested Experiments</h2>
+                    <button id="doe-export-btn" class="btn small">Export CSV</button>
+                </div>
+                <div id="doe-quality-dashboard" class="quality-dashboard hidden"></div>
+                <div class="table-container">
+                    <table id="doe-results-table">
+                        <thead id="doe-results-head"></thead>
+                        <tbody id="doe-results-body"></tbody>
+                    </table>
+                </div>
+                <!-- Selective CSV buttons -->
+                <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border-color);">
+                    <button id="doe-commit-suggestions-btn" class="btn success small">Add all to Main Dataset</button>
+                    <button id="doe-import-results-btn" class="btn small" style="background-color: var(--accent-light);">Import Results CSV</button>
+                    <input type="file" id="doe-import-results-input" style="display: none;" accept=".csv">
+                    <button id="doe-export-features-btn" class="btn small">Export Features CSV</button>
+                </div>
+            </section>
+        </div>
+
+        <!-- 2. BO MODULE VIEW (EDOS Optimization logic) -->
+        <div id="bo-module" class="module-view hidden">
+            <div id="bo-visuals" class="hidden">
+                <section id="trend-plot-section" class="card">
+                    <div class="card-header"><h2>Objectives Trend</h2></div>
+                    <div id="trend-plot" style="width: 100%; height: 400px;"></div>
+                </section>
+                <section id="pareto-plot-section" class="card">
+                    <div class="card-header">
+                        <h2 id="pareto-title">Pareto Front</h2>
+                        <button id="pareto-export-btn" class="btn small hidden">Export Pareto CSV</button>
+                    </div>
+                    <div id="pareto-plot" style="width: 100%; height: 450px;"></div>
+                    <div id="pareto-table-container" class="table-container hidden">
+                        <table id="pareto-table">
+                            <thead id="pareto-table-head"></thead>
+                            <tbody id="pareto-table-body"></tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <section class="card">
+                <h2>BO Setup</h2>
+                
+                <!-- Optimization Strategy Toggle -->
+                <div id="bo-strategy-container" style="margin-bottom: 1.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 1.25rem;">
+                    <label style="font-weight: 600; display: block; margin-bottom: 0.75rem; color: var(--text-primary); font-size: 0.95rem;">Optimization Strategy</label>
+                    <div style="display: flex; gap: 2rem;">
+                        <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.9rem;">
+                            <input type="radio" name="bo-strategy" value="gradient_based" checked style="width: auto;">
+                            <span>Gradient-based (Default)</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.9rem;">
+                            <input type="radio" name="bo-strategy" value="exhaustive_grid" style="width: auto;">
+                            <span>Exhaustive Grid (EDBO+)</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Warning Banner for Auto-reclassification -->
+                <div id="bo-warning-banner" class="hidden" style="background: #fffbeb; border: 1px solid #fde68a; color: #92400e; padding: 1rem; border-radius: 12px; margin-bottom: 1.5rem; font-size: 0.85rem; line-height: 1.4;">
+                    <div style="display: flex; gap: 0.75rem; align-items: flex-start;">
+                        <span style="font-size: 1.2rem;">⚠️</span>
+                        <div id="bo-warning-text"></div>
+                    </div>
+                </div>
+
+                <div class="setup-tabs">
+                    <button class="tab-btn active" data-tab="bo-features-tab">Features</button>
+                    <button class="tab-btn" data-tab="bo-objectives-tab">Objectives</button>
+                    <button class="tab-btn" data-tab="bo-tweaks-tab">Optimization Tweaks</button>
+                </div>
+                <div id="bo-features-tab" class="tab-content">
+                    <table class="setup-table">
+                        <thead><tr><th>Name</th><th>Type</th><th>Range / Values</th><th>Include</th></tr></thead>
+                        <tbody id="bo-features-list"></tbody>
+                    </table>
+
+                    <!-- Constraints Sub-section for BO -->
+                    <details class="constraints-collapsible">
+                        <summary class="constraints-toggle">
+                            <span class="constraints-toggle-label">Constraints</span>
+                            <span class="constraints-chevron">&#8250;</span>
+                        </summary>
+                        <div class="constraints-body">
+                            <div style="margin-bottom: 1.5rem;">
+                                <h4 style="margin-bottom: 0.5rem; color: var(--text-secondary);">Numerical Constraints</h4>
+                                <p class="text-secondary" style="font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                    Select features to build an equation (e.g., A + B &lt;= 10). Features cannot be used more than once per equation.
+                                </p>
+                                <table class="setup-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Equation</th>
+                                            <th style="width: 250px;">Add Feature Helper</th>
+                                            <th style="width: 80px;">Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="bo-numerical-constraints-list"></tbody>
+                                </table>
+                                <button id="bo-add-num-constraint-btn" class="btn secondary small" style="margin-top: 0.5rem;" type="button">+ Add Numerical Constraint</button>
+                            </div>
+
+                            <div>
+                                <h4 style="margin-bottom: 0.5rem; color: var(--text-secondary);">Disallowed Combinations</h4>
+                                <p class="text-secondary" style="font-size: 0.85rem; margin-bottom: 0.5rem;">
+                                    Exclude specific combinations of categorical feature values.
+                                </p>
+                                <table class="setup-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Forbidden Combination Definition</th>
+                                            <th style="width: 80px;">Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="bo-disallowed-constraints-list"></tbody>
+                                </table>
+                                <button id="bo-add-disallowed-constraint-btn" class="btn secondary small" style="margin-top: 0.5rem;" type="button">+ Add Disallowed Combination</button>
+                            </div>
+                        </div>
+                    </details>
+                </div>
+                <div id="bo-objectives-tab" class="tab-content hidden">
+                    <table class="setup-table">
+                        <thead><tr><th>Name</th><th>Type</th><th>Target</th><th>Importance (%)</th><th>Include</th></tr></thead>
+                        <tbody id="bo-objectives-list"></tbody>
+                    </table>
+                </div>
+                <div id="bo-tweaks-tab" class="tab-content hidden">
+                    <div class="tweak-grid">
+                        <div class="tweak-item"><label>Batch Size</label><input type="number" id="batch-size" value="1"></div>
+                        <div class="tweak-item">
+                            <label>Acquisition</label>
+                            <select id="acq-type-select"><option value="EI">EI</option><option value="LCB">LCB</option></select>
+                        </div>
+                        <div class="tweak-item">
+                            <label>Kernel Function</label>
+                            <select id="kernel-select">
+                                <option value="matern52">Matérn 5/2</option>
+                                <option value="matern32">Matérn 3/2</option>
+                                <option value="rbf">RBF (Gaussian)</option>
+                            </select>
+                        </div>
+                        <div class="tweak-item full-width" style="display: flex; flex-direction: column;">
+                            <label>Exploration/Exploitation</label>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <input type="range" id="style-slider" min="0" max="1" step="0.01" value="0.5" style="flex: 1;">
+                                <input type="number" id="style-number" min="0" max="1" step="0.01" value="0.5" style="width: 80px;">
+                            </div>
+                            <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px; padding-right: 90px;">
+                                <span>Exploitation (0)</span>
+                                <span>Exploration (1)</span>
+                            </div>
+                        </div>
+                        <div class="tweak-item">
+                            <label><input type="checkbox" id="bo-noiseless"> Noiseless</label>
+                        </div>
+                        <div class="tweak-item">
+                            <label><input type="checkbox" id="bo-avoid-reval" checked> No Re-evaluation</label>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            <div class="run-container">
+                <button id="run-btn" class="btn primary x-large">Run Bayesian Optimization</button>
+            </div>
+
+            <!-- BO Results & Analysis -->
+            <div id="bo-results-container" class="hidden">
+                <section id="results-section" class="card">
+                <div class="card-header">
+                    <h2>Suggested Experiments</h2>
+                    <div style="display: flex; gap: 10px;">
+                        <button id="commit-suggestions-btn" class="btn success small">Add all to Main Dataset</button>
+                        <button id="export-results-btn" class="btn small">Export CSV</button>
+                    </div>
+                </div>
+                <div class="table-container"><table id="results-table"><thead id="results-table-head"></thead><tbody id="results-table-body"></tbody></table></div>
+                <!-- Selective CSV buttons -->
+                <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border-color);">
+                    <button id="import-results-btn" class="btn small" style="background-color: var(--accent-light);">Import Results CSV</button>
+                    <input type="file" id="import-results-input" style="display: none;" accept=".csv">
+                    <button id="export-features-btn" class="btn small">Export Features CSV</button>
+                </div>
+            </section>
+
+            <section class="card">
+                <div class="card-header">
+                    <h2>BO Model Performance</h2>
+                </div>
+                <div id="bo-performance-info"></div>
+            </section>
+
+            <section class="card">
+                <h2>BO Outcome Estimator</h2>
+                <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 1.5rem;">Estimate objective values for specific feature settings using the current BO model.</p>
+                <div id="bo-estimator-inputs" class="tweak-grid" style="margin-bottom: 2rem;">
+                    <!-- Inputs injected here -->
+                </div>
+                <button id="bo-estimate-btn" class="btn btn-primary" style="width: 100%; padding: 1rem; font-size: 1.1rem; margin-bottom: 1.5rem;">Run BO Estimation</button>
+                <div id="bo-estimate-results" class="results-table-container shadow-inner" style="background: #fdfdfd; padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border-color); min-height: 100px;">
+                    <!-- Results injected here -->
+                </div>
+            </section>
+        </div>
+    </div>
+
+        <!-- 3. SA MODULE VIEW -->
+        <div id="sa-module" class="module-view hidden">
+            <section class="card">
+                <h2>SA Setup</h2>
+                <div class="setup-tabs">
+                    <button class="tab-btn active" data-tab="sa-features-tab">Features</button>
+                    <button class="tab-btn" data-tab="sa-objectives-tab">Objectives</button>
+                    <button class="tab-btn" data-tab="sa-tweaks-tab">SA Tweaks</button>
+                </div>
+                <div id="sa-features-tab" class="tab-content">
+                    <table class="setup-table">
+                        <thead><tr><th>Name</th><th>Type</th><th>Action</th></tr></thead>
+                        <tbody id="sa-features-list"></tbody>
+                    </table>
+                </div>
+                <div id="sa-objectives-tab" class="tab-content hidden">
+                    <table class="setup-table">
+                        <thead><tr><th>Name</th><th>Type</th><th>Target</th><th>Importance (%)</th><th>Action</th></tr></thead>
+                        <tbody id="sa-objectives-list"></tbody>
+                    </table>
+                </div>
+                <div id="sa-tweaks-tab" class="tab-content hidden">
+                    <div class="tweak-grid">
+                        <div class="tweak-item">
+                            <label>Model</label>
+                            <select id="sa-model-select">
+                                <option value="linear">Linear Regression</option>
+                                <option value="random_forest">Random Forest</option>
+                                <option value="mlp">Neural Network (MLP)</option>
+                            </select>
+                        </div>
+                        <div class="tweak-item sa-rf-param hidden">
+                            <label>Trees (RF)</label>
+                            <input type="number" id="sa-rf-trees" value="100">
+                        </div>
+                        <div class="tweak-item sa-rf-param hidden">
+                            <label>Max Depth (RF)</label>
+                            <input type="number" id="sa-rf-depth" value="10">
+                        </div>
+                        <div class="tweak-item sa-mlp-param hidden">
+                            <label>Hidden Layers (e.g. 100,50)</label>
+                            <input type="text" id="sa-mlp-layers" value="100">
+                        </div>
+                        <div class="tweak-item sa-mlp-param hidden">
+                            <label>Max Iterations</label>
+                            <input type="number" id="sa-mlp-iter" value="500">
+                        </div>
+                    </div>
+                </div>
+            </section>
+            <div class="run-container">
+                <button id="sa-run-btn" class="btn primary x-large">Run the Statistical Analysis</button>
+            </div>
+
+            <!-- SA Results overhauled -->
+            <div id="sa-results-container" class="hidden">
+                <section class="card">
+                    <div class="card-header">
+                        <h2>Reliability & Validation</h2>
+                        <button id="sa-export-report-btn" class="btn small">Export Analysis Report</button>
+                    </div>
+                    <div id="sa-reliability-info"></div>
+                </section>
+
+                <section class="card">
+                    <h2>Numerical Correlation Matrix</h2>
+                    <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 1rem;">Correlation between numerical features and success targets.</p>
+                    <div id="sa-num-corr" style="width: 100%; height: 400px;"></div>
+                </section>
+
+                <section class="card">
+                    <h2>Categorical Analysis (Interactions)</h2>
+                    <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 1rem;">View how combinations of levels impact your results.</p>
+                    <div id="sa-cat-controls" class="tweak-grid" style="margin-bottom: 1rem; border-bottom: 1px dashed var(--border-color); padding-bottom: 1rem;">
+                        <!-- JS will inject filters here -->
+                    </div>
+                    <div id="sa-cat-interactions-container">
+                        <!-- Interaction matrices will be injected here -->
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2>Parallel Coordinates</h2>
+                    <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 0.5rem;">One plot per objective. Each line represents a single experiment, colored by the objective value.</p>                    <p class="text-secondary" style="font-size: 0.85rem; margin-bottom: 1rem;">💡 <b>Tip:</b> Click and drag on any axis to create a <b>filter range</b>. You can apply multiple filters across different axes simultaneously to isolate specific data subsets. Drag a filter to move it, or click the axis again to clear it.</p>
+                    <div id="sa-parcoords-container">
+                        <!-- Parallel coordinates plots injected here -->
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2>Feature Impact</h2>
+                    <div id="sa-results-head" style="margin-bottom: 1rem;">
+                        <!-- Global Success reliability info injected here -->
+                        <div id="sa-reliability-info"></div>
+                    </div>
+                    <div id="sa-impact-container">
+                        <!-- Impact plots injected here -->
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2>Optimization Outcome - Simulation</h2>
+                    <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 1.5rem;">Input specific parameter values to estimate the outcome based on the active model.</p>
+                    <div id="sa-estimator-inputs" class="tweaks-grid" style="margin-bottom: 2rem;">
+                        <!-- Inputs injected here -->
+                    </div>
+                    <button id="sa-estimate-btn" class="btn btn-primary" style="width: 100%; padding: 1rem; font-size: 1.1rem; margin-bottom: 1.5rem;">Run Simulation</button>
+                    <div id="sa-estimate-results" class="results-table-container shadow-inner" style="background: #fdfdfd; padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border-color); min-height: 100px;">
+                        <!-- Results injected here -->
+                    </div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <div id="loading-overlay" class="hidden">
+        <div class="spinner"></div>
+        <p id="loading-text">Optimizing...</p>
+        <button id="abort-calc-btn" class="btn small" style="background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.4); backdrop-filter: blur(4px);">Abort & Restore View</button>
+    </div>
+
+    <script type="module" src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script data-goatcounter="https://edos-app.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+</body>
+
+</html>

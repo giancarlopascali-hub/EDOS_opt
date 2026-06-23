@@ -1,0 +1,913 @@
+import re
+import itertools
+import numpy as np
+import pandas as pd
+import torch
+from gpytorch.mlls import ExactMarginalLogLikelihood, SumMarginalLogLikelihood
+from gpytorch.kernels import RBFKernel, MaternKernel, ScaleKernel
+from gpytorch.priors import NormalPrior
+
+from botorch.models import SingleTaskGP, MixedSingleTaskGP, ModelListGP
+from botorch.models.transforms import Standardize, Normalize
+from botorch.fit import fit_gpytorch_mll
+from botorch.optim.initializers import gen_batch_initial_conditions
+
+# Acquisition functions
+from botorch.acquisition import (
+    ExpectedImprovement,
+    UpperConfidenceBound,
+    qExpectedImprovement,
+    qUpperConfidenceBound,
+)
+try:
+    from botorch.acquisition import qLogExpectedImprovement
+except ImportError:
+    qLogExpectedImprovement = qExpectedImprovement
+
+from botorch.acquisition.multi_objective.monte_carlo import (
+    qNoisyExpectedHypervolumeImprovement,
+    qExpectedHypervolumeImprovement,
+)
+try:
+    from botorch.acquisition.multi_objective.monte_carlo import qLogNoisyExpectedHypervolumeImprovement
+except ImportError:
+    qLogNoisyExpectedHypervolumeImprovement = qNoisyExpectedHypervolumeImprovement
+
+from botorch.acquisition.multi_objective.objective import WeightedMCMultiOutputObjective
+from botorch.acquisition.objective import ScalarizedPosteriorTransform
+
+from botorch.optim import optimize_acqf, optimize_acqf_discrete
+from botorch.utils.sampling import draw_sobol_samples
+from botorch.sampling.normal import SobolQMCNormalSampler
+
+from src.core.constraints import check_constraints
+
+def generate_feasible_initial_conditions(bounds_t, q, num_restarts, p_constraints, max_attempts=500):
+    """
+    Generates a tensor of shape (num_restarts, q, d) where all points satisfy
+    the constraints specified in p_constraints.
+    """
+    d = bounds_t.shape[1]
+    feasible_points = []
+    
+    for attempt in range(max_attempts):
+        samples = draw_sobol_samples(bounds=bounds_t, n=1, q=2000).squeeze(0)
+        
+        mask = torch.ones(samples.shape[0], dtype=torch.bool, device=samples.device)
+        for constraint_func, _ in p_constraints:
+            val = constraint_func(samples)
+            mask = mask & (val >= 0)
+            
+        feasible_samples = samples[mask]
+        feasible_points.append(feasible_samples)
+        
+        all_feasible = torch.cat(feasible_points, dim=0)
+        if all_feasible.shape[0] >= num_restarts * q:
+            selected = all_feasible[:num_restarts * q]
+            return selected.view(num_restarts, q, d)
+            
+    all_feasible = torch.cat(feasible_points, dim=0) if feasible_points else torch.empty((0, d), device=bounds_t.device)
+    if all_feasible.shape[0] < num_restarts * q:
+        if all_feasible.shape[0] == 0:
+            return draw_sobol_samples(bounds=bounds_t, n=num_restarts, q=q)
+        else:
+            repeats = (num_restarts * q // all_feasible.shape[0]) + 1
+            tiled = all_feasible.repeat(repeats, 1)[:num_restarts * q]
+            return tiled.view(num_restarts, q, d)
+            
+    return all_feasible[:num_restarts * q].view(num_restarts, q, d)
+
+
+def clean_dataframe(df, features_config, objectives_config):
+    # 1. Feature filtering: Drop rows missing any required feature value
+    valid_feat_mask = pd.Series(True, index=df.index)
+    for f in features_config:
+        name = f['name']
+        if name not in df.columns:
+            continue
+        col_series = df[name]
+        if f['type'] in ['continuous', 'discrete', 'regular']:
+            num_col = pd.to_numeric(col_series, errors='coerce')
+            valid_feat_mask = valid_feat_mask & num_col.notna()
+        else:
+            valid_feat_mask = valid_feat_mask & col_series.notna() & (col_series.astype(str).str.strip() != "")
+            
+    df_clean = df[valid_feat_mask].copy()
+    
+    if not objectives_config:
+        return df_clean
+        
+    # 2. Objective filtering: Differentiate single vs multi-objective
+    obj_df_numeric = pd.DataFrame()
+    for obj in objectives_config:
+        if obj['name'] in df_clean.columns:
+            obj_df_numeric[obj['name']] = pd.to_numeric(df_clean[obj['name']], errors='coerce')
+        else:
+            obj_df_numeric[obj['name']] = pd.Series(np.nan, index=df_clean.index)
+            
+    if len(objectives_config) == 1:
+        # Single-objective case: drop any row missing the objective value
+        valid_obj_mask = obj_df_numeric[objectives_config[0]['name']].notna()
+    else:
+        # Multi-objective case: drop rows missing ALL objectives
+        valid_obj_mask = obj_df_numeric.notna().any(axis=1)
+        
+    df_clean = df_clean[valid_obj_mask].copy()
+    return df_clean
+
+
+def run_bo_optimization(df, features_config, objectives_config, tweaks, device, compute_device):
+    # Filter the dataframe to drop incomplete rows
+    df_clean = clean_dataframe(df, features_config, objectives_config)
+
+    # STEP 1 — Build Training Features (X)
+    train_x_list    = []
+    bounds          = []
+    categorical_features = []
+    feature_levels  = []
+
+    for i, f in enumerate(features_config):
+        name    = f['name']
+        f_range = f['range']
+
+        if f['type'] == 'continuous':
+            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
+            low, high = sorted([float(matches[0]), float(matches[1])]) if len(matches) >= 2 else (0.0, 1.0)
+            if low == high:
+                high = low + abs(low) * 0.01 + 0.1
+            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(0).values
+            train_x_list.append(feat_vals)
+            bounds.append([low, high])
+            feature_levels.append(None)
+
+        elif f['type'] == 'discrete':
+            clean_range = f_range.replace('[', '').replace(']', '')
+            values = sorted([float(x.strip()) for x in clean_range.split(',') if x.strip()])
+            if not values:
+                values = [0.0]
+            low, high = values[0], values[-1]
+            if low == high:
+                high = low + abs(low) * 0.01 + 0.1
+            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(values[0]).values
+            train_x_list.append(feat_vals)
+            bounds.append([low, high])
+            feature_levels.append(values)
+
+        elif f['type'] == 'regular':
+            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
+            if len(matches) >= 3:
+                low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
+                values = np.linspace(low, high, steps).tolist()
+            elif len(matches) == 2:
+                low, high = sorted([float(matches[0]), float(matches[1])])
+                values = np.linspace(low, high, 10).tolist()
+            else:
+                values = [0.0]
+            low, high = values[0], values[-1]
+            if low == high:
+                high = low + abs(low) * 0.01 + 0.1
+            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(values[0]).values
+            train_x_list.append(feat_vals)
+            bounds.append([low, high])
+            feature_levels.append(values)
+
+        elif f['type'] == 'categorical':
+            choices = [str(x).strip() for x in f_range.split(',')]
+            mapping = {choice: idx for idx, choice in enumerate(choices)}
+            encoded = df_clean[name].astype(str).map(mapping).fillna(0).values
+            train_x_list.append(encoded)
+            low, high = 0, len(choices) - 1
+            if low == high:
+                high = low + 0.1
+            bounds.append([low, high])
+            categorical_features.append(i)
+            feature_levels.append(list(range(len(choices))))
+
+    if not df_clean.empty:
+        train_x  = torch.tensor(np.stack(train_x_list, axis=1), dtype=torch.float32).to(device)
+    else:
+        train_x  = torch.zeros((0, len(features_config)), dtype=torch.float32).to(device)
+    bounds_t = torch.tensor(bounds, dtype=torch.float32).T.to(device)
+
+    # STEP 2 — Build Training Objectives (Y)
+    train_y_list = []
+    weights_list = []
+
+    for obj in objectives_config:
+        weights_list.append(float(obj.get('importance', 1)))
+        if not df_clean.empty:
+            vals = pd.to_numeric(df_clean[obj['name']], errors='coerce').values
+            if obj['type'] == 'minimize':
+                train_y_list.append(-vals)
+            elif obj['type'] == 'maximize':
+                train_y_list.append(vals)
+            elif obj['type'] == 'target':
+                target   = float(obj.get('target', 0))
+                valid_vals = vals[~np.isnan(vals)]
+                variance = np.var(valid_vals) if len(valid_vals) > 0 and np.var(valid_vals) > 0 else 1.0
+                train_y_list.append(-((vals - target) ** 2) / variance)
+
+    if not df_clean.empty:
+        train_y = torch.tensor(np.stack(train_y_list, axis=1), dtype=torch.float32).to(device)
+    else:
+        train_y = torch.zeros((0, len(objectives_config)), dtype=torch.float32).to(device)
+
+    weights_t   = torch.tensor(weights_list, dtype=torch.float32).to(device)
+    batch_size  = int(float(tweaks.get('batch_size', 1)))
+    avoid_reval = tweaks.get('avoid_reval', True)
+    acq_type    = tweaks.get('acq_type', 'EI')
+    exploration = float(tweaks.get('exploration', 0.5))
+
+    # STEP 3 — Optimization Logic
+    if df_clean.empty:
+        candidates = draw_sobol_samples(bounds=bounds_t, n=1, q=batch_size).squeeze(0)
+    else:
+        kernel_name  = tweaks.get('kernel', 'matern52')
+        is_noiseless = tweaks.get('noiseless', False)
+
+        def get_kernel(k_name):
+            if k_name == 'rbf':      return ScaleKernel(RBFKernel()).to(device)
+            if k_name == 'matern32': return ScaleKernel(MaternKernel(nu=1.5)).to(device)
+            if k_name == 'matern12': return ScaleKernel(MaternKernel(nu=0.5)).to(device)
+            return ScaleKernel(MaternKernel(nu=2.5)).to(device)
+
+        def build_single_model(tx, ty_slice):
+            all_dims  = list(range(tx.shape[1]))
+            cont_dims = [idx for idx in all_dims if idx not in categorical_features]
+
+            input_tf = (
+                Normalize(
+                    d=tx.shape[1],
+                    bounds=bounds_t.to(compute_device)[:, cont_dims],
+                    indices=cont_dims
+                ).to(compute_device)
+                if cont_dims else None
+            )
+
+            if categorical_features and len(cont_dims) > 0:
+                m = MixedSingleTaskGP(
+                    tx.to(compute_device), ty_slice.to(compute_device),
+                    cat_dims=categorical_features,
+                    outcome_transform=Standardize(m=1),
+                    input_transform=input_tf
+                ).to(compute_device)
+            else:
+                m = SingleTaskGP(
+                    tx.to(compute_device), ty_slice.to(compute_device),
+                    covar_module=get_kernel(kernel_name).to(compute_device),
+                    outcome_transform=Standardize(m=1),
+                    input_transform=input_tf
+                ).to(compute_device)
+
+            if is_noiseless:
+                m.likelihood.noise_covar.register_prior(
+                    "noise_prior", NormalPrior(1e-4, 1e-5), "noise"
+                )
+
+            return m.to(compute_device)
+
+        if train_y.shape[1] > 1:
+            models = []
+            for idx in range(train_y.shape[1]):
+                y_slice = train_y[:, idx:idx+1]
+                non_nan_mask = ~torch.isnan(y_slice.squeeze(-1))
+                tx_i = train_x[non_nan_mask]
+                ty_i = y_slice[non_nan_mask]
+                if tx_i.shape[0] == 0:
+                    raise ValueError(f"No valid observations for objective '{objectives_config[idx]['name']}' after filtering missing values.")
+                models.append(build_single_model(tx_i, ty_i))
+
+            model   = ModelListGP(*models).to(compute_device)
+            mll     = SumMarginalLogLikelihood(model.likelihood, model).to(compute_device)
+        else:
+            model = build_single_model(train_x, train_y).to(compute_device)
+            mll   = ExactMarginalLogLikelihood(model.likelihood, model).to(compute_device)
+
+        try:
+            fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 100}})
+        except Exception as e:
+            print(f"Warning: Main model fit failed: {e}")
+
+        OPT_DEVICE = device if device.type == 'cuda' else compute_device
+        model = model.to(OPT_DEVICE)
+
+        intensity = 2 if train_y.shape[1] > 1 else 1
+        if device.type == 'cuda':
+            intensity *= 6
+        else:
+            intensity *= 2
+
+        is_mo      = train_y.shape[1] > 1
+        is_uniform = (
+            torch.allclose(weights_t, weights_t[0].expand_as(weights_t), atol=1e-2)
+            if is_mo else True
+        )
+
+        base_mc_samples = 64 if is_mo else 256
+        mc_samples = int(base_mc_samples * intensity)
+        sampler    = SobolQMCNormalSampler(sample_shape=torch.Size([mc_samples]))
+
+        if is_mo:
+            if is_uniform:
+                mo_obj = WeightedMCMultiOutputObjective(weights=weights_t.to(OPT_DEVICE))
+                ty_compute = train_y.to(OPT_DEVICE)
+                
+                mins_list = []
+                maxs_list = []
+                for idx in range(ty_compute.shape[1]):
+                    valid_vals = ty_compute[:, idx][~torch.isnan(ty_compute[:, idx])]
+                    if valid_vals.numel() > 0:
+                        mins_list.append(valid_vals.min())
+                        maxs_list.append(valid_vals.max())
+                    else:
+                        mins_list.append(torch.tensor(0.0, device=OPT_DEVICE))
+                        maxs_list.append(torch.tensor(1.0, device=OPT_DEVICE))
+                mins = torch.stack(mins_list)
+                maxs = torch.stack(maxs_list)
+                
+                ref_point = (mins - 0.2 * (maxs - mins + 1e-6)) * weights_t.to(OPT_DEVICE)
+                acq_func = qLogNoisyExpectedHypervolumeImprovement(
+                    model=model,
+                    ref_point=ref_point,
+                    X_baseline=train_x.to(OPT_DEVICE),
+                    sampler=sampler,
+                    objective=mo_obj,
+                    prune_baseline=True
+                ).to(OPT_DEVICE)
+            else:
+                post_tf = ScalarizedPosteriorTransform(weights=weights_t.to(OPT_DEVICE))
+                
+                # Fill NaNs with the minimum observed value for each objective
+                train_y_filled = train_y.clone()
+                for idx in range(train_y.shape[1]):
+                    valid_vals = train_y[:, idx][~torch.isnan(train_y[:, idx])]
+                    min_val = valid_vals.min().item() if valid_vals.numel() > 0 else 0.0
+                    nan_mask = torch.isnan(train_y_filled[:, idx])
+                    train_y_filled[nan_mask, idx] = min_val
+                
+                best_f = (train_y_filled.to(OPT_DEVICE) * weights_t.to(OPT_DEVICE)).sum(dim=-1).max().item()
+                acq_func = qLogExpectedImprovement(
+                    model=model,
+                    best_f=best_f,
+                    sampler=sampler,
+                    posterior_transform=post_tf
+                ).to(OPT_DEVICE)
+        else:
+            if acq_type == 'EI':
+                acq_func = qLogExpectedImprovement(
+                    model=model,
+                    best_f=train_y.to(OPT_DEVICE).max().item(),
+                    sampler=sampler,
+                    objective=None
+                ).to(OPT_DEVICE)
+            elif acq_type == 'LCB':
+                beta     = (1.0 - exploration) * 10.0 + 0.1
+                acq_func = qUpperConfidenceBound(model, beta=beta, sampler=sampler).to(OPT_DEVICE)
+            else:
+                acq_func = qLogExpectedImprovement(
+                    model=model,
+                    best_f=train_y.to(OPT_DEVICE).max().item(),
+                    sampler=sampler,
+                    objective=None
+                ).to(OPT_DEVICE)
+
+        strategy = tweaks.get('optimization_strategy', 'gradient_based')
+
+        if strategy == 'exhaustive_grid':
+            final_levels = []
+            for idx, levels in enumerate(feature_levels):
+                if levels is None:
+                    low, high = bounds[idx]
+                    final_levels.append(np.linspace(low, high, 10).tolist())
+                else:
+                    final_levels.append(levels)
+
+            import math
+            n_combos = math.prod(len(l) for l in final_levels)
+            if n_combos > 100000:
+                raise ValueError(f'Exhaustive grid is too large ({n_combos:,} combinations). Please reduce steps or categorical features.')
+
+            all_combos = list(itertools.product(*final_levels))
+            train_fps  = {tuple(np.round(row, 6)) for row in train_x.cpu().numpy()}
+            filtered_combos = [c for c in all_combos if tuple(np.round(c, 6)) not in train_fps]
+
+            if not filtered_combos:
+                raise ValueError('All points in the grid scope have already been evaluated.')
+
+            candidates_grid = torch.tensor(filtered_combos, dtype=torch.float32).to(OPT_DEVICE)
+
+            constraints_cfg = tweaks.get('constraints', {})
+            num_rules = constraints_cfg.get('numerical', [])
+            disallowed_rules = constraints_cfg.get('disallowed', [])
+            
+            if num_rules or disallowed_rules:
+                feasible_indices = []
+                for idx, cand in enumerate(filtered_combos):
+                    row_dict = {}
+                    for col_idx, f in enumerate(features_config):
+                        val = cand[col_idx]
+                        if f['type'] == 'categorical':
+                            choices = [x.strip() for x in f['range'].split(',')]
+                            choice_idx = max(0, min(len(choices) - 1, int(round(val))))
+                            val = choices[choice_idx]
+                        elif f['type'] == 'discrete':
+                            d_vals = sorted([float(x.strip()) for x in f['range'].split(',') if x.strip()])
+                            val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
+                        elif f['type'] == 'regular':
+                            matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
+                            if len(matches) >= 3:
+                                low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
+                                d_vals = np.linspace(low, high, steps).tolist()
+                            elif len(matches) == 2:
+                                low, high = sorted([float(matches[0]), float(matches[1])])
+                                d_vals = np.linspace(low, high, 10).tolist()
+                            else:
+                                d_vals = []
+                            val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
+                        
+                        if isinstance(val, (int, float)):
+                            val = round(float(val), 3)
+                        row_dict[f['name']] = val
+
+                    if check_constraints(row_dict, num_rules, disallowed_rules, features_config):
+                        feasible_indices.append(idx)
+
+                if not feasible_indices:
+                    raise ValueError('No grid points satisfy the provided constraints.')
+
+                filtered_combos = [filtered_combos[idx] for idx in feasible_indices]
+                candidates_grid = torch.tensor(filtered_combos, dtype=torch.float32).to(OPT_DEVICE)
+
+            candidates, _ = optimize_acqf_discrete(
+                acq_function=acq_func,
+                q=batch_size,
+                choices=candidates_grid,
+                unique=True
+            )
+            candidates = candidates.cpu()
+
+        else:
+            p_constraints = []
+            constraints_cfg = tweaks.get('constraints', {})
+            num_rules = constraints_cfg.get('numerical', [])
+            disallowed_rules = constraints_cfg.get('disallowed', [])
+            if num_rules:
+                indices = {f['name']: idx for idx, f in enumerate(features_config)}
+                for expr in num_rules:
+                    try:
+                        clean_expr = expr.strip()
+                        op_found = None
+                        for op in ['<=', '>=', '<', '>']:
+                            if op in clean_expr:
+                                op_found = op
+                                break
+                        if op_found:
+                            parts = clean_expr.split(op_found)
+                            lhs_str = parts[0].strip()
+                            rhs_str = parts[1].strip()
+                            
+                            for name, idx in indices.items():
+                                lhs_str = re.sub(rf'\b{re.escape(name)}\b', f'X[..., {idx}]', lhs_str)
+                                rhs_str = re.sub(rf'\b{re.escape(name)}\b', f'X[..., {idx}]', rhs_str)
+                            
+                            if op_found in ('<=', '<'):
+                                vec_expr = f"({rhs_str}) - ({lhs_str})"
+                            else:
+                                vec_expr = f"({lhs_str}) - ({rhs_str})"
+                                
+                            code = compile(vec_expr, '<string>', 'eval')
+                            def constraint_func(X, code=code):
+                                return eval(code, {"X": X, "torch": torch, "np": np, "__builtins__": {}})
+                            p_constraints.append((constraint_func, True))
+                    except Exception as ex:
+                        print(f"Error compiling continuous constraint '{expr}': {ex}")
+
+            base_restarts    = 8  if is_mo else 32
+            base_raw_samples = 128 if is_mo else 512
+
+            batch_initial_conditions = None
+            if p_constraints:
+                try:
+                    batch_initial_conditions = generate_feasible_initial_conditions(
+                        bounds_t=bounds_t.to(OPT_DEVICE),
+                        q=batch_size,
+                        num_restarts=int(base_restarts * intensity),
+                        p_constraints=p_constraints
+                    )
+                except Exception as e:
+                    print(f"Error generating feasible initial conditions: {e}")
+
+            candidates, _ = optimize_acqf(
+                acq_function=acq_func,
+                bounds=bounds_t.to(OPT_DEVICE),
+                q=batch_size,
+                num_restarts=int(base_restarts * intensity),
+                raw_samples=int(base_raw_samples * intensity),
+                nonlinear_inequality_constraints=p_constraints if p_constraints else None,
+                batch_initial_conditions=batch_initial_conditions
+            )
+            candidates = candidates.cpu()
+
+    # Decode Candidate Tensors
+    feat_names = [f['name'] for f in features_config]
+
+    def get_fingerprint(row_dict):
+        parts = []
+        for name in feat_names:
+            val = row_dict[name]
+            parts.append(f"{float(val):.3f}" if isinstance(val, (int, float)) else str(val))
+        return "|".join(parts)
+
+    existing_fps = set()
+    if not df_clean.empty:
+        for _, row in df_clean[feat_names].iterrows():
+            existing_fps.add(get_fingerprint(row.to_dict()))
+
+    def decode_cand(c_tensor):
+        row = {}
+        for idx, f in enumerate(features_config):
+            val = c_tensor[idx].item()
+
+            if f['type'] == 'discrete':
+                d_vals = sorted([float(x.strip()) for x in f['range'].split(',') if x.strip()])
+                val    = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
+
+            elif f['type'] == 'regular':
+                matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
+                if len(matches) >= 3:
+                    low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
+                    d_vals = np.linspace(low, high, steps).tolist()
+                elif len(matches) == 2:
+                    low, high = sorted([float(matches[0]), float(matches[1])])
+                    d_vals = np.linspace(low, high, 10).tolist()
+                else:
+                    d_vals = []
+                val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
+
+            elif f['type'] == 'categorical':
+                choices = [x.strip() for x in f['range'].split(',')]
+                idx_choice = max(0, min(len(choices) - 1, int(round(val))))
+                val     = choices[idx_choice]
+
+            if isinstance(val, (int, float)):
+                val = round(float(val), 3)
+            row[f['name']] = val
+        return row
+
+    suggestions = []
+    for cand in candidates:
+        suggestion = decode_cand(cand)
+
+        if avoid_reval or num_rules or disallowed_rules:
+            attempts = 0
+            t_cand   = cand.clone()
+            while (get_fingerprint(suggestion) in existing_fps or not check_constraints(suggestion, num_rules, disallowed_rules, features_config)) and attempts < 40:
+                attempts += 1
+                for idx, f in enumerate(features_config):
+                    if f['type'] == 'continuous':
+                        span     = bounds[idx][1] - bounds[idx][0]
+                        t_cand[idx] = torch.clamp(
+                            t_cand[idx] + (torch.rand(1).item() - 0.5) * span * 0.1,
+                            bounds[idx][0], bounds[idx][1]
+                        )
+                    elif f['type'] == 'discrete':
+                        d_vals  = sorted([float(x.strip()) for x in f['range'].split(',') if x.strip()])
+                        if len(d_vals) > 1:
+                            cur_idx   = d_vals.index(suggestion[f['name']])
+                            t_cand[idx] = d_vals[(cur_idx + attempts) % len(d_vals)]
+                    elif f['type'] == 'regular':
+                        matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
+                        if len(matches) >= 3:
+                            low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
+                            d_vals = np.linspace(low, high, steps).tolist()
+                        elif len(matches) == 2:
+                            low, high = sorted([float(matches[0]), float(matches[1])])
+                            d_vals = np.linspace(low, high, 10).tolist()
+                        else:
+                            d_vals = []
+                        if len(d_vals) > 1:
+                            cur_idx   = d_vals.index(suggestion[f['name']])
+                            t_cand[idx] = d_vals[(cur_idx + attempts) % len(d_vals)]
+                    elif f['type'] == 'categorical':
+                        choices = [x.strip() for x in f['range'].split(',')]
+                        if len(choices) > 1:
+                            cur_idx   = choices.index(suggestion[f['name']])
+                            t_cand[idx] = float((cur_idx + attempts) % len(choices))
+                suggestion = decode_cand(t_cand)
+
+        suggestions.append(suggestion)
+        existing_fps.add(get_fingerprint(suggestion))
+
+    if num_rules or disallowed_rules:
+        suggestions = [s for s in suggestions if check_constraints(s, num_rules, disallowed_rules, features_config)]
+
+    # Sobol gap-filling
+    if len(suggestions) < batch_size:
+        gap = batch_size - len(suggestions)
+        try:
+            n_pool = max(gap * 200, 2000)
+            pool = draw_sobol_samples(bounds=bounds_t.to(OPT_DEVICE), n=1, q=n_pool).squeeze(0)
+            for pt in pool:
+                if len(suggestions) >= batch_size:
+                    break
+                decoded = decode_cand(pt.cpu())
+                fp = get_fingerprint(decoded)
+                if fp in existing_fps:
+                    continue
+                if not check_constraints(decoded, num_rules, disallowed_rules, features_config):
+                    continue
+                suggestions.append(decoded)
+                existing_fps.add(fp)
+        except Exception as e:
+            print(f"Error in Sobol gap-filling: {e}")
+
+    if not suggestions:
+        raise ValueError('No suggestions satisfy the specified constraints.')
+
+    # Cross-Validation
+    performance_results = {}
+    if not df_clean.empty and train_x.shape[0] >= 5:
+        from sklearn.model_selection import KFold
+        n_splits = 5
+        kf       = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        for idx, obj_cfg in enumerate(objectives_config):
+            obj_name  = obj_cfg['name']
+            y_all_np  = train_y[:, idx:idx+1].cpu().numpy()
+            x_all_np  = train_x.cpu().numpy()
+
+            nan_mask = np.isnan(y_all_np.flatten())
+            y_all_np_clean = y_all_np[~nan_mask]
+            x_all_np_clean = x_all_np[~nan_mask]
+
+            if len(y_all_np_clean) < 5:
+                performance_results[obj_name] = {
+                    'r2': 0.0,
+                    'status': 'Poor'
+                }
+                continue
+
+            all_preds = []
+            all_true  = []
+
+            for train_idx, test_idx in kf.split(x_all_np_clean):
+                x_tr = torch.tensor(x_all_np_clean[train_idx], dtype=torch.float32).to(device)
+                x_te = torch.tensor(x_all_np_clean[test_idx],  dtype=torch.float32).to(device)
+                y_tr = torch.tensor(y_all_np_clean[train_idx], dtype=torch.float32).to(device)
+
+                try:
+                    m_tmp   = build_single_model(x_tr, y_tr)
+                    mll_tmp = ExactMarginalLogLikelihood(m_tmp.likelihood, m_tmp).to(compute_device)
+                    fit_gpytorch_mll(mll_tmp, optimizer_kwargs={"options": {"maxiter": 25}})
+                    m_tmp.eval()
+                    with torch.no_grad():
+                        post  = m_tmp.posterior(x_te.to(compute_device))
+                        preds = post.mean.cpu().numpy().flatten()
+                        all_preds.extend(preds)
+                        all_true.extend(y_all_np_clean[test_idx].flatten())
+                except Exception as ex:
+                    print(f"Error in CV for {obj_name}: {ex}")
+                    all_preds.extend([np.mean(y_all_np_clean[train_idx])] * len(test_idx))
+                    all_true.extend(y_all_np_clean[test_idx].flatten())
+
+            all_preds = np.array(all_preds)
+            all_true  = np.array(all_true)
+            ss_res    = np.sum((all_true - all_preds) ** 2)
+            ss_tot    = np.sum((all_true - np.mean(all_true)) ** 2)
+            r2        = 1 - (ss_res / (ss_tot + 1e-9))
+            avg_r2    = max(0, r2)
+
+            performance_results[obj_name] = {
+                'r2':     round(float(avg_r2), 3),
+                'status': 'Good' if avg_r2 > 0.7 else ('Limited' if avg_r2 >= 0.4 else 'Poor')
+            }
+
+        if train_y.shape[1] > 1:
+            weights_np = weights_t.cpu().numpy()
+            
+            # Fill NaNs in train_y for global success metric calculation
+            train_y_filled_np = train_y.cpu().numpy()
+            for idx in range(train_y_filled_np.shape[1]):
+                valid_vals = train_y_filled_np[:, idx][~np.isnan(train_y_filled_np[:, idx])]
+                min_val = valid_vals.min() if len(valid_vals) > 0 else 0.0
+                train_y_filled_np[np.isnan(train_y_filled_np[:, idx]), idx] = min_val
+                
+            y_min, y_max = train_y_filled_np.min(axis=0), train_y_filled_np.max(axis=0)
+            y_norm     = (train_y_filled_np - y_min) / (y_max - y_min + 1e-9)
+            global_y   = np.average(y_norm, axis=1, weights=weights_np)
+
+            all_preds_g = []
+            all_true_g  = []
+            for train_idx, test_idx in kf.split(x_all_np):
+                x_tr   = torch.tensor(x_all_np[train_idx], dtype=torch.float32).to(device)
+                x_te   = torch.tensor(x_all_np[test_idx],  dtype=torch.float32).to(device)
+                y_tr_g = torch.tensor(global_y[train_idx], dtype=torch.float32).unsqueeze(-1).to(device)
+
+                try:
+                    m_tmp   = build_single_model(x_tr, y_tr_g)
+                    mll_tmp = ExactMarginalLogLikelihood(m_tmp.likelihood, m_tmp).to(compute_device)
+                    fit_gpytorch_mll(mll_tmp, optimizer_kwargs={"options": {"maxiter": 25}})
+                    m_tmp.eval()
+                    with torch.no_grad():
+                        post  = m_tmp.posterior(x_te.to(compute_device))
+                        preds = post.mean.cpu().numpy().flatten()
+                        all_preds_g.extend(preds)
+                        all_true_g.extend(global_y[test_idx].flatten())
+                except Exception:
+                    all_preds_g.extend([np.mean(global_y[train_idx])] * len(test_idx))
+                    all_true_g.extend(global_y[test_idx].flatten())
+
+            ss_res_g = np.sum((np.array(all_true_g) - np.array(all_preds_g)) ** 2)
+            ss_tot_g = np.sum((np.array(all_true_g) - np.mean(all_true_g)) ** 2)
+            r2_g     = 1 - (ss_res_g / (ss_tot_g + 1e-9))
+            avg_r2_g = max(0, r2_g)
+
+            performance_results['global_success'] = {
+                'r2':     round(float(avg_r2_g), 3),
+                'status': 'Good' if avg_r2_g > 0.7 else ('Limited' if avg_r2_g >= 0.4 else 'Poor')
+            }
+
+    return suggestions, performance_results
+
+
+def run_bo_estimation(df, input_values, features_config, objectives_config, tweaks, device, compute_device):
+    # Filter the dataframe to drop incomplete rows
+    df_clean = clean_dataframe(df, features_config, objectives_config)
+    if df_clean.empty:
+        raise ValueError('No valid data points left after filtering missing features/objectives.')
+
+    # Build Feature Matrix (X)
+    train_x_list      = []
+    bounds            = []
+    categorical_features = []
+
+    for idx, f in enumerate(features_config):
+        name    = f['name']
+        f_range = f['range']
+
+        if f['type'] == 'continuous':
+            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
+            low, high = sorted([float(matches[0]), float(matches[1])]) if len(matches) >= 2 else (0.0, 1.0)
+            if low == high: high = low + abs(low) * 0.01 + 0.1
+            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(0).values
+            train_x_list.append(feat_vals)
+            bounds.append([low, high])
+
+        elif f['type'] in ['discrete', 'regular']:
+            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
+            if f['type'] == 'discrete':
+                values = sorted([float(x.strip()) for x in f_range.replace('[', '').replace(']', '').split(',') if x.strip()])
+            else:
+                if len(matches) >= 3:
+                    low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
+                    values = np.linspace(low, high, steps).tolist()
+                else:
+                    values = [0.0]
+            low, high = values[0], values[-1]
+            if low == high: high = low + abs(low) * 0.01 + 0.1
+            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(values[0]).values
+            train_x_list.append(feat_vals)
+            bounds.append([low, high])
+
+        elif f['type'] == 'categorical':
+            choices = [str(x).strip() for x in f_range.split(',')]
+            mapping = {choices[c_idx]: c_idx for c_idx in range(len(choices))}
+            encoded = df_clean[name].astype(str).map(mapping).fillna(0).values
+            train_x_list.append(encoded)
+            low, high = 0, len(choices) - 1
+            if low == high: high = low + 0.1
+            bounds.append([low, high])
+            categorical_features.append(idx)
+
+    train_x  = torch.tensor(np.stack(train_x_list, axis=1), dtype=torch.float32).to(device)
+    bounds_t = torch.tensor(bounds, dtype=torch.float32).T.to(device)
+
+    # Build Objective Matrix (Y) in optimization-transformed space
+    train_y_list = []
+    weights_list = []
+    for obj in objectives_config:
+        weights_list.append(float(obj.get('importance', 1)))
+        vals = pd.to_numeric(df_clean[obj['name']], errors='coerce').values
+        if   obj['type'] == 'minimize': train_y_list.append(-vals)
+        elif obj['type'] == 'maximize': train_y_list.append(vals)
+        elif obj['type'] == 'target':
+            target   = float(obj.get('target', 0))
+            valid_vals = vals[~np.isnan(vals)]
+            variance = np.var(valid_vals) if len(valid_vals) > 0 and np.var(valid_vals) > 0 else 1.0
+            train_y_list.append(-((vals - target) ** 2) / variance)
+
+    train_y  = torch.tensor(np.stack(train_y_list, axis=1), dtype=torch.float32).to(device)
+
+    kernel_name = tweaks.get('kernel', 'matern52')
+
+    def get_kernel(k_name):
+        if k_name == 'rbf':      return ScaleKernel(RBFKernel()).to(device)
+        if k_name == 'matern32': return ScaleKernel(MaternKernel(nu=1.5)).to(device)
+        if k_name == 'matern12': return ScaleKernel(MaternKernel(nu=0.5)).to(device)
+        return ScaleKernel(MaternKernel(nu=2.5)).to(device)
+
+    def build_single_model(tx, ty_slice):
+        all_dims  = list(range(tx.shape[1]))
+        cont_dims = [idx for idx in all_dims if idx not in categorical_features]
+        input_tf  = (
+            Normalize(d=tx.shape[1], bounds=bounds_t.to(compute_device)[:, cont_dims], indices=cont_dims).to(compute_device)
+            if cont_dims else None
+        )
+        if categorical_features and len(cont_dims) > 0:
+            return MixedSingleTaskGP(tx.to(compute_device), ty_slice.to(compute_device),
+                                      cat_dims=categorical_features, outcome_transform=Standardize(m=1),
+                                      input_transform=input_tf).to(compute_device)
+        return SingleTaskGP(tx.to(compute_device), ty_slice.to(compute_device),
+                             covar_module=get_kernel(kernel_name).to(compute_device),
+                             outcome_transform=Standardize(m=1), input_transform=input_tf).to(compute_device)
+
+    if train_y.shape[1] > 1:
+        models = []
+        for idx in range(train_y.shape[1]):
+            y_slice = train_y[:, idx:idx+1]
+            non_nan_mask = ~torch.isnan(y_slice.squeeze(-1))
+            tx_i = train_x[non_nan_mask]
+            ty_i = y_slice[non_nan_mask]
+            if tx_i.shape[0] == 0:
+                raise ValueError(f"No valid observations for objective '{objectives_config[idx]['name']}' after filtering missing values.")
+            models.append(build_single_model(tx_i, ty_i))
+        model   = ModelListGP(*models).to(compute_device)
+        mll     = SumMarginalLogLikelihood(model.likelihood, model).to(compute_device)
+    else:
+        model   = build_single_model(train_x, train_y)
+        mll     = ExactMarginalLogLikelihood(model.likelihood, model).to(compute_device)
+
+    try:
+        fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 100}})
+    except Exception as e:
+        print(f"Warning: Main model fit failed in estimate_bo: {e}")
+    model.eval()
+
+    # Encode Query Point
+    input_point_list = []
+    for idx, f in enumerate(features_config):
+        val = input_values[f['name']]
+        if f['type'] == 'categorical':
+            choices = [str(x).strip() for x in f['range'].split(',')]
+            val     = choices.index(str(val)) if str(val) in choices else 0
+        input_point_list.append(float(val))
+
+    test_x = torch.tensor([input_point_list], dtype=torch.float32).to(compute_device)
+
+    # Fit RAW (un-transformed) models to predict values in original units
+    raw_predictions = {}
+    for idx, obj in enumerate(objectives_config):
+        name  = obj['name']
+        y_raw = pd.to_numeric(df_clean[name], errors='coerce').values
+        
+        # Filter NaNs for raw model fitting
+        non_nan_mask = ~np.isnan(y_raw)
+        train_x_i = train_x[non_nan_mask]
+        y_raw_t = torch.tensor(y_raw[non_nan_mask], dtype=torch.float32).unsqueeze(-1).to(device)
+
+        if train_x_i.shape[0] == 0:
+            raise ValueError(f"No valid observations for objective '{name}' after filtering missing values.")
+
+        m_raw   = build_single_model(train_x_i, y_raw_t)
+        mll_raw = ExactMarginalLogLikelihood(m_raw.likelihood, m_raw).to(compute_device)
+        try:
+            fit_gpytorch_mll(mll_raw, optimizer_kwargs={"options": {"maxiter": 100}})
+        except Exception as e:
+            print(f"Warning: Raw model fit failed in estimate_bo: {e}")
+        m_raw.eval()
+
+        with torch.no_grad():
+            post_raw   = m_raw.posterior(test_x)
+            pred_raw   = post_raw.mean.item()
+            raw_predictions[name] = round(float(pred_raw), 3)
+
+    # Compute Per-Objective and Global Success Scores (0-100%)
+    success_scores    = {}
+    processed_success = []
+
+    for idx, obj in enumerate(objectives_config):
+        name        = obj['name']
+        val         = raw_predictions[name]
+        train_vals  = pd.to_numeric(df_clean[name], errors='coerce').values
+        
+        # Clean training values for scoring bounds
+        valid_train = train_vals[~np.isnan(train_vals)]
+        if len(valid_train) == 0:
+            success_scores[name] = 0.0
+            continue
+
+        if   obj['type'] == 'maximize': s = val;       t_s = valid_train
+        elif obj['type'] == 'minimize': s = -val;      t_s = -valid_train
+        else:
+            target = float(obj.get('target', 0))
+            s = -abs(val - target)
+            t_s = -np.abs(valid_train - target)
+
+        s_min, s_max = t_s.min(), t_s.max()
+        norm_s = (s - s_min) / (s_max - s_min + 1e-9) if s_max > s_min else 1.0
+        success_scores[name] = round(float(np.clip(norm_s, 0, 1) * 100), 1)
+        processed_success.append(np.clip(norm_s, 0, 1))
+
+    global_score = np.average(processed_success, weights=weights_list) if processed_success else 0
+
+    return raw_predictions, success_scores, round(float(global_score * 100), 1)
