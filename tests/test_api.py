@@ -8,6 +8,7 @@ expected HTTP status codes and JSON response structures.
 
 import pytest
 import json
+import io
 import sys
 import os
 
@@ -81,7 +82,7 @@ class TestUploadEndpoint:
     def test_upload_valid_csv(self, client, sample_csv_data):
         """POST /upload with a valid CSV should return data and columns."""
         data = {
-            'file': (sample_csv_data, 'test.csv', 'text/csv')
+            'file': (io.BytesIO(sample_csv_data), 'test.csv', 'text/csv')
         }
         resp = client.post('/upload', data=data, content_type='multipart/form-data')
         assert resp.status_code == 200
@@ -102,7 +103,7 @@ class TestUploadEndpoint:
     def test_upload_empty_filename_returns_400(self, client):
         """POST /upload with an empty filename should return HTTP 400."""
         data = {
-            'file': (b'', '', 'text/csv')
+            'file': (io.BytesIO(b''), '', 'text/csv')
         }
         resp = client.post('/upload', data=data, content_type='multipart/form-data')
         assert resp.status_code == 400
@@ -147,23 +148,4 @@ class TestDoeEndpoint:
         assert 'error' in result
 
 
-# ==============================================================================
-# Test: /export Endpoint
-# ==============================================================================
 
-class TestExportEndpoint:
-    """Tests for the CSV export endpoint."""
-
-    def test_export_returns_csv_file(self, client):
-        """POST /export with valid data should return a CSV file download."""
-        payload = {
-            'data':    [[1, 2], [3, 4]],
-            'columns': ['Feature_A', 'Objective_Y']
-        }
-        resp = client.post(
-            '/export',
-            data=json.dumps(payload),
-            content_type='application/json'
-        )
-        assert resp.status_code == 200
-        assert 'text/csv' in resp.content_type

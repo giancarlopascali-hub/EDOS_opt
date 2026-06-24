@@ -42,8 +42,7 @@ export async function runSA() {
         const row = cb.closest('tr');
         return {
             name:  cb.dataset.col,
-            type:  row.querySelector('.sa-f-type').value,
-            range: 'valid'
+            type:  row.querySelector('.sa-f-type').value
         };
     });
 
@@ -414,8 +413,7 @@ export async function runEstimate() {
             const cfg = window.saFeatureConfigs[c] || { type: 'continuous' };
             return {
                 name: c,
-                type: cfg.type,
-                range: 'x'
+                type: cfg.type
             };
         });
 

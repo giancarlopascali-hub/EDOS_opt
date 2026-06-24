@@ -65,6 +65,7 @@ def generate_doe(features_config, tweaks):
             if n_factors <= 4:
                 design = doe.fullfact([2] * n_factors).astype(float)
                 design = design * 2 - 1
+                model_type = 'fullfact'
             else:
                 design = doe.pbdesign(n_factors).astype(float)
         elif model_type in ('def_screening', 'pbdesign'):

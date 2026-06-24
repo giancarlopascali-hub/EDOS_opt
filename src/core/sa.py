@@ -59,7 +59,7 @@ def run_sa(df, features_config, objectives_config, tweaks):
         if f.get('type') == 'categorical':
             df_clean[f['name']] = df_clean[f['name']].astype(str)
 
-    feat_names = [f['name'] for f in features_config if f.get('range')]
+    feat_names = [f['name'] for f in features_config if f.get('name')]
     obj_names  = [o['name'] for o in objectives_config]
 
     if not feat_names or not obj_names:
@@ -290,7 +290,7 @@ def estimate_sa(df, input_values, features_config, objectives_config, model_name
     if df_clean.empty:
         raise ValueError('No valid data points left after filtering missing features/objectives.')
 
-    feat_names = [f['name'] for f in features_config if f.get('range')]
+    feat_names = [f['name'] for f in features_config if f.get('name')]
     obj_names  = [o['name'] for o in objectives_config]
 
     # Build Training Feature Matrix

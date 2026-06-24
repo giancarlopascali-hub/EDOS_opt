@@ -2,8 +2,7 @@ import os
 import sys
 import torch
 import pandas as pd
-from flask import Blueprint, request, jsonify, render_template, send_file
-from io import BytesIO
+from flask import Blueprint, request, jsonify, render_template
 
 # Import core modules
 from src.core.doe import generate_doe
@@ -251,21 +250,3 @@ def estimate_sa_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
-@api_bp.route('/export', methods=['POST'])
-def export_csv():
-    """Accepts a JSON payload and returns a downloadable CSV file."""
-    req_data = request.get_json()
-    data     = req_data.get('data')
-    columns  = req_data.get('columns')
-
-    df     = pd.DataFrame(data, columns=columns)
-    output = BytesIO()
-    df.to_csv(output, index=False)
-    output.seek(0)
-
-    return send_file(
-        output,
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name='edos_export.csv'
-    )

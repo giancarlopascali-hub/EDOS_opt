@@ -214,6 +214,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
     weights_t   = torch.tensor(weights_list, dtype=torch.float32).to(device)
     batch_size  = int(float(tweaks.get('batch_size', 1)))
     avoid_reval = tweaks.get('avoid_reval', True)
+    # acq_type is ignored in multi-objective mode (which always uses EHVI or scalarized posterior transform)
     acq_type    = tweaks.get('acq_type', 'EI')
     exploration = float(tweaks.get('exploration', 0.5))
 
@@ -387,7 +388,11 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
             import math
             n_combos = math.prod(len(l) for l in final_levels)
             if n_combos > 100000:
-                raise ValueError(f'Exhaustive grid is too large ({n_combos:,} combinations). Please reduce steps or categorical features.')
+                raise ValueError(
+                    f"Exhaustive grid size ({n_combos:,} combinations) exceeds the safety cap of 100,000. "
+                    "To optimize successfully, please reduce the number of steps in your 'regular' features "
+                    "or limit the categories in 'categorical' features."
+                )
 
             all_combos = list(itertools.product(*final_levels))
             train_fps  = {tuple(np.round(row, 6)) for row in train_x.cpu().numpy()}
@@ -517,8 +522,10 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
         parts = []
         for name in feat_names:
             val = row_dict[name]
-            parts.append(f"{float(val):.3f}" if isinstance(val, (int, float)) else str(val))
+            parts.append(f"{float(val):.6f}" if isinstance(val, (int, float)) else str(val))
         return "|".join(parts)
+
+
 
     existing_fps = set()
     if not df_clean.empty:
@@ -552,7 +559,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 val     = choices[idx_choice]
 
             if isinstance(val, (int, float)):
-                val = round(float(val), 3)
+                val = round(float(val), 6)
             row[f['name']] = val
         return row
 
