@@ -102,6 +102,25 @@ export function renderDoEResults(metrics) {
     const head      = document.getElementById('doe-results-head');
     const body      = document.getElementById('doe-results-body');
 
+    const warningBanner = document.getElementById('doe-warning-banner');
+    if (warningBanner) {
+        if (metrics && (metrics.runs <= 1 || metrics.resolution === 'Error' || metrics.orthogonality === 0 || metrics.efficiency === 0)) {
+            warningBanner.innerHTML = `
+                <div style="background: #fff1f2; border: 1px solid #fecdd3; color: #9f1239; padding: 1rem; border-radius: 12px; margin-bottom: 1.5rem; font-size: 0.9rem; line-height: 1.5; display: flex; gap: 0.75rem; align-items: flex-start; text-align: left;">
+                    <span style="font-size: 1.25rem;">⚠️</span>
+                    <div>
+                        <strong>Low design quality or calculation errors detected:</strong>
+                        <p style="margin: 0.25rem 0 0 0;">It is suggested to increase the "Max number of experiments" or modify/remove constraints.</p>
+                    </div>
+                </div>
+            `;
+            warningBanner.classList.remove('hidden');
+        } else {
+            warningBanner.classList.add('hidden');
+            warningBanner.innerHTML = '';
+        }
+    }
+
     if (metrics && typeof metrics === 'object') {
         const getFlag = (val, type) => {
             if (type === 'ortho') {

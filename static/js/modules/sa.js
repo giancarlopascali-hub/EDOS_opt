@@ -501,7 +501,7 @@ export async function exportSAReport() {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>EDOS Analysis Report - \${timestamp}</title>
+    <title>EDOS Analysis Report - ${timestamp}</title>
     <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"><\/script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -533,14 +533,14 @@ export async function exportSAReport() {
             <p style="margin: 5px 0 0 0; color: #64748b;">Statistical Analysis Model Results</p>
         </div>
         <div class="meta">
-            <b>Model:</b> \${activeModel}<br>
-            <b>Date:</b> \${timestamp}
+            <b>Model:</b> ${activeModel}<br>
+            <b>Date:</b> ${timestamp}
         </div>
     </div>
 
     <div class="card">
         <h2>Model Reliability &amp; Validation</h2>
-        \${reliabilityHtml}
+        ${reliabilityHtml}
     </div>
 
     <div class="card" id="num-corr-section" style="display:none;">
@@ -554,13 +554,13 @@ export async function exportSAReport() {
             <div class="tweak-item">
                 <label>Select Pair:</label>
                 <select id="report-cat-pair">
-                    \${Object.keys(catInteractions).map(p => \`<option value="\${p}">\${p}</option>\`).join('')}
+                    ${Object.keys(catInteractions).map(p => `<option value="${p}">${p}</option>`).join('')}
                 </select>
             </div>
             <div class="tweak-item">
                 <label>Select Objective:</label>
                 <select id="report-cat-obj">
-                    \${objNames.map(o => \`<option value="\${o}">\${o}</option>\`).join('')}
+                    ${objNames.map(o => `<option value="${o}">${o}</option>`).join('')}
                 </select>
             </div>
         </div>
@@ -571,8 +571,8 @@ export async function exportSAReport() {
     <div id="impact-section"></div>
 
     <script>
-        const plotsData      = \${JSON.stringify(plotsData)};
-        const catInteractions = \${JSON.stringify(catInteractions)};
+        const plotsData      = ${JSON.stringify(plotsData)};
+        const catInteractions = ${JSON.stringify(catInteractions)};
 
         const corrPlot = plotsData.find(p => p.id === 'sa-num-corr');
         if (corrPlot) {
@@ -589,7 +589,7 @@ export async function exportSAReport() {
                 if (!data) return;
                 const trace = { z: data.z, x: data.x, y: data.y, type: 'heatmap', colorscale: 'RdBu', zmin: 0, zmax: 1 };
                 const layout = {
-                    title: \\\`Optimal Outcome: \\\${obj}\\\`,
+                    title: \`Optimal Outcome: \${obj}\`,
                     xaxis: { title: pair.split(' vs ')[1], automargin: true },
                     yaxis: { title: pair.split(' vs ')[0], automargin: true },
                     margin: { l: 150, b: 80, t: 50, r: 50 }, height: 500
