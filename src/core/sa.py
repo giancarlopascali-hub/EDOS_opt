@@ -268,12 +268,13 @@ def run_sa(df, features_config, objectives_config, tweaks):
                     'y': pivot.index.tolist()
                 }
 
-    # Numerical Pearson correlation
-    num_df      = df_clean[num_features].apply(pd.to_numeric, errors='coerce').fillna(0)
-    # Fill NaNs with 0 for corr coefficients calculation
-    Y_success_filled = Y_success.fillna(0)
+    # Numerical Pearson correlation.
+    # Y_success is used directly (no NaN fill) — pandas.corr() uses pairwise complete
+    # observations, so rows where an objective is missing are excluded per pair rather
+    # than biasing the correlation toward zero.
+    num_df = df_clean[num_features].apply(pd.to_numeric, errors='coerce').fillna(0)
     num_corr_matrix = (
-        pd.concat([num_df, Y_success_filled], axis=1)
+        pd.concat([num_df, Y_success], axis=1)
         .corr().loc[extended_obj_names, num_features].fillna(0).to_dict()
     )
 

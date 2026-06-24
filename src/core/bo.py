@@ -5,7 +5,6 @@ import pandas as pd
 import torch
 from gpytorch.mlls import ExactMarginalLogLikelihood, SumMarginalLogLikelihood
 from gpytorch.kernels import RBFKernel, MaternKernel, ScaleKernel
-from gpytorch.priors import NormalPrior
 
 from botorch.models import SingleTaskGP, MixedSingleTaskGP, ModelListGP
 from botorch.models.transforms import Standardize, Normalize
@@ -260,9 +259,12 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 ).to(compute_device)
 
             if is_noiseless:
-                m.likelihood.noise_covar.register_prior(
-                    "noise_prior", NormalPrior(1e-4, 1e-5), "noise"
-                )
+                # Pin noise to a small constant and freeze it so model fitting
+                # cannot increase it. This enforces near-noiseless behavior rather
+                # than just softly encouraging low noise via a prior.
+                with torch.no_grad():
+                    m.likelihood.noise_covar.noise = torch.tensor(1e-4, device=compute_device)
+                m.likelihood.noise_covar.raw_noise.requires_grad_(False)
 
             return m.to(compute_device)
 

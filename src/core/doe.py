@@ -116,10 +116,14 @@ def generate_doe(features_config, tweaks):
                     rng.shuffle(strat)
                     entry[feat['name']] = strat[row_idx]
                 else:
-                    idx = 0
+                    # Map coded value to category:
+                    #   +1 → last choice (high level)
+                    #   -1 → first choice (low level)
+                    #   ~0 → rotate through all choices per row_idx (avoids all center-point
+                    #        rows receiving the same fixed middle level)
                     if   row[i] >  0.5: idx = len(feat['choices']) - 1
                     elif row[i] < -0.5: idx = 0
-                    else:               idx = len(feat['choices']) // 2
+                    else:               idx = row_idx % len(feat['choices'])
                     entry[feat['name']] = feat['choices'][idx]
             else:
                 val = feat['low'] + (row[i] + 1) / 2 * (feat['high'] - feat['low'])

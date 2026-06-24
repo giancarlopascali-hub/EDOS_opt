@@ -348,11 +348,15 @@ export function renderSAResults(result) {
         <div style="margin-bottom: 10px; font-weight: 600; color: var(--accent-color);">
             Active Model: ${document.getElementById('sa-model-select').options[document.getElementById('sa-model-select').selectedIndex].text}
         </div>
+        <div style="margin-bottom: 12px; font-size: 0.82rem; color: var(--text-secondary); background: var(--bg-secondary, #f8fafc); border-left: 3px solid var(--accent-color); padding: 8px 12px; border-radius: 4px;">
+            ℹ️ <b>Note:</b> R² is measured on the normalized success space [0–1], not on raw objective values.
+            A high R² means the model reliably predicts relative performance, not absolute measurements.
+        </div>
         <table class="setup-table" style="width: 100%; border-collapse: collapse; margin-top: 10px;">
             <thead>
                 <tr style="text-align: left; border-bottom: 2px solid var(--border-color);">
                     <th style="padding: 10px;">Objective</th>
-                    <th style="padding: 10px;">Predictive Power (R²)</th>
+                    <th style="padding: 10px;">Predictive Power (R²) <span title="R² is computed on the normalized success space [0–1]. It reflects how well the model predicts relative performance, not raw measurement values." style="cursor:help; color:var(--text-secondary); font-size:0.85em;">ⓘ</span></th>
                     <th style="padding: 10px;">Status</th>
                     <th style="padding: 10px;">Suggestion</th>
                 </tr>
