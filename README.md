@@ -24,7 +24,7 @@ pinned: false
 
 ## Installation and Running (Windows Standalone)
 
-1. **Web-app**: You can use the most updated version of the app online on [EDOS](https://realgcp-edos-app.hf.space/) page.
+1. **Web-app**: You can use the most updated version of the app online on [EDOS](https://realgcp-edos-app-old.hf.space/) page.
 2. **Download**: You can download the latest standalone version from the [Releases](https://github.com/giancarlopascali-hub/EDOS_opt/releases) page. This version is not up to date as the online one, but gives the freedom of no internet connection required to run. New releases will be available in the future, with several fixes and improvement, to align with the online version.
 3. **Extract**: Right-click the `EDOS_v4.0_Standalone.zip` file and select "Extract All...".
 4. **Run**: 
