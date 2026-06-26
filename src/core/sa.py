@@ -22,7 +22,7 @@ def clean_dataframe_sa(df, features_config, objectives_config):
         else:
             valid_feat_mask = valid_feat_mask & col_series.notna() & (col_series.astype(str).str.strip() != "")
             
-    df_clean = df[valid_feat_mask].copy()
+    df_clean = df[valid_feat_mask].reset_index(drop=True).copy()
     
     if not objectives_config:
         return df_clean
@@ -42,7 +42,7 @@ def clean_dataframe_sa(df, features_config, objectives_config):
         # Multi-objective case: drop rows missing ALL objectives
         valid_obj_mask = obj_df_numeric.notna().any(axis=1)
         
-    df_clean = df_clean[valid_obj_mask].copy()
+    df_clean = df_clean[valid_obj_mask].reset_index(drop=True).copy()
     return df_clean
 
 
