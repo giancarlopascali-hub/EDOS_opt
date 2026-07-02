@@ -241,6 +241,26 @@ export function renderSAResults(result) {
     const impactContainer = document.getElementById('sa-impact-container');
     impactContainer.innerHTML = '';
 
+    const globalCatMap = {};
+    objNames.forEach(obj => {
+        const res = result.results[obj];
+        if (res && res.shap_data && res.shap_data.features) {
+            res.shap_data.features.forEach((feat, i) => {
+                const fVals = res.shap_data.feature_values[i];
+                let isCategorical = fVals.some(v => isNaN(parseFloat(v)));
+                if (isCategorical) {
+                    if (!globalCatMap[feat]) {
+                        globalCatMap[feat] = new Set();
+                    }
+                    fVals.forEach(v => globalCatMap[feat].add(v));
+                }
+            });
+        }
+    });
+    Object.keys(globalCatMap).forEach(feat => {
+        globalCatMap[feat] = Array.from(globalCatMap[feat]).sort();
+    });
+
     objNames.forEach((obj, idx) => {
         const res = result.results[obj];
         if (!res || !res.importance) return;
@@ -297,7 +317,7 @@ export function renderSAResults(result) {
                 let colorArray, cmin, cmax, colorscale, reversescale;
 
                 if (isCategorical) {
-                    const uniqueStr = [...new Set(fVals)];
+                    const uniqueStr = globalCatMap[feat] || [...new Set(fVals)].sort();
                     colorArray   = fVals.map(v => uniqueStr.indexOf(v));
                     colorscale   = 'Portland'; reversescale = false;
                 } else {
@@ -489,7 +509,9 @@ export async function exportSAReport() {
             capturePlot(el.id, el.layout?.title?.text || el.layout?.title || 'Parallel Coordinates');
         });
         document.querySelectorAll('[id^="sa-bar-"], [id^="sa-shap-"]').forEach(el => {
-            capturePlot(el.id, el.layout?.title?.text || el.layout?.title || 'Feature Impact');
+            const h3 = el.parentElement ? el.parentElement.querySelector('h3') : null;
+            const title = (h3 ? h3.textContent : null) || el.layout?.title?.text || el.layout?.title || 'Feature Impact Group';
+            capturePlot(el.id, title);
         });
 
         const reliabilityHtml  = document.getElementById('sa-reliability-info').innerHTML;
@@ -624,7 +646,7 @@ export async function exportSAReport() {
             barPlots.forEach((p, idx) => {
                 const group   = document.createElement('div');
                 group.className = 'card';
-                group.innerHTML = '<h3>' + (p.layout.title?.text || p.layout.title || 'Feature Impact Group') + '</h3><div class="impact-group"></div>';
+                group.innerHTML = '<h3>' + (p.title || p.layout.title?.text || p.layout.title || 'Feature Impact Group') + '</h3><div class="impact-group"></div>';
                 const container = group.querySelector('.impact-group');
 
                 const barDiv = document.createElement('div');
