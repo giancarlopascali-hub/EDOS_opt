@@ -4,16 +4,23 @@ export function safeAddListener(id, event, callback) {
     else console.warn(`Element with ID "${id}" not found. skipping listener.`);
 }
 
-export async function exportData(data, columns) {
-    const res  = await fetch('/export', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ data, columns })
-    });
-    const blob = await res.blob();
+export function exportData(data, columns) {
+    // Build CSV entirely client-side — no server round-trip needed
+    const escape = (v) => {
+        const s = (v === null || v === undefined) ? '' : String(v);
+        return s.includes(',') || s.includes('"') || s.includes('\n')
+            ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const rows = [
+        columns.map(escape).join(','),
+        ...data.map(row => row.map(escape).join(','))
+    ];
+    const csv  = rows.join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
     a.href = url; a.download = 'export.csv'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 export function detectParetoIndices(data, objCols) {
