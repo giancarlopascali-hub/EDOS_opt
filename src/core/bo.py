@@ -218,9 +218,51 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
     acq_type    = tweaks.get('acq_type', 'EI')
     exploration = float(tweaks.get('exploration', 0.5))
 
+    # Hoist constraint extraction so variables are always in scope (needed on cold start too)
+    constraints_cfg  = tweaks.get('constraints', {})
+    num_rules        = constraints_cfg.get('numerical', [])
+    disallowed_rules = constraints_cfg.get('disallowed', [])
+
     # STEP 3 — Optimization Logic
     if df_clean.empty:
-        candidates = draw_sobol_samples(bounds=bounds_t, n=1, q=batch_size).squeeze(0)
+        # Cold start: generate Sobol candidates and filter by constraints if any
+        n_pool = max(batch_size * 500, 2000)
+        pool   = draw_sobol_samples(bounds=bounds_t, n=1, q=n_pool).squeeze(0)
+        if num_rules or disallowed_rules:
+            feasible = []
+            for pt in pool:
+                decoded = {}
+                for idx_f, f in enumerate(features_config):
+                    v = pt[idx_f].item()
+                    if f['type'] == 'categorical':
+                        choices = [x.strip() for x in f['range'].split(',')]
+                        v = choices[max(0, min(len(choices) - 1, int(round(v))))]
+                    elif f['type'] in ('discrete', 'regular'):
+                        matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
+                        if f['type'] == 'discrete':
+                            d_vals = sorted([float(x.strip()) for x in f['range'].replace('[','').replace(']','').split(',') if x.strip()])
+                        elif len(matches) >= 3:
+                            lo, hi, st = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
+                            d_vals = np.linspace(lo, hi, st).tolist()
+                        elif len(matches) == 2:
+                            d_vals = np.linspace(float(matches[0]), float(matches[1]), 10).tolist()
+                        else:
+                            d_vals = []
+                        if d_vals:
+                            v = min(d_vals, key=lambda x: abs(x - v))
+                    if isinstance(v, (int, float)):
+                        v = round(float(v), 6)
+                    decoded[f['name']] = v
+                if check_constraints(decoded, num_rules, disallowed_rules, features_config):
+                    feasible.append(pt)
+                if len(feasible) >= batch_size:
+                    break
+            if feasible:
+                candidates = torch.stack(feasible[:batch_size])
+            else:
+                candidates = draw_sobol_samples(bounds=bounds_t, n=1, q=batch_size).squeeze(0)
+        else:
+            candidates = draw_sobol_samples(bounds=bounds_t, n=1, q=batch_size).squeeze(0)
     else:
         kernel_name  = tweaks.get('kernel', 'matern52')
         is_noiseless = tweaks.get('noiseless', False)
@@ -403,10 +445,6 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
 
             candidates_grid = torch.tensor(filtered_combos, dtype=torch.float32).to(OPT_DEVICE)
 
-            constraints_cfg = tweaks.get('constraints', {})
-            num_rules = constraints_cfg.get('numerical', [])
-            disallowed_rules = constraints_cfg.get('disallowed', [])
-            
             if num_rules or disallowed_rules:
                 feasible_indices = []
                 for idx, cand in enumerate(filtered_combos):
@@ -455,9 +493,6 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
 
         else:
             p_constraints = []
-            constraints_cfg = tweaks.get('constraints', {})
-            num_rules = constraints_cfg.get('numerical', [])
-            disallowed_rules = constraints_cfg.get('disallowed', [])
             if num_rules:
                 indices = {f['name']: idx for idx, f in enumerate(features_config)}
                 for expr in num_rules:
