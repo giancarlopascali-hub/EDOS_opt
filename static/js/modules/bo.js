@@ -84,6 +84,9 @@ export async function runBO() {
     if (estRes)   estRes.innerHTML = '';
     const boResContainer = document.getElementById('bo-results-container');
     if (boResContainer) boResContainer.classList.add('hidden');
+    // Clear any stale exhaustion banner from a previous run
+    const staleExhBanner = document.getElementById('bo-exhaustion-banner');
+    if (staleExhBanner) staleExhBanner.remove();
 
     const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
         .filter(tr => tr.querySelector('.bo-f-include').checked)
@@ -145,6 +148,12 @@ export async function runBO() {
         const result = await res.json();
         document.getElementById('loading-overlay').classList.add('hidden');
         if (result.error) return alert("Optimization Error: " + result.error);
+
+        // Handle exhaustion: all optimal conditions have already been tested
+        if (result.exhausted) {
+            renderBOExhaustedBanner(result);
+            return;
+        }
 
         window.suggestionsData = result.suggestions;
 
@@ -220,6 +229,56 @@ export async function runBO() {
     section.classList.remove('hidden');
     renderTrendPlot();
     section.scrollIntoView({ behavior: 'smooth' });
+}
+
+export function renderBOExhaustedBanner(result) {
+    const boResContainer = document.getElementById('bo-results-container');
+    if (boResContainer) boResContainer.classList.remove('hidden');
+
+    const head    = document.getElementById('results-table-head');
+    const body    = document.getElementById('results-table-body');
+    const section = document.getElementById('results-section');
+    if (head) head.innerHTML = '';
+    if (body) body.innerHTML = '';
+
+    const container = boResContainer || section;
+    let banner = document.getElementById('bo-exhaustion-banner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'bo-exhaustion-banner';
+        if (container) container.prepend(banner);
+    }
+
+    banner.innerHTML = `
+        <div style="
+            background: linear-gradient(135deg,#fef3c7,#fffbeb);
+            border-left: 4px solid #f59e0b;
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        ">
+            <span style="font-size:1.5rem">⚠️</span>
+            <div>
+                <b style="color:#92400e">All optimal conditions have already been tested.</b><br>
+                <span style="color:#78350f;font-size:0.9rem">
+                    BO could not find new distinct combinations at the current
+                    significant-figure precision. To explore further, try:<br>
+                    &nbsp;• Increase the <b>Exploration</b> slider<br>
+                    &nbsp;• Switch the <b>Kernel</b> or <b>Acquisition Function</b><br>
+                    &nbsp;• Expand the feature <b>ranges</b><br>
+                    &nbsp;• Uncheck <b>Avoid Re-evaluation</b> to allow revisiting candidates
+                </span>
+            </div>
+        </div>`;
+
+    if (result && result.performance) renderBOPerformanceTable(result.performance);
+    if (section) {
+        section.classList.remove('hidden');
+        section.scrollIntoView({ behavior: 'smooth' });
+    }
 }
 
 export function renderBOPerformanceTable(performance) {

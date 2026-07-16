@@ -114,6 +114,13 @@ def optimize():
             compute_device=COMPUTE_DEVICE
         )
 
+        # Exhaustion sentinel: all optimal conditions have already been tested
+        if suggestions is None:
+            return jsonify(clean_json_data({
+                'exhausted': True,
+                'performance': performance_results
+            }))
+
         return jsonify(clean_json_data({'suggestions': suggestions, 'performance': performance_results}))
 
     except Exception as e:

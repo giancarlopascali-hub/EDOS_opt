@@ -115,6 +115,28 @@ def clean_dataframe(df, features_config, objectives_config):
     return df_clean
 
 
+def infer_decimal_precision(col_series: pd.Series, range_str: str) -> int:
+    """
+    Return the maximum number of decimal places seen in col_series.
+    Fallback chain:
+      1. Maximum decimals across non-null dataset values
+      2. Maximum decimals seen in range_str tokens
+      3. 1  (safe default – avoids integer-only snapping when no decimals present)
+    """
+    max_dec = 0
+    for raw in col_series.dropna().astype(str):
+        m = re.search(r'\.(\d+)$', raw.strip())
+        if m:
+            max_dec = max(max_dec, len(m.group(1)))
+    if max_dec == 0 and range_str:
+        for tok in re.findall(r'[-+]?\d*\.?\d+', range_str):
+            m = re.search(r'\.(\d+)$', tok)
+            if m:
+                max_dec = max(max_dec, len(m.group(1)))
+    # Default to 1 decimal when no decimal precision is evident in data or range
+    return max_dec if max_dec > 0 else 1
+
+
 def run_bo_optimization(df, features_config, objectives_config, tweaks, device, compute_device):
     # Filter the dataframe to drop incomplete rows
     df_clean = clean_dataframe(df, features_config, objectives_config)
@@ -187,6 +209,18 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
     else:
         train_x  = torch.zeros((0, len(features_config)), dtype=torch.float32).to(device)
     bounds_t = torch.tensor(bounds, dtype=torch.float32).T.to(device)
+
+    # Build per-feature decimal precision for continuous features
+    # (used later by get_fingerprint and decode_cand)
+    feature_precision = {}
+    for f in features_config:
+        if f['type'] == 'continuous':
+            col_s = (
+                df_clean[f['name']].astype(str)
+                if (not df_clean.empty and f['name'] in df_clean.columns)
+                else pd.Series(dtype=str)
+            )
+            feature_precision[f['name']] = infer_decimal_precision(col_s, f['range'])
 
     # STEP 2 — Build Training Objectives (Y)
     train_y_list = []
@@ -557,7 +591,11 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
         parts = []
         for name in feat_names:
             val = row_dict[name]
-            parts.append(f"{float(val):.6f}" if isinstance(val, (int, float)) else str(val))
+            if isinstance(val, (int, float)):
+                prec = feature_precision.get(name, 6)
+                parts.append(f"{float(val):.{prec}f}")
+            else:
+                parts.append(str(val))
         return "|".join(parts)
 
 
@@ -594,11 +632,13 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 val     = choices[idx_choice]
 
             if isinstance(val, (int, float)):
-                val = round(float(val), 6)
+                prec = feature_precision.get(f['name'], 6)
+                val = round(float(val), prec)
             row[f['name']] = val
         return row
 
     suggestions = []
+    duplicate_count = 0  # tracks candidates rejected solely due to fingerprint collision
     for cand in candidates:
         suggestion = decode_cand(cand)
 
@@ -639,6 +679,12 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                             t_cand[idx] = float((cur_idx + attempts) % len(choices))
                 suggestion = decode_cand(t_cand)
 
+        # If avoid_reval is on and the candidate is still a known fingerprint after
+        # all retry attempts, count it as a duplicate and skip (do not append).
+        if avoid_reval and get_fingerprint(suggestion) in existing_fps:
+            duplicate_count += 1
+            continue
+
         suggestions.append(suggestion)
         existing_fps.add(get_fingerprint(suggestion))
 
@@ -665,7 +711,12 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
         except Exception as e:
             print(f"Error in Sobol gap-filling: {e}")
 
-    if not suggestions:
+    # Exhaustion flag: if avoid_reval is active and every candidate was a
+    # precision-rounded duplicate (not a constraint failure), we will signal
+    # exhaustion after computing performance metrics (so the user still gets R² info).
+    is_exhausted = avoid_reval and len(suggestions) == 0 and duplicate_count > 0
+
+    if not is_exhausted and not suggestions:
         raise ValueError('No suggestions satisfy the specified constraints.')
 
     # Cross-Validation
@@ -770,6 +821,10 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 'r2':     round(float(avg_r2_g), 3),
                 'status': 'Good' if avg_r2_g > 0.7 else ('Limited' if avg_r2_g >= 0.4 else 'Poor')
             }
+
+    # Return exhaustion sentinel after CV so performance table is still populated
+    if is_exhausted:
+        return None, performance_results
 
     return suggestions, performance_results
 
