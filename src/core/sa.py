@@ -7,6 +7,7 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import permutation_importance
 import shap
+from src.core.bo import infer_decimal_precision
 
 def clean_dataframe_sa(df, features_config, objectives_config):
     # 1. Feature filtering: Drop rows missing any required feature value
@@ -325,7 +326,9 @@ def estimate_sa(df, input_values, features_config, objectives_config, model_name
 
     # Fit Model and Predict per-objective using valid data
     predictions = {}
+    std_errors  = {}
     for obj in obj_names:
+        prec = infer_decimal_precision(df_clean[obj])
         y_obj = Y[obj]
         valid_mask = y_obj.notna()
         X_tr_obj = X_train_data[valid_mask]
@@ -333,6 +336,7 @@ def estimate_sa(df, input_values, features_config, objectives_config, model_name
 
         if len(y_tr_obj) == 0:
             predictions[obj] = 0.0
+            std_errors[obj]  = 0.0
             continue
 
         if model_name == 'random_forest':
@@ -340,6 +344,10 @@ def estimate_sa(df, input_values, features_config, objectives_config, model_name
                 n_estimators=int(params.get('n_estimators', 100)),
                 max_depth=int(params.get('max_depth', 10)) if params.get('max_depth') else None
             )
+            model.fit(X_tr_obj, y_tr_obj)
+            pred = model.predict(input_data)[0]
+            tree_preds = [tree.predict(input_data)[0] for tree in model.estimators_]
+            std_err = float(np.std(tree_preds))
         elif model_name == 'mlp':
             hidden_layers = str(params.get('mlp_layers', '100'))
             layers = [int(x.strip()) for x in hidden_layers.split(',') if x.strip()]
@@ -348,12 +356,33 @@ def estimate_sa(df, input_values, features_config, objectives_config, model_name
                 max_iter=int(params.get('mlp_iter', 500)),
                 random_state=42
             )
+            model.fit(X_tr_obj, y_tr_obj)
+            pred = model.predict(input_data)[0]
+            y_pred_tr = model.predict(X_tr_obj)
+            residuals = y_tr_obj.values - y_pred_tr
+            dof = max(1, len(y_tr_obj) - 1)
+            std_err = float(np.sqrt(np.sum(residuals**2) / dof))
         else:
             model = lm.LinearRegression()
+            model.fit(X_tr_obj, y_tr_obj)
+            pred = model.predict(input_data)[0]
+            y_pred_tr = model.predict(X_tr_obj)
+            residuals = y_tr_obj.values - y_pred_tr
+            n = len(y_tr_obj)
+            p = X_tr_obj.shape[1]
+            dof = max(1, n - p - 1)
+            s_e2 = np.sum(residuals**2) / dof
+            try:
+                X_mat = X_tr_obj.values
+                x0 = input_data.values[0]
+                XtX_inv = np.linalg.pinv(X_mat.T @ X_mat)
+                leverage = float(x0 @ XtX_inv @ x0)
+                std_err = float(np.sqrt(s_e2 * (1.0 + leverage)))
+            except Exception:
+                std_err = float(np.sqrt(s_e2))
 
-        model.fit(X_tr_obj, y_tr_obj)
-        pred             = model.predict(input_data)[0]
-        predictions[obj] = round(float(pred), 3)
+        predictions[obj] = round(float(pred), prec)
+        std_errors[obj]  = round(float(std_err), prec + 2)
 
     # Compute Success Scores
     success_feedback  = {}
@@ -408,4 +437,4 @@ def estimate_sa(df, input_values, features_config, objectives_config, model_name
     else:
         global_score = 0
 
-    return predictions, success_feedback, round(float(global_score * 100), 1)
+    return predictions, std_errors, success_feedback, round(float(global_score * 100), 1)

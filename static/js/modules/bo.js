@@ -400,9 +400,11 @@ export async function runBOEstimate() {
         html += '<b>Predictions:</b><br>';
         for (const obj in result.predictions) {
             const val  = result.predictions[obj];
+            const err  = result.std_errors ? result.std_errors[obj] : null;
             const succ = result.success_scores[obj];
-            html += `<div style="display: flex; justify-content: space-between; margin: 4px 0;">
-                        <span><b>${obj}:</b> ${val}</span>
+            const errBadge = (err !== null && err !== undefined) ? `<span style="font-size: 0.85rem; color: var(--text-secondary); margin-left: 4px;">(&plusmn; ${err})</span>` : '';
+            html += `<div style="display: flex; justify-content: space-between; align-items: center; margin: 4px 0;">
+                        <span><b>${obj}:</b> ${val}${errBadge}</span>
                         <span style="color: ${succ > 80 ? '#22c55e' : (succ > 50 ? '#f59e0b' : '#ef4444')}">Success: ${succ}%</span>
                      </div>`;
         }

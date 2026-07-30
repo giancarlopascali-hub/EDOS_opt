@@ -166,7 +166,7 @@ def estimate_bo():
         if df.empty:
             return jsonify({'error': 'Cannot estimate with no data points.'}), 400
 
-        raw_predictions, success_scores, global_score = run_bo_estimation(
+        raw_predictions, raw_std_errors, success_scores, global_score = run_bo_estimation(
             df=df,
             input_values=input_values,
             features_config=features_config,
@@ -178,6 +178,7 @@ def estimate_bo():
 
         return jsonify(clean_json_data({
             'predictions':    raw_predictions,
+            'std_errors':     raw_std_errors,
             'success_scores': success_scores,
             'global_success': global_score
         }))
@@ -238,7 +239,7 @@ def estimate_sa_endpoint():
 
         df         = pd.DataFrame(data, columns=columns)
         
-        predictions, success_feedback, global_score = estimate_sa(
+        predictions, std_errors, success_feedback, global_score = estimate_sa(
             df=df,
             input_values=input_values,
             features_config=features_config,
@@ -249,6 +250,7 @@ def estimate_sa_endpoint():
 
         return jsonify(clean_json_data({
             'predictions':    predictions,
+            'std_errors':     std_errors,
             'success_scores': success_feedback,
             'global_success': global_score
         }))

@@ -115,12 +115,12 @@ def clean_dataframe(df, features_config, objectives_config):
     return df_clean
 
 
-def infer_decimal_precision(col_series: pd.Series, range_str: str) -> int:
+def infer_decimal_precision(col_series: pd.Series, range_str: str = '') -> int:
     """
     Return the maximum number of decimal places seen in col_series.
     Fallback chain:
       1. Maximum decimals across non-null dataset values
-      2. Maximum decimals seen in range_str tokens
+      2. Maximum decimals seen in range_str tokens (if provided)
       3. 1  (safe default – avoids integer-only snapping when no decimals present)
     """
     max_dec = 0
@@ -955,8 +955,10 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
 
     # Fit RAW (un-transformed) models to predict values in original units
     raw_predictions = {}
+    raw_std_errors  = {}
     for idx, obj in enumerate(objectives_config):
         name  = obj['name']
+        prec  = infer_decimal_precision(df_clean[name])
         y_raw = pd.to_numeric(df_clean[name], errors='coerce').values
         
         # Filter NaNs for raw model fitting
@@ -978,7 +980,9 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
         with torch.no_grad():
             post_raw   = m_raw.posterior(test_x)
             pred_raw   = post_raw.mean.item()
-            raw_predictions[name] = round(float(pred_raw), 3)
+            std_raw    = post_raw.stddev.item()
+            raw_predictions[name] = round(float(pred_raw), prec)
+            raw_std_errors[name]  = round(float(std_raw), prec + 2)
 
     # Compute Per-Objective and Global Success Scores (0-100%)
     success_scores    = {}
@@ -1009,4 +1013,4 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
 
     global_score = np.average(processed_success, weights=weights_list) if processed_success else 0
 
-    return raw_predictions, success_scores, round(float(global_score * 100), 1)
+    return raw_predictions, raw_std_errors, success_scores, round(float(global_score * 100), 1)
