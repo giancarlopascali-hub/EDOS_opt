@@ -210,11 +210,11 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
         train_x  = torch.zeros((0, len(features_config)), dtype=torch.float32).to(device)
     bounds_t = torch.tensor(bounds, dtype=torch.float32).T.to(device)
 
-    # Build per-feature decimal precision for continuous features
-    # (used later by get_fingerprint and decode_cand)
+    # Build per-feature decimal precision for continuous/regular/discrete features
+    # (used later by get_fingerprint and decode_cand to round suggested values)
     feature_precision = {}
     for f in features_config:
-        if f['type'] == 'continuous':
+        if f['type'] in ('continuous', 'regular', 'discrete'):
             col_s = (
                 df_clean[f['name']].astype(str)
                 if (not df_clean.empty and f['name'] in df_clean.columns)
@@ -505,7 +505,8 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                             val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
                         
                         if isinstance(val, (int, float)):
-                            val = round(float(val), 3)
+                            prec = feature_precision.get(f['name'], 6)
+                            val = round(float(val), prec)
                         row_dict[f['name']] = val
 
                     if check_constraints(row_dict, num_rules, disallowed_rules, features_config):
