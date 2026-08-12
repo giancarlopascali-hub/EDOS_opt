@@ -1000,4 +1000,69 @@ tr:last-child td.highlight-objective-col {
         opacity: 1;
         transform: translateY(0);
     }
-}
+}
+
+/* Segmented Switch Control for Max/Exact DoE experiment count */
+.segmented-switch-container {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-bottom: 0.5rem;
+}
+
+.segmented-switch-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.segmented-switch {
+    display: inline-flex;
+    background: #e2e8f0;
+    border-radius: 8px;
+    padding: 3px;
+    gap: 2px;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+    transition: all 0.2s ease;
+}
+
+.segmented-switch-btn {
+    border: none;
+    background: transparent;
+    padding: 0.3rem 0.85rem;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #64748b;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    user-select: none;
+}
+
+.segmented-switch-btn:hover:not(:disabled):not(.active) {
+    color: #0f172a;
+    background: rgba(255, 255, 255, 0.5);
+}
+
+.segmented-switch-btn.active {
+    background: #ffffff;
+    color: var(--accent-color, #0ea5e9);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.segmented-switch.disabled {
+    background: #f1f5f9;
+    opacity: 0.7;
+}
+
+.segmented-switch.disabled .segmented-switch-btn {
+    cursor: not-allowed;
+}
+
+.segmented-switch.disabled .segmented-switch-btn.active {
+    background: #cbd5e1;
+    color: #334155;
+    box-shadow: none;
+}
+

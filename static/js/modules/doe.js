@@ -44,31 +44,50 @@ export function attachDeleteEvents() {
 // ---------------------------------------------------------------------------
 
 /**
+ * Set the Max/Exact switch state and block/unblock controls.
+ */
+function setExactRunsMode(isExact, isBlocked = false) {
+    const hiddenCheckbox  = document.getElementById('doe-exact-runs-toggle');
+    const switchMaxBtn    = document.getElementById('doe-switch-max-btn');
+    const switchExactBtn  = document.getElementById('doe-switch-exact-btn');
+    const switchContainer = document.getElementById('doe-runs-switch');
+    const runsLabel       = document.getElementById('doe-runs-label');
+
+    if (hiddenCheckbox) hiddenCheckbox.checked = isExact;
+
+    if (switchMaxBtn && switchExactBtn && switchContainer) {
+        if (isExact) {
+            switchMaxBtn.classList.remove('active');
+            switchExactBtn.classList.add('active');
+            if (runsLabel) runsLabel.textContent = 'Exact Experiments';
+        } else {
+            switchExactBtn.classList.remove('active');
+            switchMaxBtn.classList.add('active');
+            if (runsLabel) runsLabel.textContent = 'Max Experiments';
+        }
+
+        if (isBlocked) {
+            switchMaxBtn.disabled   = true;
+            switchExactBtn.disabled = true;
+            switchContainer.classList.add('disabled');
+            switchContainer.title   = "LHS and D-Optimal require an exact run count";
+        } else {
+            switchMaxBtn.disabled   = false;
+            switchExactBtn.disabled = false;
+            switchContainer.classList.remove('disabled');
+            switchContainer.title   = "Switch between Max and Exact experiment count";
+        }
+    }
+}
+
+/**
  * Sync the Max/Exact toggle state to the selected model.
- * LHS and D-Optimal are inherently exact-N: force the toggle ON and grey it out.
- * All other (structured) models: reset to Max and re-enable the toggle.
+ * LHS and D-Optimal are inherently exact-N: force to Exact and block controls.
+ * All other (structured) models: reset to Max and re-enable controls.
  */
 function syncToggleToModel(modelValue) {
-    const toggle      = document.getElementById('doe-exact-runs-toggle');
-    const toggleLabel = document.getElementById('doe-exact-runs-toggle-label');
-    const runsLabel   = document.getElementById('doe-runs-label');
-    if (!toggle || !toggleLabel || !runsLabel) return;
-
     const isExactOnly = (modelValue === 'lhs' || modelValue === 'doptimal');
-
-    if (isExactOnly) {
-        toggle.checked            = true;
-        toggle.disabled           = true;
-        toggleLabel.style.opacity = '0.45';
-        toggleLabel.style.cursor  = 'not-allowed';
-        runsLabel.textContent     = 'Exact Experiments';
-    } else {
-        toggle.checked            = false;
-        toggle.disabled           = false;
-        toggleLabel.style.opacity = '1';
-        toggleLabel.style.cursor  = '';
-        runsLabel.textContent     = 'Max Experiments';
-    }
+    setExactRunsMode(isExactOnly, isExactOnly);
 }
 
 // ---------------------------------------------------------------------------
@@ -101,13 +120,21 @@ function updateDoptMinNHint() {
 // ---------------------------------------------------------------------------
 
 function initDoEListeners() {
-    // Toggle: update label text when user manually flips (enabled state only)
-    const toggle = document.getElementById('doe-exact-runs-toggle');
-    if (toggle) {
-        toggle.addEventListener('change', (e) => {
-            const runsLabel = document.getElementById('doe-runs-label');
-            if (runsLabel) {
-                runsLabel.textContent = e.target.checked ? 'Exact Experiments' : 'Max Experiments';
+    const switchMaxBtn   = document.getElementById('doe-switch-max-btn');
+    const switchExactBtn = document.getElementById('doe-switch-exact-btn');
+
+    if (switchMaxBtn) {
+        switchMaxBtn.addEventListener('click', () => {
+            if (!switchMaxBtn.disabled) {
+                setExactRunsMode(false, false);
+            }
+        });
+    }
+
+    if (switchExactBtn) {
+        switchExactBtn.addEventListener('click', () => {
+            if (!switchExactBtn.disabled) {
+                setExactRunsMode(true, false);
             }
         });
     }
