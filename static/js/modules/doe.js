@@ -19,7 +19,6 @@ export function attachDeleteEvents() {
                 const name = nameInput.value;
                 if (window.objectiveConfigs[name]) {
                     delete window.objectiveConfigs[name];
-                    // We import rebalanceObjectiveConfigs dynamically if needed, or get it from window
                     if (window.rebalanceObjectiveConfigs) window.rebalanceObjectiveConfigs();
                 }
             }
@@ -28,6 +27,10 @@ export function attachDeleteEvents() {
             if (window.currentModule === 'doe') {
                 rebalanceDoEDOM();
                 updateAllConstraintsDropdowns('doe');
+                // Refresh the min-N hint if D-Optimal is active
+                if (document.getElementById('doe-model-select')?.value === 'doptimal') {
+                    updateDoptMinNHint();
+                }
             } else {
                 if (window.renderSetup) window.renderSetup();
                 updateAllConstraintsDropdowns('bo');
@@ -35,6 +38,111 @@ export function attachDeleteEvents() {
         };
     });
 }
+
+// ---------------------------------------------------------------------------
+// Toggle helpers – Max / Exact experiment count
+// ---------------------------------------------------------------------------
+
+/**
+ * Sync the Max/Exact toggle state to the selected model.
+ * LHS and D-Optimal are inherently exact-N: force the toggle ON and grey it out.
+ * All other (structured) models: reset to Max and re-enable the toggle.
+ */
+function syncToggleToModel(modelValue) {
+    const toggle      = document.getElementById('doe-exact-runs-toggle');
+    const toggleLabel = document.getElementById('doe-exact-runs-toggle-label');
+    const runsLabel   = document.getElementById('doe-runs-label');
+    if (!toggle || !toggleLabel || !runsLabel) return;
+
+    const isExactOnly = (modelValue === 'lhs' || modelValue === 'doptimal');
+
+    if (isExactOnly) {
+        toggle.checked            = true;
+        toggle.disabled           = true;
+        toggleLabel.style.opacity = '0.45';
+        toggleLabel.style.cursor  = 'not-allowed';
+        runsLabel.textContent     = 'Exact Experiments';
+    } else {
+        toggle.checked            = false;
+        toggle.disabled           = false;
+        toggleLabel.style.opacity = '1';
+        toggleLabel.style.cursor  = '';
+        runsLabel.textContent     = 'Max Experiments';
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D-Optimal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute and display the minimum-N hint beneath the run-count input.
+ * Only shown when D-Optimal is the selected model.
+ */
+function updateDoptMinNHint() {
+    const isDopt  = document.getElementById('doe-model-select')?.value === 'doptimal';
+    const hintEl  = document.getElementById('doe-dopt-min-n-hint');
+    if (!hintEl) return;
+    if (!isDopt) { hintEl.style.display = 'none'; return; }
+
+    const k     = document.querySelectorAll('#doe-features-list tr').length;
+    const order = document.getElementById('doe-dopt-order-select')?.value ?? 'quadratic';
+    let minN;
+    if      (order === 'linear')       minN = k + 1;
+    else if (order === 'interaction')  minN = k + Math.floor(k * (k - 1) / 2) + 1;
+    else                               minN = Math.floor((k + 1) * (k + 2) / 2);  // quadratic
+
+    hintEl.textContent   = `Min recommended: ${minN} runs for ${k} factor${k !== 1 ? 's' : ''}`;
+    hintEl.style.display = 'block';
+}
+
+// ---------------------------------------------------------------------------
+// Wire up listeners (called once on module init)
+// ---------------------------------------------------------------------------
+
+function initDoEListeners() {
+    // Toggle: update label text when user manually flips (enabled state only)
+    const toggle = document.getElementById('doe-exact-runs-toggle');
+    if (toggle) {
+        toggle.addEventListener('change', (e) => {
+            const runsLabel = document.getElementById('doe-runs-label');
+            if (runsLabel) {
+                runsLabel.textContent = e.target.checked ? 'Exact Experiments' : 'Max Experiments';
+            }
+        });
+    }
+
+    // Model selector: sync toggle state + show/hide D-Optimal panel
+    const modelSelect = document.getElementById('doe-model-select');
+    if (modelSelect) {
+        modelSelect.addEventListener('change', (e) => {
+            const isDopt = e.target.value === 'doptimal';
+            syncToggleToModel(e.target.value);
+
+            const orderItem = document.getElementById('doe-dopt-order-item');
+            if (orderItem) orderItem.style.display = isDopt ? '' : 'none';
+
+            updateDoptMinNHint();
+        });
+    }
+
+    // D-Optimal model order: refresh hint on change
+    const orderSelect = document.getElementById('doe-dopt-order-select');
+    if (orderSelect) {
+        orderSelect.addEventListener('change', updateDoptMinNHint);
+    }
+}
+
+// Run listener setup as soon as this module is imported
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initDoEListeners);
+} else {
+    initDoEListeners();
+}
+
+// ---------------------------------------------------------------------------
+// Main DoE execution
+// ---------------------------------------------------------------------------
 
 export async function runDoE() {
     window.currentDoEFeatures = Array.from(document.querySelectorAll('#doe-features-list tr')).map(tr => ({
@@ -61,11 +169,16 @@ export async function runDoE() {
         })
         .filter(conds => conds.length > 0);
 
+    const exactToggle = document.getElementById('doe-exact-runs-toggle');
+    const useExact    = exactToggle ? exactToggle.checked : false;
+
     const tweaks = {
-        model:    document.getElementById('doe-model-select').value,
-        max_runs: document.getElementById('doe-max-runs').value,
+        model:            document.getElementById('doe-model-select').value,
+        max_runs:         document.getElementById('doe-max-runs').value,
+        use_exact_runs:   useExact,
+        dopt_model_order: document.getElementById('doe-dopt-order-select')?.value ?? 'quadratic',
         constraints: {
-            numerical: numericalConstraints,
+            numerical:  numericalConstraints,
             disallowed: disallowedCombinations
         }
     };
@@ -96,6 +209,10 @@ export async function runDoE() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Results rendering
+// ---------------------------------------------------------------------------
+
 export function renderDoEResults(metrics) {
     const section   = document.getElementById('doe-results-section');
     const dashboard = document.getElementById('doe-quality-dashboard');
@@ -104,39 +221,67 @@ export function renderDoEResults(metrics) {
 
     const warningBanner = document.getElementById('doe-warning-banner');
     if (warningBanner) {
-        if (metrics && (metrics.runs <= 1 || metrics.resolution === 'Error' || metrics.orthogonality === 0 || metrics.efficiency === 0)) {
-            warningBanner.innerHTML = `
-                <div style="background: #fff1f2; border: 1px solid #fecdd3; color: #9f1239; padding: 1rem; border-radius: 12px; margin-bottom: 1.5rem; font-size: 0.9rem; line-height: 1.5; display: flex; gap: 0.75rem; align-items: flex-start; text-align: left;">
-                    <span style="font-size: 1.25rem;">⚠️</span>
+        warningBanner.innerHTML = '';
+        warningBanner.classList.add('hidden');
+
+        // Low-quality / error warning (red)
+        if (metrics && (metrics.runs <= 1 || metrics.resolution === 'Error' ||
+                        metrics.orthogonality === 0 || metrics.efficiency === 0)) {
+            warningBanner.innerHTML += `
+                <div style="background:#fff1f2; border:1px solid #fecdd3; color:#9f1239;
+                            padding:1rem; border-radius:12px; margin-bottom:1rem;
+                            font-size:0.9rem; line-height:1.5; display:flex; gap:0.75rem;
+                            align-items:flex-start; text-align:left;">
+                    <span style="font-size:1.25rem;">⚠️</span>
                     <div>
                         <strong>Low design quality or calculation errors detected:</strong>
-                        <p style="margin: 0.25rem 0 0 0;">It is suggested to increase the "Max number of experiments" or modify/remove constraints.</p>
+                        <p style="margin:0.25rem 0 0 0;">It is suggested to increase the
+                        "Max / Exact number of experiments" or modify/remove constraints.</p>
                     </div>
-                </div>
-            `;
+                </div>`;
             warningBanner.classList.remove('hidden');
-        } else {
-            warningBanner.classList.add('hidden');
-            warningBanner.innerHTML = '';
+        }
+
+        // Oversampling warning (amber) – only for structured models in Exact mode
+        if (metrics && metrics.oversampling_warning) {
+            warningBanner.innerHTML += `
+                <div style="background:#fffbeb; border:1px solid #fde68a; color:#92400e;
+                            padding:1rem; border-radius:12px; margin-bottom:1rem;
+                            font-size:0.9rem; line-height:1.5; display:flex; gap:0.75rem;
+                            align-items:flex-start; text-align:left;">
+                    <span style="font-size:1.25rem;">⚠️</span>
+                    <div>
+                        <strong>Oversampling detected:</strong>
+                        <p style="margin:0.25rem 0 0 0;">The requested number of experiments
+                        exceeds the natural size of this design. Extra rows have been added
+                        with small jitter, which may reduce orthogonality and D-efficiency.
+                        Consider switching to <em>LHS</em> or <em>D-Optimal</em> for a
+                        fully flexible run count.</p>
+                    </div>
+                </div>`;
+            warningBanner.classList.remove('hidden');
         }
     }
 
     if (metrics && typeof metrics === 'object') {
         const getFlag = (val, type) => {
             if (type === 'ortho') {
-                if (val >= 90) return { text: 'Good',      class: 'flag-good' };
-                if (val >= 70) return { text: 'Limited',   class: 'flag-limited' };
-                return           { text: 'Poor',       class: 'flag-poor' };
+                if (val === 'N/A') return { text: 'N/A', class: 'flag-limited' };
+                if (val >= 90) return { text: 'Good',    class: 'flag-good' };
+                if (val >= 70) return { text: 'Limited', class: 'flag-limited' };
+                return           { text: 'Poor',    class: 'flag-poor' };
             }
             if (type === 'eff') {
-                if (val >= 80) return { text: 'Good',      class: 'flag-good' };
-                if (val >= 50) return { text: 'Limited',   class: 'flag-limited' };
-                return           { text: 'Poor',       class: 'flag-poor' };
+                if (val === 'N/A') return { text: 'N/A', class: 'flag-limited' };
+                if (val >= 80) return { text: 'Good',    class: 'flag-good' };
+                if (val >= 50) return { text: 'Limited', class: 'flag-limited' };
+                return           { text: 'Poor',    class: 'flag-poor' };
             }
             if (type === 'res') {
-                if (val.includes('V'))  return { text: 'Good',      class: 'flag-good' };
-                if (val.includes('IV')) return { text: 'Limited',   class: 'flag-limited' };
-                return                         { text: 'Screening', class: 'flag-poor' };
+                if (val === 'D-Optimal')       return { text: 'Model-opt.', class: 'flag-good' };
+                if (val.includes('V'))         return { text: 'Good',       class: 'flag-good' };
+                if (val.includes('IV'))        return { text: 'Limited',    class: 'flag-limited' };
+                return                                { text: 'Screening',  class: 'flag-poor' };
             }
             if (type === 'curve') {
                 if (val === 'Excellent') return { text: 'Good',    class: 'flag-good' };
@@ -222,5 +367,5 @@ export function renderDoEResults(metrics) {
 }
 
 // Bind to window for inline calls
-window.rebalanceDoEDOM = rebalanceDoEDOM;
+window.rebalanceDoEDOM  = rebalanceDoEDOM;
 window.attachDeleteEvents = attachDeleteEvents;
