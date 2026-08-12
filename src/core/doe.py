@@ -3,6 +3,7 @@ import random
 import numpy as np
 import pyDOE2 as doe
 from src.core.constraints import check_constraints
+from src.core.bo import infer_decimal_precision
 
 
 def _doptimal_coordinate_exchange(candidates, N, model_order, max_iter=500, seed=42):
@@ -252,12 +253,13 @@ def generate_doe(features_config, tweaks):
 
                 if feat['type'] == 'discrete':
                     d_vals = sorted([float(x.strip()) for x in feat['range'].split(',') if x.strip()])
-                    val    = min(d_vals, key=lambda x: abs(x - val)) if d_vals else round(float(val))
+                    val    = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
                 elif feat['type'] == 'regular':
                     d_vals = feat.get('levels', [])
-                    val    = min(d_vals, key=lambda x: abs(x - val)) if d_vals else round(float(val), 3)
-                else:
-                    val = round(float(val), 3)
+                    val    = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
+
+                prec = infer_decimal_precision(None, feat.get('range', ''))
+                val  = round(float(val), prec)
                 entry[feat['name']] = val
         suggested_table.append(entry)
 

@@ -115,25 +115,25 @@ def clean_dataframe(df, features_config, objectives_config):
     return df_clean
 
 
-def infer_decimal_precision(col_series: pd.Series, range_str: str = '') -> int:
+def infer_decimal_precision(col_series: pd.Series = None, range_str: str = '') -> int:
     """
-    Return the maximum number of decimal places seen in col_series.
+    Return the maximum number of decimal places seen in col_series or range_str.
     Fallback chain:
       1. Maximum decimals across non-null dataset values
       2. Maximum decimals seen in range_str tokens (if provided)
       3. 1  (safe default – avoids integer-only snapping when no decimals present)
     """
     max_dec = 0
-    for raw in col_series.dropna().astype(str):
-        m = re.search(r'\.(\d+)$', raw.strip())
-        if m:
-            max_dec = max(max_dec, len(m.group(1)))
+    if col_series is not None and hasattr(col_series, 'empty') and not col_series.empty:
+        for raw in col_series.dropna().astype(str):
+            m = re.search(r'\.(\d+)$', raw.strip())
+            if m:
+                max_dec = max(max_dec, len(m.group(1)))
     if max_dec == 0 and range_str:
         for tok in re.findall(r'[-+]?\d*\.?\d+', range_str):
             m = re.search(r'\.(\d+)$', tok)
             if m:
                 max_dec = max(max_dec, len(m.group(1)))
-    # Default to 1 decimal when no decimal precision is evident in data or range
     return max_dec if max_dec > 0 else 1
 
 
@@ -214,13 +214,12 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
     # (used later by get_fingerprint and decode_cand to round suggested values)
     feature_precision = {}
     for f in features_config:
-        if f['type'] in ('continuous', 'regular', 'discrete'):
-            col_s = (
-                df_clean[f['name']].astype(str)
-                if (not df_clean.empty and f['name'] in df_clean.columns)
-                else pd.Series(dtype=str)
-            )
-            feature_precision[f['name']] = infer_decimal_precision(col_s, f['range'])
+        col_s = (
+            df_clean[f['name']].astype(str)
+            if (not df_clean.empty and f['name'] in df_clean.columns)
+            else pd.Series(dtype=str)
+        )
+        feature_precision[f['name']] = infer_decimal_precision(col_s, f.get('range', ''))
 
     # STEP 2 — Build Training Objectives (Y)
     train_y_list = []
@@ -505,7 +504,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                             val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
                         
                         if isinstance(val, (int, float)):
-                            prec = feature_precision.get(f['name'], 6)
+                            prec = feature_precision.get(f['name'], infer_decimal_precision(None, f.get('range', '')))
                             val = round(float(val), prec)
                         row_dict[f['name']] = val
 
@@ -633,7 +632,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 val     = choices[idx_choice]
 
             if isinstance(val, (int, float)):
-                prec = feature_precision.get(f['name'], 6)
+                prec = feature_precision.get(f['name'], infer_decimal_precision(None, f.get('range', '')))
                 val = round(float(val), prec)
             row[f['name']] = val
         return row

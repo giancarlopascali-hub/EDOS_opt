@@ -185,3 +185,40 @@ class TestErrorCases:
         """An empty features list should raise ValueError."""
         with pytest.raises(ValueError):
             generate_doe([], {'model': 'bbdesign'})
+
+
+# ==============================================================================
+# Test: Feature Precision Rules
+# ==============================================================================
+
+class TestFeaturePrecision:
+    """Tests for decimal precision of generated feature values."""
+
+    def test_whole_number_range_defaults_to_one_decimal(self):
+        """Range with whole numbers (0 decimals) should format values to 1 decimal place."""
+        features = [
+            {'name': 'Temp', 'type': 'continuous', 'range': '[10, 50]'},
+            {'name': 'Press', 'type': 'continuous', 'range': '[1, 5]'},
+        ]
+        table, _ = generate_doe(features, {'model': 'lhs', 'max_runs': 10})
+        for row in table:
+            for feat_name in ('Temp', 'Press'):
+                val_str = str(row[feat_name])
+                parts = val_str.split('.')
+                assert len(parts) == 2
+                assert len(parts[1]) == 1
+
+    def test_explicit_two_decimals_range(self):
+        """Range with 2 decimal places (e.g. 0.00 to 1.00) should produce values with <=2 decimal places."""
+        features = [
+            {'name': 'Conc', 'type': 'continuous', 'range': '[0.00, 1.00]'},
+            {'name': 'Flow', 'type': 'continuous', 'range': '[0.10, 0.50]'},
+        ]
+        table, _ = generate_doe(features, {'model': 'lhs', 'max_runs': 10})
+        for row in table:
+            for feat_name in ('Conc', 'Flow'):
+                val_str = str(row[feat_name])
+                parts = val_str.split('.')
+                if len(parts) == 2:
+                    assert len(parts[1]) <= 2
+
