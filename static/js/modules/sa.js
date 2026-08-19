@@ -444,6 +444,9 @@ export function renderSAResults(result) {
         shapBtnWrap.appendChild(shapDiv);
         container.appendChild(shapBtnWrap);
 
+        // ⚠️ Must append to DOM BEFORE Plotly renders (Plotly requires a live element)
+        impactContainer.appendChild(container);
+
         const hasShap = res.shap_data && res.shap_data.features && res.shap_data.features.length > 0;
 
         Plotly.newPlot(barId,
@@ -503,8 +506,6 @@ export function renderSAResults(result) {
         } else {
             shapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;">No SHAP data available for this model.</div>';
         }
-
-        impactContainer.appendChild(container);
     });
 
     const getFittingSuggestion = (status) => {
