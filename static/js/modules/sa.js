@@ -1,9 +1,25 @@
 /**
- * Wires a "select all / deselect all" header checkbox to a set of row checkboxes.
- * @param {string} headerId    - id of the header checkbox element
- * @param {string} rowSelector - CSS selector for the row checkboxes
- * @param {function} syncFn    - called with the column name after each row toggle
+ * Generic CSV downloader.
+ * @param {string[][]} rows  - Array of arrays (first row = headers)
+ * @param {string}     fname - Filename (without extension)
  */
+function _downloadCSV(rows, fname) {
+    const escape = v => {
+        const s = (v === null || v === undefined) ? '' : String(v);
+        return s.includes(',') || s.includes('"') || s.includes('\n')
+            ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const csv  = rows.map(r => r.map(escape).join(',')).join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = fname.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+
 function _wireSelectAll(headerId, rowSelector, syncFn) {
     const header = document.getElementById(headerId);
     if (!header) return;
@@ -168,8 +184,22 @@ export function renderSAResults(result) {
                 margin: { l: 150, b: 80, t: 30, r: 50 },
                 height: 400
             });
+
+        // Wire correlation CSV download
+        const corrBtn = document.getElementById('sa-corr-csv-btn');
+        if (corrBtn) {
+            corrBtn.onclick = () => {
+                const header = ['Feature / Objective', ...objNames];
+                const rows   = [header, ...numFeats.map(f =>
+                    [f, ...objNames.map(obj => ((numCorr[f] || {})[obj] ?? 0).toFixed(4))]
+                )];
+                _downloadCSV(rows, 'SA_Numerical_Correlation');
+            };
+        }
     } else {
         document.getElementById('sa-num-corr').innerHTML = '<p class="text-secondary"><i>No numerical features available for correlation.</i></p>';
+        const corrBtn = document.getElementById('sa-corr-csv-btn');
+        if (corrBtn) corrBtn.disabled = true;
     }
 
     const catContainer = document.getElementById('sa-cat-interactions-container');
@@ -214,6 +244,19 @@ export function renderSAResults(result) {
                 margin: { l: 150, b: 80, t: 50, r: 50 },
                 height: 500
             });
+
+            // Keep the CSV button in sync with the current view
+            const catCsvBtn = document.getElementById('sa-cat-csv-btn');
+            if (catCsvBtn) {
+                catCsvBtn.onclick = () => {
+                    const [rowFeat, colFeat] = pair.split(' vs ');
+                    const header = [rowFeat + ' \\ ' + colFeat, ...data.x];
+                    const rows   = [header, ...data.y.map((yVal, ri) =>
+                        [yVal, ...data.z[ri].map(v => v.toFixed(4))]
+                    )];
+                    _downloadCSV(rows, `SA_CatInteraction_${pair.replace(/ /g,'_')}_${obj}`);
+                };
+            }
         };
 
         document.getElementById('sa-cat-pair-select').addEventListener('change', updateInteractionPlot);
@@ -221,6 +264,8 @@ export function renderSAResults(result) {
         updateInteractionPlot();
     } else {
         catContainer.innerHTML = '<p class="text-secondary"><i>No categorical interactions possible (requires 2+ categorical features).</i></p>';
+        const catCsvBtn = document.getElementById('sa-cat-csv-btn');
+        if (catCsvBtn) catCsvBtn.disabled = true;
     }
 
     const parcoordsContainer = document.getElementById('sa-parcoords-container');
@@ -255,11 +300,33 @@ export function renderSAResults(result) {
             const objIdx    = window.currentColumns.indexOf(objCol);
             const colorVals = window.currentData.map(r => parseFloat(r[objIdx]) || 0);
 
+            // Build wrapper with title + CSV button
+            const wrapperDiv = document.createElement('div');
+            wrapperDiv.style.cssText = 'width:100%; margin-bottom:2rem;';
+
+            const headerRow = document.createElement('div');
+            headerRow.style.cssText = 'display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;';
+            headerRow.innerHTML = `<span style="font-weight:600;">Parallel Coordinates — Colored by: ${objCol}</span>`;
+
+            const pcCsvBtn = document.createElement('button');
+            pcCsvBtn.className = 'btn small';
+            pcCsvBtn.textContent = '⬇ Download CSV';
+            pcCsvBtn.onclick = () => {
+                const header = plotCols;
+                const rows   = [header, ...window.currentData.map(r =>
+                    plotCols.map(col => r[window.currentColumns.indexOf(col)])
+                )];
+                _downloadCSV(rows, `SA_ParCoords_${objCol}`);
+            };
+            headerRow.appendChild(pcCsvBtn);
+            wrapperDiv.appendChild(headerRow);
+
             const pcDiv = document.createElement('div');
             pcDiv.id    = `sa-parcoords-${idx}`;
             pcDiv.classList.add('plot-container');
-            pcDiv.style.cssText = 'width: 100%; height: 420px; margin-bottom: 2rem;';
-            parcoordsContainer.appendChild(pcDiv);
+            pcDiv.style.cssText = 'width: 100%; height: 420px;';
+            wrapperDiv.appendChild(pcDiv);
+            parcoordsContainer.appendChild(wrapperDiv);
 
             const finiteColorVals = colorVals.filter(v => isFinite(v));
             const cmin = finiteColorVals.length > 0 ? Math.min(...finiteColorVals) : 0;
@@ -325,10 +392,24 @@ export function renderSAResults(result) {
         container.classList.add('impact-row');
         container.style.cssText = 'display:flex;flex-wrap:wrap;gap:15px;margin-bottom:2.5rem;padding:1rem;background:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;';
 
+        const titleRow = document.createElement('div');
+        titleRow.style.cssText = 'width:100%;display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;';
+
         const titleDiv        = document.createElement('h3');
         titleDiv.textContent  = `Feature Impact: ${obj}`;
-        titleDiv.style.cssText = 'width:100%;margin:0 0 1rem 0;';
-        container.appendChild(titleDiv);
+        titleDiv.style.margin = '0';
+        titleRow.appendChild(titleDiv);
+
+        // --- Bar chart CSV ---
+        const barCsvBtn = document.createElement('button');
+        barCsvBtn.className   = 'btn small';
+        barCsvBtn.textContent = '⬇ Importance CSV';
+        barCsvBtn.onclick = () => {
+            const rows = [['Feature', 'Importance (%)'], ...sortedEntries.map(([f, v]) => [f, v.toFixed(4)])];
+            _downloadCSV(rows, `SA_Importance_${obj}`);
+        };
+        titleRow.appendChild(barCsvBtn);
+        container.appendChild(titleRow);
 
         const barId  = `sa-bar-${idx}`;
         const barDiv = document.createElement('div');
@@ -340,9 +421,28 @@ export function renderSAResults(result) {
         const shapDiv = document.createElement('div');
         shapDiv.id    = shapId;
         shapDiv.style.cssText = 'flex:1.3;min-width:450px;height:400px;';
-        container.appendChild(shapDiv);
 
-        impactContainer.appendChild(container);
+        // SHAP CSV button
+        const shapBtnWrap = document.createElement('div');
+        shapBtnWrap.style.cssText = 'flex:1.3;min-width:450px;display:flex;flex-direction:column;gap:6px;';
+        const shapCsvBtn = document.createElement('button');
+        shapCsvBtn.className   = 'btn small';
+        shapCsvBtn.textContent = '⬇ SHAP CSV';
+        shapCsvBtn.style.cssText = 'align-self:flex-end;';
+        shapCsvBtn.onclick = () => {
+            if (!res.shap_data || !res.shap_data.features) return;
+            const sd = res.shap_data;
+            const csvRows = [['Feature', 'Feature_Value', 'SHAP_Value']];
+            sd.features.forEach((feat, i) => {
+                sd.shap_values[i].forEach((sv, j) => {
+                    csvRows.push([feat, sd.feature_values[i][j], sv.toFixed(6)]);
+                });
+            });
+            _downloadCSV(csvRows, `SA_SHAP_${obj}`);
+        };
+        shapBtnWrap.appendChild(shapCsvBtn);
+        shapBtnWrap.appendChild(shapDiv);
+        container.appendChild(shapBtnWrap);
 
         const hasShap = res.shap_data && res.shap_data.features && res.shap_data.features.length > 0;
 
@@ -403,6 +503,8 @@ export function renderSAResults(result) {
         } else {
             shapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;">No SHAP data available for this model.</div>';
         }
+
+        impactContainer.appendChild(container);
     });
 
     const getFittingSuggestion = (status) => {

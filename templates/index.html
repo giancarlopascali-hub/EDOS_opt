@@ -462,13 +462,19 @@
                 </section>
 
                 <section class="card">
-                    <h2>Numerical Correlation Matrix</h2>
+                    <div class="card-header">
+                        <h2>Numerical Correlation Matrix</h2>
+                        <button id="sa-corr-csv-btn" class="btn small">⬇ Download CSV</button>
+                    </div>
                     <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 1rem;">Correlation between numerical features and success targets.</p>
                     <div id="sa-num-corr" style="width: 100%; height: 400px;"></div>
                 </section>
 
                 <section class="card">
-                    <h2>Categorical Analysis (Interactions)</h2>
+                    <div class="card-header">
+                        <h2>Categorical Analysis (Interactions)</h2>
+                        <button id="sa-cat-csv-btn" class="btn small">⬇ Download CSV</button>
+                    </div>
                     <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 1rem;">View how combinations of levels impact your results.</p>
                     <div id="sa-cat-controls" class="tweak-grid" style="margin-bottom: 1rem; border-bottom: 1px dashed var(--border-color); padding-bottom: 1rem;">
                         <!-- JS will inject filters here -->
