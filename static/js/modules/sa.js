@@ -298,7 +298,7 @@ export function renderSAResults(result) {
             });
 
             const objIdx    = window.currentColumns.indexOf(objCol);
-            const colorVals = window.currentData.map(r => parseFloat(r[objIdx]) || 0);
+            const colorVals = window.currentData.map(r => { const v = parseFloat(r[objIdx]); return isFinite(v) ? v : NaN; });
 
             // Build wrapper with title + CSV button
             const wrapperDiv = document.createElement('div');
@@ -329,28 +329,36 @@ export function renderSAResults(result) {
             parcoordsContainer.appendChild(wrapperDiv);
 
             const finiteColorVals = colorVals.filter(v => isFinite(v));
-            const cmin = finiteColorVals.length > 0 ? Math.min(...finiteColorVals) : 0;
-            const cmax = finiteColorVals.length > 0 ? Math.max(...finiteColorVals) : 1;
+            let cmin = finiteColorVals.length > 0 ? Math.min(...finiteColorVals) : 0;
+            let cmax = finiteColorVals.length > 0 ? Math.max(...finiteColorVals) : 1;
+            // Plotly requires cmin < cmax for the colorscale to work — add a small epsilon if equal
+            if (cmin === cmax) { cmin = cmin - 0.5; cmax = cmax + 0.5; }
 
-            Plotly.newPlot(`sa-parcoords-${idx}`, [{
-                type: 'parcoords',
-                line: {
-                    color: colorVals,
-                    colorscale: [
-                        [0, '#0d0887'], [0.11, '#46039f'], [0.22, '#7201a8'], [0.33, '#9c179e'],
-                        [0.44, '#bd3786'], [0.55, '#d8576b'], [0.66, '#ed7953'], [0.77, '#fb9f3a'],
-                        [0.88, '#fdca26'], [1, '#f0f921']
-                    ],
-                    showscale: true, reversescale: false, opacity: 0.85,
-                    cmin, cmax,
-                    colorbar: { title: objCol, thickness: 15 }
-                },
-                unselected: { line: { opacity: 0, color: 'rgba(0,0,0,0)' } },
-                dimensions
-            }], {
-                title: `Parallel Coordinates — Colored by: ${objCol}`,
-                margin: { l: 80, r: 80, t: 120, b: 20 }
-            }, { responsive: true });
+            try {
+                Plotly.newPlot(`sa-parcoords-${idx}`, [{
+                    type: 'parcoords',
+                    line: {
+                        color: colorVals,
+                        colorscale: [
+                            [0, '#0d0887'], [0.11, '#46039f'], [0.22, '#7201a8'], [0.33, '#9c179e'],
+                            [0.44, '#bd3786'], [0.55, '#d8576b'], [0.66, '#ed7953'], [0.77, '#fb9f3a'],
+                            [0.88, '#fdca26'], [1, '#f0f921']
+                        ],
+                        showscale: true, reversescale: false, opacity: 0.85,
+                        cmin, cmax,
+                        colorbar: { title: objCol, thickness: 15 }
+                    },
+                    unselected: { line: { opacity: 0, color: 'rgba(0,0,0,0)' } },
+                    dimensions
+                }], {
+                    title: `Parallel Coordinates — Colored by: ${objCol}`,
+                    margin: { l: 80, r: 80, t: 120, b: 20 }
+                }, { responsive: true });
+            } catch (plotErr) {
+                console.warn(`Parcoords plot failed for objective "${objCol}":`, plotErr);
+                pcDiv.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-style:italic;">Could not render parallel coordinates for <b style="margin-left:4px;">${objCol}</b> — insufficient or non-numeric data.</div>`;
+            }
+
         });
     } else {
         parcoordsContainer.innerHTML = '<p class="text-secondary"><i>Parallel coordinates require at least one feature and one objective with experiments loaded.</i></p>';
