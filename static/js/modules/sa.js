@@ -163,8 +163,22 @@ export async function runSA() {
     }
 }
 
+function purgeAllPlots(container) {
+    if (!container) return;
+    const plots = container.querySelectorAll('.js-plotly-plot, .plot-container, [id^="sa-parcoords-"], [id^="sa-bar-"], [id^="sa-shap-"]');
+    plots.forEach(el => {
+        try { Plotly.purge(el); } catch (e) {}
+    });
+}
+
 export function renderSAResults(result) {
     document.getElementById('sa-results-container').classList.remove('hidden');
+
+    // Purge any existing WebGL & SVG Plotly instances to free GPU WebGL contexts
+    purgeAllPlots(document.getElementById('sa-parcoords-container'));
+    purgeAllPlots(document.getElementById('sa-impact-container'));
+    purgeAllPlots(document.getElementById('sa-cat-interactions-container'));
+    try { Plotly.purge('sa-num-corr'); } catch(e) {}
 
     const numCorr  = result.numerical_correlation;
     const numFeats = result.num_features;
@@ -232,6 +246,7 @@ export function renderSAResults(result) {
                 catContainer.innerHTML = '<p class="text-secondary"><i>No data found for this combination.</i></p>';
                 return;
             }
+            try { Plotly.purge(catContainer); } catch(e) {}
             const trace = {
                 z: data.z, x: data.x, y: data.y,
                 type: 'heatmap', colorscale: 'RdBu', zmin: 0, zmax: 1,
@@ -290,10 +305,15 @@ export function renderSAResults(result) {
                         label: col,
                         values:   rawVals.map(v => uniqueVals.indexOf(v) >= 0 ? uniqueVals.indexOf(v) : 0),
                         tickvals: uniqueVals.map((_, i) => i),
-                        ticktext: uniqueVals
+                        ticktext: uniqueVals,
+                        range: [0, Math.max(1, uniqueVals.length - 1)]
                     };
                 } else {
-                    return { label: col, values: numVals.map(v => isNaN(v) ? 0 : v) };
+                    const cleanVals = numVals.map(v => isFinite(v) ? v : 0);
+                    let min = cleanVals.length > 0 ? Math.min(...cleanVals) : 0;
+                    let max = cleanVals.length > 0 ? Math.max(...cleanVals) : 1;
+                    if (min === max) { min -= 0.5; max += 0.5; }
+                    return { label: col, values: cleanVals, range: [min, max] };
                 }
             });
 
@@ -335,7 +355,7 @@ export function renderSAResults(result) {
             if (cmin === cmax) { cmin = cmin - 0.5; cmax = cmax + 0.5; }
 
             try {
-                Plotly.newPlot(`sa-parcoords-${idx}`, [{
+                Plotly.newPlot(pcDiv, [{
                     type: 'parcoords',
                     line: {
                         color: colorVals,
@@ -797,7 +817,7 @@ export async function exportSAReport() {
                 const div = document.createElement('div');
                 div.id = p.id; div.className = 'card full-plot';
                 pcSection.appendChild(div);
-                Plotly.newPlot(p.id, p.data, p.layout, { responsive: true });
+                Plotly.newPlot(div, p.data, p.layout, { responsive: true });
             });
         }
 
