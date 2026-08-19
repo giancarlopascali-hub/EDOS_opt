@@ -485,10 +485,17 @@
                 </section>
 
                 <section class="card">
-                    <h2>Parallel Coordinates</h2>
-                    <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 0.5rem;">One plot per objective. Each line represents a single experiment, colored by the objective value.</p>                    <p class="text-secondary" style="font-size: 0.85rem; margin-bottom: 1rem;">💡 <b>Tip:</b> Click and drag on any axis to create a <b>filter range</b>. You can apply multiple filters across different axes simultaneously to isolate specific data subsets. Drag a filter to move it, or click the axis again to clear it.</p>
-                    <div id="sa-parcoords-container">
-                        <!-- Parallel coordinates plots injected here -->
+                    <div class="card-header">
+                        <h2>Parallel Coordinates</h2>
+                        <button id="sa-parcoords-csv-btn" class="btn small">⬇ Download CSV</button>
+                    </div>
+                    <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 0.5rem;">Select an objective to color and inspect multidimensional feature-objective interactions.</p>
+                    <p class="text-secondary" style="font-size: 0.85rem; margin-bottom: 1rem;">💡 <b>Tip:</b> Click and drag on any axis to create a <b>filter range</b>. You can apply multiple filters across different axes simultaneously to isolate specific data subsets. Drag a filter to move it, or click the axis again to clear it.</p>
+                    <div id="sa-parcoords-controls" class="tweak-grid" style="margin-bottom: 1rem; border-bottom: 1px dashed var(--border-color); padding-bottom: 1rem;">
+                        <!-- JS will inject objective selector dropdown here -->
+                    </div>
+                    <div id="sa-parcoords-container" style="width: 100%; min-height: 480px;">
+                        <!-- Interactive Parallel Coordinates plot injected here -->
                     </div>
                 </section>
 

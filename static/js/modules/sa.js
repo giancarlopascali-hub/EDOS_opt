@@ -284,15 +284,30 @@ export function renderSAResults(result) {
     }
 
     const parcoordsContainer = document.getElementById('sa-parcoords-container');
+    const parcoordsControls  = document.getElementById('sa-parcoords-controls');
+    if (parcoordsControls) parcoordsControls.innerHTML = '';
+    purgeAllPlots(parcoordsContainer);
     parcoordsContainer.innerHTML = '';
 
     const featCols = (window.saSelectedFeatures || window.currentColumns.filter(c => window.columnRoles[c] === 'feature'));
     const objCols  = (window.saSelectedObjectives || window.currentColumns.filter(c => window.columnRoles[c] === 'objective'));
 
-    if (featCols.length > 0 && objCols.length > 0 && window.currentData.length > 0) {
-        objCols.forEach((objCol, idx) => {
-            const plotCols = [...featCols, objCol];
+    // Cache parcoords data for all objectives so report generator can embed them
+    window.saParcoordsPlotData = {};
 
+    if (featCols.length > 0 && objCols.length > 0 && window.currentData.length > 0) {
+        if (parcoordsControls) {
+            parcoordsControls.innerHTML = `<div class="tweak-item" style="max-width: 400px;">
+                <label>Select Objective to Color By:</label>
+                <select id="sa-parcoords-obj-select" style="width: 100%;">
+                    ${objCols.map(o => `<option value="${o}">${o}</option>`).join('')}
+                </select>
+            </div>`;
+        }
+
+        // Build data structure for all objectives
+        objCols.forEach(objCol => {
+            const plotCols = [...featCols, objCol];
             const dimensions = plotCols.map(col => {
                 const colIdx  = window.currentColumns.indexOf(col);
                 const rawVals = window.currentData.map(r => r[colIdx]);
@@ -319,43 +334,14 @@ export function renderSAResults(result) {
 
             const objIdx    = window.currentColumns.indexOf(objCol);
             const colorVals = window.currentData.map(r => { const v = parseFloat(r[objIdx]); return isFinite(v) ? v : NaN; });
-
-            // Build wrapper with title + CSV button
-            const wrapperDiv = document.createElement('div');
-            wrapperDiv.style.cssText = 'width:100%; margin-bottom:2rem;';
-
-            const headerRow = document.createElement('div');
-            headerRow.style.cssText = 'display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;';
-            headerRow.innerHTML = `<span style="font-weight:600;">Parallel Coordinates — Colored by: ${objCol}</span>`;
-
-            const pcCsvBtn = document.createElement('button');
-            pcCsvBtn.className = 'btn small';
-            pcCsvBtn.textContent = '⬇ Download CSV';
-            pcCsvBtn.onclick = () => {
-                const header = plotCols;
-                const rows   = [header, ...window.currentData.map(r =>
-                    plotCols.map(col => r[window.currentColumns.indexOf(col)])
-                )];
-                _downloadCSV(rows, `SA_ParCoords_${objCol}`);
-            };
-            headerRow.appendChild(pcCsvBtn);
-            wrapperDiv.appendChild(headerRow);
-
-            const pcDiv = document.createElement('div');
-            pcDiv.id    = `sa-parcoords-${idx}`;
-            pcDiv.classList.add('plot-container');
-            pcDiv.style.cssText = 'width: 100%; height: 420px;';
-            wrapperDiv.appendChild(pcDiv);
-            parcoordsContainer.appendChild(wrapperDiv);
-
             const finiteColorVals = colorVals.filter(v => isFinite(v));
             let cmin = finiteColorVals.length > 0 ? Math.min(...finiteColorVals) : 0;
             let cmax = finiteColorVals.length > 0 ? Math.max(...finiteColorVals) : 1;
-            // Plotly requires cmin < cmax for the colorscale to work — add a small epsilon if equal
             if (cmin === cmax) { cmin = cmin - 0.5; cmax = cmax + 0.5; }
 
-            try {
-                Plotly.newPlot(pcDiv, [{
+            window.saParcoordsPlotData[objCol] = {
+                plotCols,
+                data: [{
                     type: 'parcoords',
                     line: {
                         color: colorVals,
@@ -370,18 +356,50 @@ export function renderSAResults(result) {
                     },
                     unselected: { line: { opacity: 0, color: 'rgba(0,0,0,0)' } },
                     dimensions
-                }], {
+                }],
+                layout: {
                     title: `Parallel Coordinates — Colored by: ${objCol}`,
-                    margin: { l: 80, r: 80, t: 120, b: 20 }
-                }, { responsive: true });
-            } catch (plotErr) {
-                console.warn(`Parcoords plot failed for objective "${objCol}":`, plotErr);
-                pcDiv.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-style:italic;">Could not render parallel coordinates for <b style="margin-left:4px;">${objCol}</b> — insufficient or non-numeric data.</div>`;
+                    margin: { l: 80, r: 80, t: 80, b: 20 },
+                    height: 500
+                }
+            };
+        });
+
+        const renderActiveParcoords = () => {
+            const selectEl = document.getElementById('sa-parcoords-obj-select');
+            const objCol   = selectEl ? selectEl.value : objCols[0];
+            const pObj     = window.saParcoordsPlotData[objCol];
+            if (!pObj) return;
+
+            // Wire CSV button
+            const pcCsvBtn = document.getElementById('sa-parcoords-csv-btn');
+            if (pcCsvBtn) {
+                pcCsvBtn.disabled = false;
+                pcCsvBtn.onclick = () => {
+                    const header = pObj.plotCols;
+                    const rows   = [header, ...window.currentData.map(r =>
+                        pObj.plotCols.map(col => r[window.currentColumns.indexOf(col)])
+                    )];
+                    _downloadCSV(rows, `SA_ParCoords_${objCol}`);
+                };
             }
 
-        });
+            try {
+                purgeAllPlots(parcoordsContainer);
+                Plotly.newPlot(parcoordsContainer, pObj.data, pObj.layout, { responsive: true });
+            } catch (plotErr) {
+                console.warn(`Parcoords plot failed for objective "${objCol}":`, plotErr);
+                parcoordsContainer.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-style:italic;">Could not render parallel coordinates for <b style="margin-left:4px;">${objCol}</b> — insufficient or non-numeric data.</div>`;
+            }
+        };
+
+        const selectEl = document.getElementById('sa-parcoords-obj-select');
+        if (selectEl) selectEl.addEventListener('change', renderActiveParcoords);
+        renderActiveParcoords();
     } else {
         parcoordsContainer.innerHTML = '<p class="text-secondary"><i>Parallel coordinates require at least one feature and one objective with experiments loaded.</i></p>';
+        const pcCsvBtn = document.getElementById('sa-parcoords-csv-btn');
+        if (pcCsvBtn) pcCsvBtn.disabled = true;
     }
 
     const impactContainer = document.getElementById('sa-impact-container');
@@ -701,6 +719,7 @@ export async function exportSAReport() {
         const reliabilityHtml  = document.getElementById('sa-reliability-info').innerHTML;
         const catInteractions  = window.lastSAResult ? window.lastSAResult.cat_interactions : {};
         const objNames         = window.lastSAResult ? window.lastSAResult.extended_obj_names : [];
+        const parcoordsData    = window.saParcoordsPlotData || {};
 
         let reportHtml = `
 <!DOCTYPE html>
@@ -773,12 +792,25 @@ export async function exportSAReport() {
         <div id="sa-cat-interactions-container" class="full-plot"></div>
     </div>
 
-    <div id="parcoords-section"></div>
+    <div class="card" id="parcoords-section" style="display:none;">
+        <h2>Parallel Coordinates Analysis</h2>
+        <div class="controls">
+            <div class="tweak-item">
+                <label>Select Objective to Color By:</label>
+                <select id="report-parcoords-obj">
+                    ${Object.keys(parcoordsData).map(o => `<option value="${o}">${o}</option>`).join('')}
+                </select>
+            </div>
+        </div>
+        <div id="sa-report-parcoords" class="full-plot"></div>
+    </div>
+
     <div id="impact-section"></div>
 
     <script>
-        const plotsData      = ${JSON.stringify(plotsData)};
+        const plotsData       = ${JSON.stringify(plotsData)};
         const catInteractions = ${JSON.stringify(catInteractions)};
+        const parcoordsData   = ${JSON.stringify(parcoordsData)};
 
         const corrPlot = plotsData.find(p => p.id === 'sa-num-corr');
         if (corrPlot) {
@@ -807,18 +839,19 @@ export async function exportSAReport() {
             updateCatPlot();
         }
 
-        const pcSection = document.getElementById('parcoords-section');
-        const pcPlots   = plotsData.filter(p => p.id.startsWith('sa-parcoords'));
-        if (pcPlots.length > 0) {
-            const head = document.createElement('h2');
-            head.textContent = 'Parallel Coordinates Analysis';
-            pcSection.appendChild(head);
-            pcPlots.forEach(p => {
-                const div = document.createElement('div');
-                div.id = p.id; div.className = 'card full-plot';
-                pcSection.appendChild(div);
-                Plotly.newPlot(div, p.data, p.layout, { responsive: true });
-            });
+        const pcKeys = Object.keys(parcoordsData);
+        if (pcKeys.length > 0) {
+            document.getElementById('parcoords-section').style.display = 'block';
+            const pcContainer = document.getElementById('sa-report-parcoords');
+            const updatePCPlot = () => {
+                const obj = document.getElementById('report-parcoords-obj').value;
+                const pObj = parcoordsData[obj];
+                if (!pObj) return;
+                try { Plotly.purge(pcContainer); } catch(e) {}
+                Plotly.newPlot(pcContainer, pObj.data, pObj.layout, { responsive: true });
+            };
+            document.getElementById('report-parcoords-obj').addEventListener('change', updatePCPlot);
+            updatePCPlot();
         }
 
         const impactSection = document.getElementById('impact-section');
