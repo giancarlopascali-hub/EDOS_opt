@@ -1,3 +1,39 @@
+/**
+ * Wires a "select all / deselect all" header checkbox to a set of row checkboxes.
+ * @param {string} headerId    - id of the header checkbox element
+ * @param {string} rowSelector - CSS selector for the row checkboxes
+ * @param {function} syncFn    - called with the column name after each row toggle
+ */
+function _wireSelectAll(headerId, rowSelector, syncFn) {
+    const header = document.getElementById(headerId);
+    if (!header) return;
+
+    const refreshHeader = () => {
+        const rows    = Array.from(document.querySelectorAll(rowSelector));
+        const total   = rows.length;
+        const checked = rows.filter(cb => cb.checked).length;
+        header.checked       = checked === total;
+        header.indeterminate = checked > 0 && checked < total;
+    };
+
+    header.addEventListener('change', () => {
+        const rows = Array.from(document.querySelectorAll(rowSelector));
+        rows.forEach(cb => {
+            if (cb.checked !== header.checked) {
+                cb.checked = header.checked;
+                syncFn(cb.dataset.col);
+            }
+        });
+        header.indeterminate = false;
+    });
+
+    document.querySelectorAll(rowSelector).forEach(cb => {
+        cb.addEventListener('change', refreshHeader);
+    });
+
+    refreshHeader();
+}
+
 export function renderSASetup() {
     const list    = document.getElementById('sa-features-list');
     const objList = document.getElementById('sa-objectives-list');
@@ -35,7 +71,22 @@ export function renderSASetup() {
         </tr>`;
     });
     objList.innerHTML = objHtml;
+
+    // --- Select-all / deselect-all for SA Features ---
+    _wireSelectAll(
+        'sa-select-all-features',
+        '#sa-features-list .sa-f-include',
+        col => window.syncSAFeatureConfig(col, 'include')
+    );
+
+    // --- Select-all / deselect-all for SA Objectives ---
+    _wireSelectAll(
+        'sa-select-all-objectives',
+        '#sa-objectives-list .sa-o-include',
+        col => window.syncObjectiveConfig(col, 'sa', 'include')
+    );
 }
+
 
 export async function runSA() {
     const features = Array.from(document.querySelectorAll('.sa-f-include:checked')).map(cb => {

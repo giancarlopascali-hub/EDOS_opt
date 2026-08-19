@@ -1,6 +1,46 @@
 import { exportData, detectParetoIndices } from '../utils.js';
 import { updateAllConstraintsDropdowns } from './constraints.js';
 
+/**
+ * Wires a "select all / deselect all" header checkbox to a set of row checkboxes.
+ * @param {string} headerId   - id of the <th> header checkbox
+ * @param {string} rowSelector - CSS selector for the row checkboxes
+ * @param {function} syncFn   - called with the column name after each row toggle
+ */
+function _wireSelectAll(headerId, rowSelector, syncFn) {
+    const header = document.getElementById(headerId);
+    if (!header) return;
+
+    /** Recomputes header state from the current row states */
+    const refreshHeader = () => {
+        const rows    = Array.from(document.querySelectorAll(rowSelector));
+        const total   = rows.length;
+        const checked = rows.filter(cb => cb.checked).length;
+        header.checked       = checked === total;
+        header.indeterminate = checked > 0 && checked < total;
+    };
+
+    // Header click → bulk toggle all rows
+    header.addEventListener('change', () => {
+        const rows = Array.from(document.querySelectorAll(rowSelector));
+        rows.forEach(cb => {
+            if (cb.checked !== header.checked) {
+                cb.checked = header.checked;
+                syncFn(cb.dataset.col);
+            }
+        });
+        header.indeterminate = false;
+    });
+
+    // Individual row click → update header state
+    document.querySelectorAll(rowSelector).forEach(cb => {
+        cb.addEventListener('change', refreshHeader);
+    });
+
+    // Set initial header state
+    refreshHeader();
+}
+
 export function renderBOSetup() {
     const featuresList  = document.getElementById('bo-features-list');
     const objectivesList = document.getElementById('bo-objectives-list');
@@ -42,7 +82,22 @@ export function renderBOSetup() {
     objectivesList.innerHTML = objectivesHtml;
     updateAcqSelectForMultiObj();
     updateAllConstraintsDropdowns('bo');
+
+    // --- Select-all / deselect-all for BO Features ---
+    _wireSelectAll(
+        'bo-select-all-features',
+        '#bo-features-list .bo-f-include',
+        col => window.syncBOFeatureConfig(col, 'include')
+    );
+
+    // --- Select-all / deselect-all for BO Objectives ---
+    _wireSelectAll(
+        'bo-select-all-objectives',
+        '#bo-objectives-list .bo-o-include',
+        col => window.syncObjectiveConfig(col, 'bo', 'include')
+    );
 }
+
 
 export function updateAcqSelectForMultiObj() {
     const includedObjs = Array.from(document.querySelectorAll('#bo-objectives-list .bo-o-include:checked'));
