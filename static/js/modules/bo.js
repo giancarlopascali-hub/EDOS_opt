@@ -869,12 +869,7 @@ async function updateContourPlot() {
     currentSurfaceAbortController = new AbortController();
     const thisRequestId = ++currentSurfaceRequestId;
 
-    // Only show spinner if the plot is not already rendered (avoids spinner flash on re-renders)
-    const alreadyRendered = plotContainer._fullLayout !== undefined;
-    if (!alreadyRendered) {
-        plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing contour response surface...</div>';
-    }
-
+    // Silent background computation — no spinner injected into DOM
     try {
         const response = await fetch('/bo_surface', {
             method: 'POST',
@@ -970,12 +965,7 @@ async function updateContourPlot() {
         }, { responsive: true });
 
     } catch (err) {
-        if (err.name === 'AbortError') {
-            // Aborted by a newer request — clear the spinner so it never gets stuck
-            try { Plotly.purge(plotContainer); } catch(e) {}
-            plotContainer.innerHTML = '';
-            return;
-        }
+        if (err.name === 'AbortError') return;
         if (thisRequestId !== currentSurfaceRequestId) return;
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate contour: ${err.message}</div>`;
@@ -1049,12 +1039,7 @@ async function updateSurfacePlot() {
     currentSurfaceAbortController = new AbortController();
     const thisRequestId = ++currentSurfaceRequestId;
 
-    // Only show spinner if the plot is not already rendered (avoids spinner flash on re-renders)
-    const alreadyRenderedSurf = plotContainer._fullLayout !== undefined;
-    if (!alreadyRenderedSurf) {
-        plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing 3D response surface...</div>';
-    }
-
+    // Silent background computation — no spinner injected into DOM
     try {
         const response = await fetch('/bo_surface', {
             method: 'POST',
@@ -1154,12 +1139,7 @@ async function updateSurfacePlot() {
 
 
     } catch (err) {
-        if (err.name === 'AbortError') {
-            // Aborted by a newer request — clear the spinner so it never gets stuck
-            try { Plotly.purge(plotContainer); } catch(e) {}
-            plotContainer.innerHTML = '';
-            return;
-        }
+        if (err.name === 'AbortError') return;
         if (thisRequestId !== currentSurfaceRequestId) return;
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate surface: ${err.message}</div>`;
