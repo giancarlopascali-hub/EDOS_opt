@@ -78,6 +78,7 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('sa-results-container').classList.add('hidden');
             if (document.getElementById('bo-visualization-section')) document.getElementById('bo-visualization-section').classList.add('hidden');
             if (document.getElementById('bo-visuals')) document.getElementById('bo-visuals').classList.add('hidden');
+            if (document.getElementById('pareto-plot-section')) document.getElementById('pareto-plot-section').classList.add('hidden');
         }
     });
 });

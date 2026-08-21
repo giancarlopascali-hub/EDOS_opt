@@ -480,17 +480,22 @@ export function initBOVisualizationDropdown() {
     });
 }
 
+let currentSurfaceRequestId = 0;
+let currentSurfaceAbortController = null;
+
 export function renderBOVisualization() {
     if (!window.currentData || window.currentData.length === 0) {
         try {
             Plotly.purge('trend-plot');
             const contourEl = document.getElementById('bo-contour-plot');
-            if (contourEl) Plotly.purge(contourEl);
+            if (contourEl) { Plotly.purge(contourEl); contourEl.innerHTML = ''; }
             const surfEl = document.getElementById('bo-surface-plot');
-            if (surfEl) Plotly.purge(surfEl);
+            if (surfEl) { Plotly.purge(surfEl); surfEl.innerHTML = ''; }
         } catch(e) {}
         const visSection = document.getElementById('bo-visualization-section') || document.getElementById('bo-visuals');
         if (visSection) visSection.classList.add('hidden');
+        const paretoSection = document.getElementById('pareto-plot-section');
+        if (paretoSection) paretoSection.classList.add('hidden');
         return;
     }
 
@@ -509,31 +514,42 @@ export function renderBOVisualization() {
     if (viewType === 'trend') {
         if (titleEl) titleEl.textContent = 'Objectives Trend';
         if (trendPlotEl) trendPlotEl.style.display = 'block';
-        if (contourPlotEl) { contourPlotEl.style.display = 'none'; try { Plotly.purge(contourPlotEl); } catch(e) {} }
-        if (surfacePlotEl) { surfacePlotEl.style.display = 'none'; try { Plotly.purge(surfacePlotEl); } catch(e) {} }
+        if (contourPlotEl) { contourPlotEl.style.display = 'none'; try { Plotly.purge(contourPlotEl); } catch(e) {} contourPlotEl.innerHTML = ''; }
+        if (surfacePlotEl) { surfacePlotEl.style.display = 'none'; try { Plotly.purge(surfacePlotEl); } catch(e) {} surfacePlotEl.innerHTML = ''; }
         if (controlsEl) { controlsEl.style.display = 'none'; controlsEl.innerHTML = ''; }
         renderTrendPlotOnly();
     } else if (viewType === 'contour') {
         if (titleEl) titleEl.textContent = 'Contour Plot (Response Surface)';
         if (trendPlotEl) { trendPlotEl.style.display = 'none'; try { Plotly.purge(trendPlotEl); } catch(e) {} }
+        if (surfacePlotEl) { surfacePlotEl.style.display = 'none'; try { Plotly.purge(surfacePlotEl); } catch(e) {} surfacePlotEl.innerHTML = ''; }
         if (contourPlotEl) contourPlotEl.style.display = 'block';
-        if (surfacePlotEl) { surfacePlotEl.style.display = 'none'; try { Plotly.purge(surfacePlotEl); } catch(e) {} }
-        renderContourControls();
-        updateContourPlot();
+        const isValid = renderContourControls();
+        if (isValid) {
+            updateContourPlot();
+        }
     } else if (viewType === 'surface') {
         if (titleEl) titleEl.textContent = '3D Surface Plot (Response Surface)';
         if (trendPlotEl) { trendPlotEl.style.display = 'none'; try { Plotly.purge(trendPlotEl); } catch(e) {} }
-        if (contourPlotEl) { contourPlotEl.style.display = 'none'; try { Plotly.purge(contourPlotEl); } catch(e) {} }
+        if (contourPlotEl) { contourPlotEl.style.display = 'none'; try { Plotly.purge(contourPlotEl); } catch(e) {} contourPlotEl.innerHTML = ''; }
         if (surfacePlotEl) surfacePlotEl.style.display = 'block';
-        renderSurfaceControls();
-        updateSurfacePlot();
+        const isValid = renderSurfaceControls();
+        if (isValid) {
+            updateSurfacePlot();
+        }
     }
 
     renderParetoPlot();
 }
 
 function renderTrendPlotOnly() {
-    const objCols = window.currentColumns.filter(c => window.columnRoles[c] === 'objective');
+    const objCols = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
+
+    if (objCols.length === 0) {
+        try { Plotly.purge('trend-plot'); } catch(e) {}
+        const trendEl = document.getElementById('trend-plot');
+        if (trendEl) trendEl.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><i>No included objectives to display trend.</i></div>';
+        return;
+    }
 
     const traces = objCols.map(col => {
         const colIdx = window.currentColumns.indexOf(col);
@@ -607,7 +623,7 @@ function buildFixedInput(f, cssClass) {
 
 function renderContourControls() {
     const controls = document.getElementById('bo-vis-controls');
-    if (!controls) return;
+    if (!controls) return false;
 
     const allFeatCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
     // Only numeric features can be on the X/Y axes
@@ -616,10 +632,15 @@ function renderContourControls() {
     const objCols     = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
 
     if (numFeatCols.length < 2 || objCols.length === 0) {
-        controls.innerHTML = `<p class="text-secondary" style="grid-column: 1 / -1;"><i>Contour plot requires at least 2 included <b>numerical</b> features and 1 objective.${
+        controls.innerHTML = `<p class="text-secondary" style="grid-column: 1 / -1; margin: 0.5rem 0;"><i>Contour plot requires at least 2 included <b>numerical</b> features and 1 objective.${
             catFeatCols.length > 0 ? ' Categorical features can only be set as fixed values.' : ''}</i></p>`;
         controls.style.display = 'grid';
-        return;
+        const contourPlotEl = document.getElementById('bo-contour-plot');
+        if (contourPlotEl) {
+            try { Plotly.purge(contourPlotEl); } catch(e) {}
+            contourPlotEl.innerHTML = '';
+        }
+        return false;
     }
 
     const currentX   = document.getElementById('bo-contour-x')?.value;
@@ -678,11 +699,12 @@ function renderContourControls() {
     document.getElementById('bo-contour-x').addEventListener('change', () => { renderContourControls(); updateContourPlot(); });
     document.getElementById('bo-contour-y').addEventListener('change', () => { renderContourControls(); updateContourPlot(); });
     document.getElementById('bo-contour-obj').addEventListener('change', updateContourPlot);
+    return true;
 }
 
 function renderSurfaceControls() {
     const controls = document.getElementById('bo-vis-controls');
-    if (!controls) return;
+    if (!controls) return false;
 
     const allFeatCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
     // Only numeric features can be on X/Y axes
@@ -691,10 +713,15 @@ function renderSurfaceControls() {
     const objCols     = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
 
     if (numFeatCols.length < 2 || objCols.length === 0) {
-        controls.innerHTML = `<p class="text-secondary" style="grid-column: 1 / -1;"><i>3D surface plot requires at least 2 included <b>numerical</b> features and 1 objective.${
+        controls.innerHTML = `<p class="text-secondary" style="grid-column: 1 / -1; margin: 0.5rem 0;"><i>3D surface plot requires at least 2 included <b>numerical</b> features and 1 objective.${
             catFeatCols.length > 0 ? ' Categorical features can only be set as fixed values.' : ''}</i></p>`;
         controls.style.display = 'grid';
-        return;
+        const surfacePlotEl = document.getElementById('bo-surface-plot');
+        if (surfacePlotEl) {
+            try { Plotly.purge(surfacePlotEl); } catch(e) {}
+            surfacePlotEl.innerHTML = '';
+        }
+        return false;
     }
 
     const currentX     = document.getElementById('bo-surf-x')?.value;
@@ -769,6 +796,7 @@ function renderSurfaceControls() {
     document.getElementById('bo-surf-y').addEventListener('change', () => { renderSurfaceControls(); updateSurfacePlot(); });
     document.getElementById('bo-surf-z').addEventListener('change', updateSurfacePlot);
     document.getElementById('bo-surf-color').addEventListener('change', updateSurfacePlot);
+    return true;
 }
 
 async function updateContourPlot() {
@@ -780,6 +808,7 @@ async function updateContourPlot() {
 
     if (!xFeat || !yFeat || !colorObj || !plotContainer) return;
     if (xFeat === yFeat) {
+        try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ef4444;font-style:italic;">Please select two distinct features for X and Y axes.</div>';
         return;
     }
@@ -807,9 +836,22 @@ async function updateContourPlot() {
             importance: tr.querySelector('.bo-o-importance').value
         }));
 
+    if (features.length < 2 || objectives.length === 0) {
+        try { Plotly.purge(plotContainer); } catch(e) {}
+        plotContainer.innerHTML = '';
+        return;
+    }
+
     const tweaks = {
         kernel: document.getElementById('kernel-select')?.value || 'matern52'
     };
+
+    // Cancel any previous active request
+    if (currentSurfaceAbortController) {
+        try { currentSurfaceAbortController.abort(); } catch(e) {}
+    }
+    currentSurfaceAbortController = new AbortController();
+    const thisRequestId = ++currentSurfaceRequestId;
 
     plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing contour response surface...</div>';
 
@@ -817,6 +859,7 @@ async function updateContourPlot() {
         const response = await fetch('/bo_surface', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: currentSurfaceAbortController.signal,
             body: JSON.stringify({
                 data: window.currentData,
                 columns: window.currentColumns,
@@ -832,8 +875,11 @@ async function updateContourPlot() {
             })
         });
 
+        if (thisRequestId !== currentSurfaceRequestId) return;
+
         const result = await response.json();
         if (result.error) {
+            try { Plotly.purge(plotContainer); } catch(e) {}
             plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Contour calculation error: ${result.error}</div>`;
             return;
         }
@@ -879,6 +925,9 @@ async function updateContourPlot() {
         }, { responsive: true });
 
     } catch (err) {
+        if (err.name === 'AbortError') return;
+        if (thisRequestId !== currentSurfaceRequestId) return;
+        try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate contour: ${err.message}</div>`;
         console.error(err);
     }
@@ -894,6 +943,7 @@ async function updateSurfacePlot() {
 
     if (!xFeat || !yFeat || !colorObj || !plotContainer) return;
     if (xFeat === yFeat) {
+        try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ef4444;font-style:italic;">Please select two distinct features for X and Y axes.</div>';
         return;
     }
@@ -921,9 +971,22 @@ async function updateSurfacePlot() {
             importance: tr.querySelector('.bo-o-importance').value
         }));
 
+    if (features.length < 2 || objectives.length === 0) {
+        try { Plotly.purge(plotContainer); } catch(e) {}
+        plotContainer.innerHTML = '';
+        return;
+    }
+
     const tweaks = {
         kernel: document.getElementById('kernel-select')?.value || 'matern52'
     };
+
+    // Cancel any previous active request
+    if (currentSurfaceAbortController) {
+        try { currentSurfaceAbortController.abort(); } catch(e) {}
+    }
+    currentSurfaceAbortController = new AbortController();
+    const thisRequestId = ++currentSurfaceRequestId;
 
     plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing 3D response surface...</div>';
 
@@ -931,6 +994,7 @@ async function updateSurfacePlot() {
         const response = await fetch('/bo_surface', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: currentSurfaceAbortController.signal,
             body: JSON.stringify({
                 data: window.currentData,
                 columns: window.currentColumns,
@@ -946,8 +1010,11 @@ async function updateSurfacePlot() {
             })
         });
 
+        if (thisRequestId !== currentSurfaceRequestId) return;
+
         const result = await response.json();
         if (result.error) {
+            try { Plotly.purge(plotContainer); } catch(e) {}
             plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Surface calculation error: ${result.error}</div>`;
             return;
         }
@@ -995,6 +1062,9 @@ async function updateSurfacePlot() {
         }, { responsive: true });
 
     } catch (err) {
+        if (err.name === 'AbortError') return;
+        if (thisRequestId !== currentSurfaceRequestId) return;
+        try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate surface: ${err.message}</div>`;
         console.error(err);
     }
