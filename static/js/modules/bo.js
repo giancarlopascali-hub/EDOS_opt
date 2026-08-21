@@ -900,28 +900,53 @@ async function updateContourPlot() {
             hovertemplate: `<b>${result.x_feat}:</b> %{x}<br><b>${result.y_feat}:</b> %{y}<br><b>${result.color_obj}:</b> %{z:.3f}<extra></extra>`
         };
 
-        const scatterTrace = {
-            x: result.experiments.map(e => e.x),
-            y: result.experiments.map(e => e.y),
-            mode: 'markers',
-            type: 'scatter',
-            name: 'Evaluated Points',
-            marker: {
-                size: 8,
-                color: '#ef4444',
-                line: { width: 1.5, color: '#ffffff' }
-            },
-            customdata: result.experiments.map(e => [e.exp_id, e.color]),
-            hovertemplate: `<b>Experiment #%{customdata[0]}</b><br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.color_obj}: %{customdata[1]}<extra></extra>`
-        };
+        const inSliceExps = result.experiments.filter(e => e.in_slice);
+        const offSliceExps = result.experiments.filter(e => !e.in_slice);
+
+        const traces = [contourTrace];
+
+        if (inSliceExps.length > 0) {
+            traces.push({
+                x: inSliceExps.map(e => e.x),
+                y: inSliceExps.map(e => e.y),
+                mode: 'markers',
+                type: 'scatter',
+                name: 'In-Slice Experiments (Solid)',
+                marker: {
+                    size: 9,
+                    color: '#ef4444',
+                    line: { width: 1.5, color: '#ffffff' }
+                },
+                customdata: inSliceExps.map(e => [e.exp_id, e.color, e.conditions]),
+                hovertemplate: `<b>Experiment #%{customdata[0]}</b> [In-Slice]<br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.color_obj}: %{customdata[1]}<br>%{customdata[2]}<extra></extra>`
+            });
+        }
+
+        if (offSliceExps.length > 0) {
+            traces.push({
+                x: offSliceExps.map(e => e.x),
+                y: offSliceExps.map(e => e.y),
+                mode: 'markers',
+                type: 'scatter',
+                name: 'Other Experiments (Off-Slice)',
+                marker: {
+                    size: 8,
+                    color: 'rgba(239, 68, 68, 0.15)',
+                    line: { width: 1.5, color: '#ef4444' }
+                },
+                customdata: offSliceExps.map(e => [e.exp_id, e.color, e.conditions]),
+                hovertemplate: `<b>Experiment #%{customdata[0]}</b> [Off-Slice]<br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.color_obj}: %{customdata[1]}<br>%{customdata[2]}<extra></extra>`
+            });
+        }
 
         try { Plotly.purge(plotContainer); } catch(e) {}
-        Plotly.newPlot(plotContainer, [contourTrace, scatterTrace], {
+        Plotly.newPlot(plotContainer, traces, {
             title: `Contour Plot: ${result.color_obj} vs (${result.x_feat}, ${result.y_feat})`,
             xaxis: { title: result.x_feat, automargin: true },
             yaxis: { title: result.y_feat, automargin: true },
             margin: { l: 70, r: 50, t: 70, b: 60 },
-            height: 500
+            height: 500,
+            legend: { orientation: 'h', y: -0.15 }
         }, { responsive: true });
 
     } catch (err) {
@@ -1033,24 +1058,49 @@ async function updateSurfacePlot() {
             hovertemplate: `<b>${result.x_feat}:</b> %{x}<br><b>${result.y_feat}:</b> %{y}<br><b>${result.z_axis}:</b> %{z:.3f}<br><b>${result.color_obj}:</b> %{surfacecolor:.3f}<extra></extra>`
         };
 
-        const scatter3dTrace = {
-            x: result.experiments.map(e => e.x),
-            y: result.experiments.map(e => e.y),
-            z: result.experiments.map(e => e.z),
-            mode: 'markers',
-            type: 'scatter3d',
-            name: 'Evaluated Points',
-            marker: {
-                size: 5,
-                color: '#ef4444',
-                line: { width: 1, color: '#ffffff' }
-            },
-            customdata: result.experiments.map(e => [e.exp_id, e.color]),
-            hovertemplate: `<b>Experiment #%{customdata[0]}</b><br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.z_axis}: %{z}<br>${result.color_obj}: %{customdata[1]}<extra></extra>`
-        };
+        const inSliceExps = result.experiments.filter(e => e.in_slice);
+        const offSliceExps = result.experiments.filter(e => !e.in_slice);
+
+        const traces = [surfaceTrace];
+
+        if (inSliceExps.length > 0) {
+            traces.push({
+                x: inSliceExps.map(e => e.x),
+                y: inSliceExps.map(e => e.y),
+                z: inSliceExps.map(e => e.z),
+                mode: 'markers',
+                type: 'scatter3d',
+                name: 'In-Slice Experiments (Solid)',
+                marker: {
+                    size: 6,
+                    color: '#ef4444',
+                    line: { width: 1, color: '#ffffff' }
+                },
+                customdata: inSliceExps.map(e => [e.exp_id, e.color, e.conditions]),
+                hovertemplate: `<b>Experiment #%{customdata[0]}</b> [In-Slice]<br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.z_axis}: %{z}<br>${result.color_obj}: %{customdata[1]}<br>%{customdata[2]}<extra></extra>`
+            });
+        }
+
+        if (offSliceExps.length > 0) {
+            traces.push({
+                x: offSliceExps.map(e => e.x),
+                y: offSliceExps.map(e => e.y),
+                z: offSliceExps.map(e => e.z),
+                mode: 'markers',
+                type: 'scatter3d',
+                name: 'Other Experiments (Off-Slice)',
+                marker: {
+                    size: 5,
+                    color: 'rgba(239, 68, 68, 0.15)',
+                    line: { width: 1.5, color: '#ef4444' }
+                },
+                customdata: offSliceExps.map(e => [e.exp_id, e.color, e.conditions]),
+                hovertemplate: `<b>Experiment #%{customdata[0]}</b> [Off-Slice]<br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.z_axis}: %{z}<br>${result.color_obj}: %{customdata[1]}<br>%{customdata[2]}<extra></extra>`
+            });
+        }
 
         try { Plotly.purge(plotContainer); } catch(e) {}
-        Plotly.newPlot(plotContainer, [surfaceTrace, scatter3dTrace], {
+        Plotly.newPlot(plotContainer, traces, {
             title: `3D Surface: ${result.z_axis} vs (${result.x_feat}, ${result.y_feat}) [Color: ${result.color_obj}]`,
             scene: {
                 xaxis: { title: result.x_feat },
@@ -1058,8 +1108,10 @@ async function updateSurfacePlot() {
                 zaxis: { title: result.z_axis }
             },
             margin: { l: 0, r: 0, t: 60, b: 0 },
-            height: 550
+            height: 550,
+            legend: { orientation: 'h', y: -0.1 }
         }, { responsive: true });
+
 
     } catch (err) {
         if (err.name === 'AbortError') return;

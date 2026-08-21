@@ -1207,6 +1207,46 @@ def run_bo_surface(
     color_col_raw = df_clean[color_obj].tolist() if color_obj in df_clean.columns else []
     z_col_raw = df_clean[z_axis].tolist() if z_axis and z_axis in df_clean.columns else color_col_raw
 
+    # Determine remaining features and their target slice values (nearest for numeric, exact for categorical)
+    remaining_feats = [f for f in features_config if f['name'] != x_feat and f['name'] != y_feat]
+    slice_targets = {}
+
+    for f in remaining_feats:
+        fname = f['name']
+        ftype = f.get('type', 'continuous')
+        raw_fixed = fixed_values.get(fname, None)
+        f_inf = feat_ranges.get(fname, (0.0, 1.0, 'continuous', None))
+
+        if ftype == 'categorical':
+            choices = f_inf[3] or []
+            selected_cat = str(raw_fixed) if raw_fixed is not None and str(raw_fixed) in choices else (choices[0] if choices else '')
+            slice_targets[fname] = {
+                "type": "categorical",
+                "target_val": selected_cat,
+                "label": selected_cat
+            }
+        else:
+            try:
+                selected_num = float(raw_fixed) if raw_fixed is not None else (f_inf[0] + f_inf[1]) / 2.0
+            except Exception:
+                selected_num = (f_inf[0] + f_inf[1]) / 2.0
+            
+            # Find nearest unique value in the actual dataset
+            col_vals = pd.to_numeric(df_clean[fname], errors='coerce').dropna().values
+            if len(col_vals) > 0:
+                unique_vals = np.unique(col_vals)
+                nearest_idx = np.argmin(np.abs(unique_vals - selected_num))
+                nearest_val = float(unique_vals[nearest_idx])
+            else:
+                nearest_val = selected_num
+            
+            slice_targets[fname] = {
+                "type": "numerical",
+                "target_val": nearest_val,
+                "selected_val": selected_num,
+                "label": f"{nearest_val:g}"
+            }
+
     experiments = []
     for i in range(len(df_clean)):
         try:
@@ -1214,13 +1254,40 @@ def run_bo_surface(
             exp_y = float(y_col_raw[i]) if pd.notna(y_col_raw[i]) else None
             exp_c = float(color_col_raw[i]) if i < len(color_col_raw) and pd.notna(color_col_raw[i]) else None
             exp_z = float(z_col_raw[i]) if i < len(z_col_raw) and pd.notna(z_col_raw[i]) else exp_c
+
             if exp_x is not None and exp_y is not None:
+                # Check if this row matches slice conditions
+                is_slice_match = True
+                row_remaining_info = []
+
+                for f in remaining_feats:
+                    fname = f['name']
+                    target_info = slice_targets[fname]
+                    row_val_raw = df_clean.iloc[i][fname]
+
+                    if target_info['type'] == 'categorical':
+                        row_val_str = str(row_val_raw)
+                        row_remaining_info.append(f"{fname}={row_val_str}")
+                        if row_val_str != target_info['target_val']:
+                            is_slice_match = False
+                    else:
+                        try:
+                            row_val_num = float(row_val_raw)
+                            row_remaining_info.append(f"{fname}={row_val_num:g}")
+                            if abs(row_val_num - target_info['target_val']) > 1e-6:
+                                is_slice_match = False
+                        except Exception:
+                            is_slice_match = False
+                            row_remaining_info.append(f"{fname}={row_val_raw}")
+
                 experiments.append({
                     "exp_id": i + 1,
                     "x": exp_x,
                     "y": exp_y,
                     "z": exp_z,
-                    "color": exp_c
+                    "color": exp_c,
+                    "in_slice": is_slice_match,
+                    "conditions": ", ".join(row_remaining_info) if row_remaining_info else ""
                 })
         except Exception:
             pass
@@ -1237,6 +1304,8 @@ def run_bo_surface(
         "y_feat": y_feat,
         "z_axis": z_axis or color_obj,
         "color_obj": color_obj,
-        "experiments": experiments
+        "experiments": experiments,
+        "slice_targets": {k: v['label'] for k, v in slice_targets.items()}
     }
+
 
