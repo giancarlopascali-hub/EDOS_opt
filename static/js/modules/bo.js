@@ -585,8 +585,14 @@ export function renderTrendPlot() {
     renderBOVisualization();
 }
 
-// Helper: get feature type ('categorical' | 'continuous' | 'discrete' | 'regular') from bo-features-list table
+// Helper: get feature type ('categorical' | 'continuous' | 'discrete' | 'regular')
+// Reads from authoritative in-memory boFeatureConfigs first; falls back to DOM.
 function getBOFeatureType(featName) {
+    // Authoritative source: in-memory config (immune to DOM rebuild timing)
+    if (window.boFeatureConfigs && window.boFeatureConfigs[featName]) {
+        return window.boFeatureConfigs[featName].type || 'continuous';
+    }
+    // Fallback: read from DOM table row if config not yet populated
     const row = Array.from(document.querySelectorAll('#bo-features-list tr'))
         .find(tr => tr.querySelector('.bo-f-type')?.dataset.col === featName);
     return row ? row.querySelector('.bo-f-type').value : 'continuous';
@@ -863,7 +869,11 @@ async function updateContourPlot() {
     currentSurfaceAbortController = new AbortController();
     const thisRequestId = ++currentSurfaceRequestId;
 
-    plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing contour response surface...</div>';
+    // Only show spinner if the plot is not already rendered (avoids spinner flash on re-renders)
+    const alreadyRendered = plotContainer._fullLayout !== undefined;
+    if (!alreadyRendered) {
+        plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing contour response surface...</div>';
+    }
 
     try {
         const response = await fetch('/bo_surface', {
@@ -1039,7 +1049,11 @@ async function updateSurfacePlot() {
     currentSurfaceAbortController = new AbortController();
     const thisRequestId = ++currentSurfaceRequestId;
 
-    plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing 3D response surface...</div>';
+    // Only show spinner if the plot is not already rendered (avoids spinner flash on re-renders)
+    const alreadyRenderedSurf = plotContainer._fullLayout !== undefined;
+    if (!alreadyRenderedSurf) {
+        plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing 3D response surface...</div>';
+    }
 
     try {
         const response = await fetch('/bo_surface', {
