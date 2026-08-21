@@ -470,14 +470,69 @@ export async function runBOEstimate() {
     }
 }
 
-export function renderTrendPlot() {
+export function initBOVisualizationDropdown() {
+    const visSelect = document.getElementById('bo-vis-type-select');
+    if (!visSelect || visSelect.dataset.initialized) return;
+    visSelect.dataset.initialized = 'true';
+
+    visSelect.addEventListener('change', () => {
+        renderBOVisualization();
+    });
+}
+
+export function renderBOVisualization() {
     if (!window.currentData || window.currentData.length === 0) {
-        try { Plotly.purge('trend-plot'); } catch(e) {}
-        const visuals = document.getElementById('bo-visuals');
-        if (visuals) visuals.classList.add('hidden');
+        try {
+            Plotly.purge('trend-plot');
+            const contourEl = document.getElementById('bo-contour-plot');
+            if (contourEl) Plotly.purge(contourEl);
+            const surfEl = document.getElementById('bo-surface-plot');
+            if (surfEl) Plotly.purge(surfEl);
+        } catch(e) {}
+        const visSection = document.getElementById('bo-visualization-section') || document.getElementById('bo-visuals');
+        if (visSection) visSection.classList.add('hidden');
         return;
     }
 
+    const visSection = document.getElementById('bo-visualization-section') || document.getElementById('bo-visuals');
+    if (visSection) visSection.classList.remove('hidden');
+
+    initBOVisualizationDropdown();
+
+    const viewType = document.getElementById('bo-vis-type-select')?.value || 'trend';
+    const trendPlotEl = document.getElementById('trend-plot');
+    const contourPlotEl = document.getElementById('bo-contour-plot');
+    const surfacePlotEl = document.getElementById('bo-surface-plot');
+    const controlsEl = document.getElementById('bo-vis-controls');
+    const titleEl = document.getElementById('bo-vis-title');
+
+    if (viewType === 'trend') {
+        if (titleEl) titleEl.textContent = 'Objectives Trend';
+        if (trendPlotEl) trendPlotEl.style.display = 'block';
+        if (contourPlotEl) { contourPlotEl.style.display = 'none'; try { Plotly.purge(contourPlotEl); } catch(e) {} }
+        if (surfacePlotEl) { surfacePlotEl.style.display = 'none'; try { Plotly.purge(surfacePlotEl); } catch(e) {} }
+        if (controlsEl) { controlsEl.style.display = 'none'; controlsEl.innerHTML = ''; }
+        renderTrendPlotOnly();
+    } else if (viewType === 'contour') {
+        if (titleEl) titleEl.textContent = 'Contour Plot (Response Surface)';
+        if (trendPlotEl) { trendPlotEl.style.display = 'none'; try { Plotly.purge(trendPlotEl); } catch(e) {} }
+        if (contourPlotEl) contourPlotEl.style.display = 'block';
+        if (surfacePlotEl) { surfacePlotEl.style.display = 'none'; try { Plotly.purge(surfacePlotEl); } catch(e) {} }
+        renderContourControls();
+        updateContourPlot();
+    } else if (viewType === 'surface') {
+        if (titleEl) titleEl.textContent = '3D Surface Plot (Response Surface)';
+        if (trendPlotEl) { trendPlotEl.style.display = 'none'; try { Plotly.purge(trendPlotEl); } catch(e) {} }
+        if (contourPlotEl) { contourPlotEl.style.display = 'none'; try { Plotly.purge(contourPlotEl); } catch(e) {} }
+        if (surfacePlotEl) surfacePlotEl.style.display = 'block';
+        renderSurfaceControls();
+        updateSurfacePlot();
+    }
+
+    renderParetoPlot();
+}
+
+function renderTrendPlotOnly() {
     const objCols = window.currentColumns.filter(c => window.columnRoles[c] === 'objective');
 
     const traces = objCols.map(col => {
@@ -497,12 +552,7 @@ export function renderTrendPlot() {
         return { x: xDist, y: yDist, name: col, mode: 'lines+markers', line: { width: 3 }, marker: { size: 8 } };
     }).filter(t => t.x.length > 0);
 
-    if (traces.length === 0) {
-        document.getElementById('bo-visuals').classList.add('hidden');
-        return;
-    }
-
-    document.getElementById('bo-visuals').classList.remove('hidden');
+    if (traces.length === 0) return;
 
     Plotly.newPlot('trend-plot', traces, {
         title:    objCols.length === 1 ? `Trend: ${objCols[0]}` : 'Objectives Trend',
@@ -513,7 +563,425 @@ export function renderTrendPlot() {
     }, { responsive: true });
 
     setTimeout(() => { Plotly.Plots.resize('trend-plot'); }, 100);
-    renderParetoPlot();
+}
+
+export function renderTrendPlot() {
+    renderBOVisualization();
+}
+
+function renderContourControls() {
+    const controls = document.getElementById('bo-vis-controls');
+    if (!controls) return;
+    const featCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
+    const objCols  = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
+
+    if (featCols.length < 2 || objCols.length === 0) {
+        controls.innerHTML = '<p class="text-secondary" style="grid-column: 1 / -1;"><i>Contour plot requires at least 2 included features and 1 objective.</i></p>';
+        controls.style.display = 'grid';
+        return;
+    }
+
+    const currentX = document.getElementById('bo-contour-x')?.value;
+    const currentY = document.getElementById('bo-contour-y')?.value;
+    const currentObj = document.getElementById('bo-contour-obj')?.value;
+
+    const xSelected = featCols.includes(currentX) ? currentX : featCols[0];
+    const ySelected = featCols.includes(currentY) ? currentY : (featCols[1] || featCols[0]);
+    const objSelected = objCols.includes(currentObj) ? currentObj : objCols[0];
+
+    let html = `
+        <div class="tweak-item">
+            <label>X-Axis Feature:</label>
+            <select id="bo-contour-x" style="width: 100%;">
+                ${featCols.map(f => `<option value="${f}" ${f === xSelected ? 'selected' : ''}>${f}</option>`).join('')}
+            </select>
+        </div>
+        <div class="tweak-item">
+            <label>Y-Axis Feature:</label>
+            <select id="bo-contour-y" style="width: 100%;">
+                ${featCols.map(f => `<option value="${f}" ${f === ySelected ? 'selected' : ''}>${f}</option>`).join('')}
+            </select>
+        </div>
+        <div class="tweak-item">
+            <label>Objective (Color & Contours):</label>
+            <select id="bo-contour-obj" style="width: 100%;">
+                ${objCols.map(o => `<option value="${o}" ${o === objSelected ? 'selected' : ''}>${o}</option>`).join('')}
+            </select>
+        </div>
+        <div class="tweak-item">
+            <label>Grid Resolution:</label>
+            <select id="bo-contour-res" style="width: 100%;">
+                <option value="15">15 x 15 (Fast)</option>
+                <option value="25" selected>25 x 25 (Standard)</option>
+                <option value="40">40 x 40 (High)</option>
+            </select>
+        </div>
+    `;
+
+    const otherFeats = featCols.filter(f => f !== xSelected && f !== ySelected);
+    if (otherFeats.length > 0) {
+        html += `<div style="grid-column: 1 / -1; margin-top: 0.5rem;"><b style="font-size: 0.85rem; color: var(--text-secondary);">Fixed values for remaining features:</b></div>`;
+        otherFeats.forEach(f => {
+            const colIdx = window.currentColumns.indexOf(f);
+            const vals = window.currentData.map(r => r[colIdx]).filter(v => v !== null && v !== '');
+            const numVals = vals.map(v => parseFloat(v)).filter(v => !isNaN(v));
+            const defaultVal = numVals.length > 0 ? (numVals.reduce((a,b)=>a+b,0)/numVals.length).toFixed(2) : (vals[0] || '');
+
+            html += `
+                <div class="tweak-item">
+                    <label>${f}:</label>
+                    <input type="number" class="bo-contour-fixed" data-feat="${f}" value="${defaultVal}" step="any" style="width: 100%;">
+                </div>
+            `;
+        });
+    }
+
+    html += `
+        <div style="grid-column: 1 / -1; display: flex; justify-content: flex-end; margin-top: 0.5rem;">
+            <button id="bo-contour-update-btn" class="btn primary small">Calculate & Update Contour</button>
+        </div>
+    `;
+
+    controls.innerHTML = html;
+    controls.style.display = 'grid';
+
+    document.getElementById('bo-contour-update-btn').addEventListener('click', updateContourPlot);
+    document.getElementById('bo-contour-x').addEventListener('change', () => { renderContourControls(); updateContourPlot(); });
+    document.getElementById('bo-contour-y').addEventListener('change', () => { renderContourControls(); updateContourPlot(); });
+    document.getElementById('bo-contour-obj').addEventListener('change', updateContourPlot);
+}
+
+function renderSurfaceControls() {
+    const controls = document.getElementById('bo-vis-controls');
+    if (!controls) return;
+    const featCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
+    const objCols  = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
+
+    if (featCols.length < 2 || objCols.length === 0) {
+        controls.innerHTML = '<p class="text-secondary" style="grid-column: 1 / -1;"><i>3D surface plot requires at least 2 included features and 1 objective.</i></p>';
+        controls.style.display = 'grid';
+        return;
+    }
+
+    const currentX = document.getElementById('bo-surf-x')?.value;
+    const currentY = document.getElementById('bo-surf-y')?.value;
+    const currentZ = document.getElementById('bo-surf-z')?.value;
+    const currentColor = document.getElementById('bo-surf-color')?.value;
+
+    const xSelected = featCols.includes(currentX) ? currentX : featCols[0];
+    const ySelected = featCols.includes(currentY) ? currentY : (featCols[1] || featCols[0]);
+    const zSelected = (objCols.includes(currentZ) || featCols.includes(currentZ)) ? currentZ : objCols[0];
+    const colorSelected = objCols.includes(currentColor) ? currentColor : objCols[0];
+
+    let zOptionsHtml = `<optgroup label="Objectives">`;
+    objCols.forEach(o => {
+        zOptionsHtml += `<option value="${o}" ${o === zSelected ? 'selected' : ''}>${o} (Objective)</option>`;
+    });
+    zOptionsHtml += `</optgroup>`;
+    if (featCols.length >= 3) {
+        zOptionsHtml += `<optgroup label="Features">`;
+        featCols.forEach(f => {
+            if (f !== xSelected && f !== ySelected) {
+                zOptionsHtml += `<option value="${f}" ${f === zSelected ? 'selected' : ''}>${f} (Feature)</option>`;
+            }
+        });
+        zOptionsHtml += `</optgroup>`;
+    }
+
+    let html = `
+        <div class="tweak-item">
+            <label>X-Axis Feature:</label>
+            <select id="bo-surf-x" style="width: 100%;">
+                ${featCols.map(f => `<option value="${f}" ${f === xSelected ? 'selected' : ''}>${f}</option>`).join('')}
+            </select>
+        </div>
+        <div class="tweak-item">
+            <label>Y-Axis Feature:</label>
+            <select id="bo-surf-y" style="width: 100%;">
+                ${featCols.map(f => `<option value="${f}" ${f === ySelected ? 'selected' : ''}>${f}</option>`).join('')}
+            </select>
+        </div>
+        <div class="tweak-item">
+            <label>Z-Axis (Height):</label>
+            <select id="bo-surf-z" style="width: 100%;">
+                ${zOptionsHtml}
+            </select>
+        </div>
+        <div class="tweak-item">
+            <label>Surface Color (Objective):</label>
+            <select id="bo-surf-color" style="width: 100%;">
+                ${objCols.map(o => `<option value="${o}" ${o === colorSelected ? 'selected' : ''}>${o}</option>`).join('')}
+            </select>
+        </div>
+        <div class="tweak-item">
+            <label>Grid Resolution:</label>
+            <select id="bo-surf-res" style="width: 100%;">
+                <option value="15" selected>15 x 15 (Smooth 3D)</option>
+                <option value="20">20 x 20 (Detailed)</option>
+                <option value="30">30 x 30 (Ultra)</option>
+            </select>
+        </div>
+    `;
+
+    const otherFeats = featCols.filter(f => f !== xSelected && f !== ySelected && f !== zSelected);
+    if (otherFeats.length > 0) {
+        html += `<div style="grid-column: 1 / -1; margin-top: 0.5rem;"><b style="font-size: 0.85rem; color: var(--text-secondary);">Fixed values for remaining features:</b></div>`;
+        otherFeats.forEach(f => {
+            const colIdx = window.currentColumns.indexOf(f);
+            const vals = window.currentData.map(r => r[colIdx]).filter(v => v !== null && v !== '');
+            const numVals = vals.map(v => parseFloat(v)).filter(v => !isNaN(v));
+            const defaultVal = numVals.length > 0 ? (numVals.reduce((a,b)=>a+b,0)/numVals.length).toFixed(2) : (vals[0] || '');
+
+            html += `
+                <div class="tweak-item">
+                    <label>${f}:</label>
+                    <input type="number" class="bo-surf-fixed" data-feat="${f}" value="${defaultVal}" step="any" style="width: 100%;">
+                </div>
+            `;
+        });
+    }
+
+    html += `
+        <div style="grid-column: 1 / -1; display: flex; justify-content: flex-end; margin-top: 0.5rem;">
+            <button id="bo-surf-update-btn" class="btn primary small">Calculate & Update 3D Surface</button>
+        </div>
+    `;
+
+    controls.innerHTML = html;
+    controls.style.display = 'grid';
+
+    document.getElementById('bo-surf-update-btn').addEventListener('click', updateSurfacePlot);
+    document.getElementById('bo-surf-x').addEventListener('change', () => { renderSurfaceControls(); updateSurfacePlot(); });
+    document.getElementById('bo-surf-y').addEventListener('change', () => { renderSurfaceControls(); updateSurfacePlot(); });
+    document.getElementById('bo-surf-z').addEventListener('change', updateSurfacePlot);
+    document.getElementById('bo-surf-color').addEventListener('change', updateSurfacePlot);
+}
+
+async function updateContourPlot() {
+    const xFeat = document.getElementById('bo-contour-x')?.value;
+    const yFeat = document.getElementById('bo-contour-y')?.value;
+    const colorObj = document.getElementById('bo-contour-obj')?.value;
+    const res = parseInt(document.getElementById('bo-contour-res')?.value || '25', 10);
+    const plotContainer = document.getElementById('bo-contour-plot');
+
+    if (!xFeat || !yFeat || !colorObj || !plotContainer) return;
+    if (xFeat === yFeat) {
+        plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ef4444;font-style:italic;">Please select two distinct features for X and Y axes.</div>';
+        return;
+    }
+
+    const fixedValues = {};
+    document.querySelectorAll('.bo-contour-fixed').forEach(inp => {
+        fixedValues[inp.dataset.feat] = parseFloat(inp.value);
+    });
+
+    const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
+        .filter(tr => tr.querySelector('.bo-f-include')?.checked)
+        .map(tr => ({
+            name: tr.querySelector('.bo-f-type').dataset.col,
+            type: tr.querySelector('.bo-f-type').value,
+            range: tr.querySelector('.bo-f-range').value
+        }));
+
+    const objectives = Array.from(document.querySelectorAll('#bo-objectives-list tr'))
+        .filter(tr => tr.querySelector('.bo-o-include')?.checked)
+        .map(tr => ({
+            name: tr.querySelector('.bo-o-type').dataset.col,
+            type: tr.querySelector('.bo-o-type').value,
+            target: tr.querySelector('.bo-o-target').value,
+            importance: tr.querySelector('.bo-o-importance').value
+        }));
+
+    const tweaks = {
+        kernel: document.getElementById('kernel-select')?.value || 'matern52'
+    };
+
+    plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing contour response surface...</div>';
+
+    try {
+        const response = await fetch('/bo_surface', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                data: window.currentData,
+                columns: window.currentColumns,
+                features,
+                objectives,
+                tweaks,
+                x_feat: xFeat,
+                y_feat: yFeat,
+                z_axis: colorObj,
+                color_obj: colorObj,
+                fixed_values: fixedValues,
+                resolution: res
+            })
+        });
+
+        const result = await response.json();
+        if (result.error) {
+            plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Contour calculation error: ${result.error}</div>`;
+            return;
+        }
+
+        const contourTrace = {
+            x: result.x,
+            y: result.y,
+            z: result.z,
+            type: 'contour',
+            colorscale: 'Viridis',
+            contours: {
+                coloring: 'heatmap',
+                showlabels: true,
+                labelfont: { family: 'Inter, sans-serif', size: 11, color: '#ffffff' }
+            },
+            line: { smoothing: 0.85, width: 1.5 },
+            colorbar: { title: result.color_obj, len: 0.9 },
+            hovertemplate: `<b>${result.x_feat}:</b> %{x}<br><b>${result.y_feat}:</b> %{y}<br><b>${result.color_obj}:</b> %{z:.3f}<extra></extra>`
+        };
+
+        const scatterTrace = {
+            x: result.experiments.map(e => e.x),
+            y: result.experiments.map(e => e.y),
+            mode: 'markers',
+            type: 'scatter',
+            name: 'Evaluated Points',
+            marker: {
+                size: 8,
+                color: '#ef4444',
+                line: { width: 1.5, color: '#ffffff' }
+            },
+            customdata: result.experiments.map(e => [e.exp_id, e.color]),
+            hovertemplate: `<b>Experiment #%{customdata[0]}</b><br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.color_obj}: %{customdata[1]}<extra></extra>`
+        };
+
+        try { Plotly.purge(plotContainer); } catch(e) {}
+        Plotly.newPlot(plotContainer, [contourTrace, scatterTrace], {
+            title: `Contour Plot: ${result.color_obj} vs (${result.x_feat}, ${result.y_feat})`,
+            xaxis: { title: result.x_feat, automargin: true },
+            yaxis: { title: result.y_feat, automargin: true },
+            margin: { l: 70, r: 50, t: 70, b: 60 },
+            height: 500
+        }, { responsive: true });
+
+    } catch (err) {
+        plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate contour: ${err.message}</div>`;
+        console.error(err);
+    }
+}
+
+async function updateSurfacePlot() {
+    const xFeat = document.getElementById('bo-surf-x')?.value;
+    const yFeat = document.getElementById('bo-surf-y')?.value;
+    const zAxis = document.getElementById('bo-surf-z')?.value;
+    const colorObj = document.getElementById('bo-surf-color')?.value;
+    const res = parseInt(document.getElementById('bo-surf-res')?.value || '15', 10);
+    const plotContainer = document.getElementById('bo-surface-plot');
+
+    if (!xFeat || !yFeat || !colorObj || !plotContainer) return;
+    if (xFeat === yFeat) {
+        plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ef4444;font-style:italic;">Please select two distinct features for X and Y axes.</div>';
+        return;
+    }
+
+    const fixedValues = {};
+    document.querySelectorAll('.bo-surf-fixed').forEach(inp => {
+        fixedValues[inp.dataset.feat] = parseFloat(inp.value);
+    });
+
+    const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
+        .filter(tr => tr.querySelector('.bo-f-include')?.checked)
+        .map(tr => ({
+            name: tr.querySelector('.bo-f-type').dataset.col,
+            type: tr.querySelector('.bo-f-type').value,
+            range: tr.querySelector('.bo-f-range').value
+        }));
+
+    const objectives = Array.from(document.querySelectorAll('#bo-objectives-list tr'))
+        .filter(tr => tr.querySelector('.bo-o-include')?.checked)
+        .map(tr => ({
+            name: tr.querySelector('.bo-o-type').dataset.col,
+            type: tr.querySelector('.bo-o-type').value,
+            target: tr.querySelector('.bo-o-target').value,
+            importance: tr.querySelector('.bo-o-importance').value
+        }));
+
+    const tweaks = {
+        kernel: document.getElementById('kernel-select')?.value || 'matern52'
+    };
+
+    plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);"><span class="spinner" style="margin-right:8px;"></span> Computing 3D response surface...</div>';
+
+    try {
+        const response = await fetch('/bo_surface', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                data: window.currentData,
+                columns: window.currentColumns,
+                features,
+                objectives,
+                tweaks,
+                x_feat: xFeat,
+                y_feat: yFeat,
+                z_axis: zAxis,
+                color_obj: colorObj,
+                fixed_values: fixedValues,
+                resolution: res
+            })
+        });
+
+        const result = await response.json();
+        if (result.error) {
+            plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Surface calculation error: ${result.error}</div>`;
+            return;
+        }
+
+        const surfaceTrace = {
+            x: result.x,
+            y: result.y,
+            z: result.z,
+            surfacecolor: result.color,
+            type: 'surface',
+            colorscale: 'Viridis',
+            contours: {
+                z: { show: true, usecolormap: true, highlightcolor: "#42f462", project: { z: false } }
+            },
+            colorbar: { title: result.color_obj, len: 0.8 },
+            hovertemplate: `<b>${result.x_feat}:</b> %{x}<br><b>${result.y_feat}:</b> %{y}<br><b>${result.z_axis}:</b> %{z:.3f}<br><b>${result.color_obj}:</b> %{surfacecolor:.3f}<extra></extra>`
+        };
+
+        const scatter3dTrace = {
+            x: result.experiments.map(e => e.x),
+            y: result.experiments.map(e => e.y),
+            z: result.experiments.map(e => e.z),
+            mode: 'markers',
+            type: 'scatter3d',
+            name: 'Evaluated Points',
+            marker: {
+                size: 5,
+                color: '#ef4444',
+                line: { width: 1, color: '#ffffff' }
+            },
+            customdata: result.experiments.map(e => [e.exp_id, e.color]),
+            hovertemplate: `<b>Experiment #%{customdata[0]}</b><br>${result.x_feat}: %{x}<br>${result.y_feat}: %{y}<br>${result.z_axis}: %{z}<br>${result.color_obj}: %{customdata[1]}<extra></extra>`
+        };
+
+        try { Plotly.purge(plotContainer); } catch(e) {}
+        Plotly.newPlot(plotContainer, [surfaceTrace, scatter3dTrace], {
+            title: `3D Surface: ${result.z_axis} vs (${result.x_feat}, ${result.y_feat}) [Color: ${result.color_obj}]`,
+            scene: {
+                xaxis: { title: result.x_feat },
+                yaxis: { title: result.y_feat },
+                zaxis: { title: result.z_axis }
+            },
+            margin: { l: 0, r: 0, t: 60, b: 0 },
+            height: 550
+        }, { responsive: true });
+
+    } catch (err) {
+        plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate surface: ${err.message}</div>`;
+        console.error(err);
+    }
 }
 
 export function renderParetoPlot() {

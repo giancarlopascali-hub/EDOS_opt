@@ -58,6 +58,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             try {
                 if (document.getElementById('trend-plot'))  Plotly.purge('trend-plot');
+                if (document.getElementById('bo-contour-plot')) Plotly.purge('bo-contour-plot');
+                if (document.getElementById('bo-surface-plot')) Plotly.purge('bo-surface-plot');
                 if (document.getElementById('pareto-plot')) Plotly.purge('pareto-plot');
                 if (document.getElementById('sa-num-corr')) Plotly.purge('sa-num-corr');
                 document.querySelectorAll('[id^="sa-parcoords-"]').forEach(el => Plotly.purge(el.id));
@@ -74,6 +76,7 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('doe-results-section').classList.add('hidden');
             document.getElementById('results-section').classList.add('hidden');
             document.getElementById('sa-results-container').classList.add('hidden');
+            if (document.getElementById('bo-visualization-section')) document.getElementById('bo-visualization-section').classList.add('hidden');
             if (document.getElementById('bo-visuals')) document.getElementById('bo-visuals').classList.add('hidden');
         }
     });

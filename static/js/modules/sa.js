@@ -403,6 +403,9 @@ export function renderSAResults(result) {
     }
 
     const impactContainer = document.getElementById('sa-impact-container');
+    const impactControls  = document.getElementById('sa-impact-controls');
+    if (impactControls) impactControls.innerHTML = '';
+    purgeAllPlots(impactContainer);
     impactContainer.innerHTML = '';
 
     const globalCatMap = {};
@@ -425,134 +428,196 @@ export function renderSAResults(result) {
         globalCatMap[feat] = Array.from(globalCatMap[feat]).sort();
     });
 
-    objNames.forEach((obj, idx) => {
-        const res = result.results[obj];
-        if (!res || !res.importance) return;
+    window.saImpactPlotData = {};
 
-        const imp           = res.importance;
-        const sortedEntries = Object.entries(imp).sort((a, b) => a[1] - b[1]);
-        const yFeats        = sortedEntries.map(e => e[0]);
-        const xVals         = sortedEntries.map(e => e[1]);
-
-        const container   = document.createElement('div');
-        container.classList.add('impact-row');
-        container.style.cssText = 'display:flex;flex-wrap:wrap;gap:15px;margin-bottom:2.5rem;padding:1rem;background:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;';
-
-        const titleRow = document.createElement('div');
-        titleRow.style.cssText = 'width:100%;display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;';
-
-        const titleDiv        = document.createElement('h3');
-        titleDiv.textContent  = `Feature Impact: ${obj}`;
-        titleDiv.style.margin = '0';
-        titleRow.appendChild(titleDiv);
-
-        // --- Bar chart CSV ---
-        const barCsvBtn = document.createElement('button');
-        barCsvBtn.className   = 'btn small';
-        barCsvBtn.textContent = '⬇ Importance CSV';
-        barCsvBtn.onclick = () => {
-            const rows = [['Feature', 'Importance (%)'], ...sortedEntries.map(([f, v]) => [f, v.toFixed(4)])];
-            _downloadCSV(rows, `SA_Importance_${obj}`);
-        };
-        titleRow.appendChild(barCsvBtn);
-        container.appendChild(titleRow);
-
-        const barId  = `sa-bar-${idx}`;
-        const barDiv = document.createElement('div');
-        barDiv.id    = barId;
-        barDiv.style.cssText = 'flex:1;min-width:350px;height:400px;';
-        container.appendChild(barDiv);
-
-        const shapId  = `sa-shap-${idx}`;
-        const shapDiv = document.createElement('div');
-        shapDiv.id    = shapId;
-        shapDiv.style.cssText = 'flex:1.3;min-width:450px;height:400px;';
-
-        // SHAP CSV button
-        const shapBtnWrap = document.createElement('div');
-        shapBtnWrap.style.cssText = 'flex:1.3;min-width:450px;display:flex;flex-direction:column;gap:6px;';
-        const shapCsvBtn = document.createElement('button');
-        shapCsvBtn.className   = 'btn small';
-        shapCsvBtn.textContent = '⬇ SHAP CSV';
-        shapCsvBtn.style.cssText = 'align-self:flex-end;';
-        shapCsvBtn.onclick = () => {
-            if (!res.shap_data || !res.shap_data.features) return;
-            const sd = res.shap_data;
-            const csvRows = [['Feature', 'Feature_Value', 'SHAP_Value']];
-            sd.features.forEach((feat, i) => {
-                sd.shap_values[i].forEach((sv, j) => {
-                    csvRows.push([feat, sd.feature_values[i][j], sv.toFixed(6)]);
-                });
-            });
-            _downloadCSV(csvRows, `SA_SHAP_${obj}`);
-        };
-        shapBtnWrap.appendChild(shapCsvBtn);
-        shapBtnWrap.appendChild(shapDiv);
-        container.appendChild(shapBtnWrap);
-
-        // ⚠️ Must append to DOM BEFORE Plotly renders (Plotly requires a live element)
-        impactContainer.appendChild(container);
-
-        const hasShap = res.shap_data && res.shap_data.features && res.shap_data.features.length > 0;
-
-        Plotly.newPlot(barId,
-            [{ x: xVals, y: yFeats, type: 'bar', orientation: 'h',
-               marker: { color: obj === 'global_success' ? '#FFD700' : 'var(--accent-color)' } }],
-            { xaxis: { title: 'Importance (%)', range: [0, 100] },
-              yaxis: { automargin: true },
-              margin: { l: 120, b: 50, t: 20, r: 20 },
-              showlegend: false, height: 400 },
-            { responsive: true }
-        );
-
-        if (hasShap) {
-            const shapTraces = [];
-            const sd = res.shap_data;
-            sd.features.forEach((feat, i) => {
-                const sVals = sd.shap_values[i];
-                const fVals = sd.feature_values[i];
-
-                let numericFVals = fVals.map(v => parseFloat(v));
-                let isCategorical = numericFVals.some(isNaN);
-                let colorArray, cmin, cmax, colorscale, reversescale;
-
-                if (isCategorical) {
-                    const uniqueStr = globalCatMap[feat] || [...new Set(fVals)].sort();
-                    colorArray   = fVals.map(v => uniqueStr.indexOf(v));
-                    colorscale   = 'Portland'; reversescale = false;
-                } else {
-                    colorArray  = numericFVals;
-                    colorscale  = 'RdBu';
-                    cmin        = Math.min(...colorArray);
-                    cmax        = Math.max(...colorArray);
-                    reversescale = true;
-                }
-
-                const yBase = yFeats.indexOf(feat);
-                shapTraces.push({
-                    x: sVals,
-                    y: sVals.map(() => yBase + (Math.random() - 0.5) * 0.4),
-                    mode: 'markers', type: 'scatter',
-                    marker: {
-                        size: 7, opacity: 0.6, color: colorArray,
-                        colorscale, cmin, cmax, reversescale,
-                        line: { width: 0.5, color: '#fff' }
-                    },
-                    customdata: fVals,
-                    hovertemplate: `<b>Value:</b> %{customdata}<br><b>Impact:</b> %{x:.3f}<extra></extra>`
-                });
-            });
-
-            Plotly.newPlot(shapId, shapTraces, {
-                xaxis: { title: 'SHAP Value (Impact)', zeroline: true, zerolinecolor: '#94a3b8' },
-                yaxis: { showticklabels: false, range: [-0.5, yFeats.length - 0.5] },
-                margin: { l: 20, b: 50, t: 20, r: 20 },
-                showlegend: false, height: 400
-            }, { responsive: true });
-        } else {
-            shapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;">No SHAP data available for this model.</div>';
+    if (objNames.length > 0) {
+        if (impactControls) {
+            impactControls.innerHTML = `<div class="tweak-item" style="max-width: 400px;">
+                <label>Select Objective to Inspect:</label>
+                <select id="sa-impact-obj-select" style="width: 100%;">
+                    ${objNames.map(o => `<option value="${o}">${o === 'global_success' ? '✨ Global Success Index' : o}</option>`).join('')}
+                </select>
+            </div>`;
         }
-    });
+
+        // Build plot configurations for all objectives
+        objNames.forEach(obj => {
+            const res = result.results[obj];
+            if (!res || !res.importance) return;
+
+            const imp           = res.importance;
+            const sortedEntries = Object.entries(imp).sort((a, b) => a[1] - b[1]);
+            const yFeats        = sortedEntries.map(e => e[0]);
+            const xVals         = sortedEntries.map(e => e[1]);
+            const hasShap       = res.shap_data && res.shap_data.features && res.shap_data.features.length > 0;
+
+            const barData = [{
+                x: xVals, y: yFeats, type: 'bar', orientation: 'h',
+                marker: { color: obj === 'global_success' ? '#FFD700' : 'var(--accent-color, #3b82f6)' }
+            }];
+
+            const barLayout = {
+                title: 'Feature Importance (%)',
+                xaxis: { title: 'Importance (%)', range: [0, 100] },
+                yaxis: { automargin: true },
+                margin: { l: 120, b: 50, t: 30, r: 20 },
+                showlegend: false, height: 400
+            };
+
+            let shapTraces = [];
+            let shapLayout = null;
+
+            if (hasShap) {
+                const sd = res.shap_data;
+                sd.features.forEach((feat, i) => {
+                    const sVals = sd.shap_values[i];
+                    const fVals = sd.feature_values[i];
+
+                    let numericFVals = fVals.map(v => parseFloat(v));
+                    let isCategorical = numericFVals.some(isNaN);
+                    let colorArray, cmin, cmax, colorscale, reversescale;
+
+                    if (isCategorical) {
+                        const uniqueStr = globalCatMap[feat] || [...new Set(fVals)].sort();
+                        colorArray   = fVals.map(v => uniqueStr.indexOf(v));
+                        colorscale   = 'Portland'; reversescale = false;
+                    } else {
+                        colorArray  = numericFVals;
+                        colorscale  = 'RdBu';
+                        cmin        = Math.min(...colorArray);
+                        cmax        = Math.max(...colorArray);
+                        reversescale = true;
+                    }
+
+                    const yBase = yFeats.indexOf(feat);
+                    shapTraces.push({
+                        x: sVals,
+                        y: sVals.map(() => yBase + (Math.random() - 0.5) * 0.4),
+                        mode: 'markers', type: 'scatter',
+                        marker: {
+                            size: 7, opacity: 0.6, color: colorArray,
+                            colorscale, cmin, cmax, reversescale,
+                            line: { width: 0.5, color: '#fff' }
+                        },
+                        customdata: fVals,
+                        hovertemplate: `<b>Value:</b> %{customdata}<br><b>Impact:</b> %{x:.3f}<extra></extra>`
+                    });
+                });
+
+                shapLayout = {
+                    title: 'SHAP Value Distribution',
+                    xaxis: { title: 'SHAP Value (Impact)', zeroline: true, zerolinecolor: '#94a3b8' },
+                    yaxis: { showticklabels: false, range: [-0.5, yFeats.length - 0.5] },
+                    margin: { l: 20, b: 50, t: 30, r: 20 },
+                    showlegend: false, height: 400
+                };
+            }
+
+            window.saImpactPlotData[obj] = {
+                obj,
+                objDisplay: obj === 'global_success' ? 'Global Success Index' : obj,
+                sortedEntries,
+                hasShap,
+                rawShapData: res.shap_data,
+                barData,
+                barLayout,
+                shapTraces,
+                shapLayout
+            };
+        });
+
+        const renderActiveImpact = () => {
+            const selectEl = document.getElementById('sa-impact-obj-select');
+            const obj      = selectEl ? selectEl.value : objNames[0];
+            const pObj     = window.saImpactPlotData[obj];
+            if (!pObj) return;
+
+            purgeAllPlots(impactContainer);
+            impactContainer.innerHTML = '';
+
+            const container = document.createElement('div');
+            container.className = 'impact-card';
+            container.style.cssText = 'display: flex; flex-direction: column; gap: 15px; padding: 1.25rem; background: #f8fafc; border-radius: 12px; border: 1px solid #e2e8f0;';
+
+            // Top Header Row with Title and Aligned CSV Export Buttons
+            const headerRow = document.createElement('div');
+            headerRow.style.cssText = 'width: 100%; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; border-bottom: 1px dashed #cbd5e1; padding-bottom: 0.75rem;';
+
+            const titleDiv = document.createElement('h3');
+            titleDiv.textContent = `Feature Impact: ${pObj.objDisplay}`;
+            titleDiv.style.margin = '0';
+            headerRow.appendChild(titleDiv);
+
+            const btnGroup = document.createElement('div');
+            btnGroup.style.cssText = 'display: flex; gap: 8px; align-items: center;';
+
+            // Importance CSV Button
+            const barCsvBtn = document.createElement('button');
+            barCsvBtn.className = 'btn small';
+            barCsvBtn.textContent = '⬇ Importance CSV';
+            barCsvBtn.onclick = () => {
+                const rows = [['Feature', 'Importance (%)'], ...pObj.sortedEntries.map(([f, v]) => [f, v.toFixed(4)])];
+                _downloadCSV(rows, `SA_Importance_${obj}`);
+            };
+            btnGroup.appendChild(barCsvBtn);
+
+            // SHAP CSV Button
+            const shapCsvBtn = document.createElement('button');
+            shapCsvBtn.className = 'btn small';
+            shapCsvBtn.textContent = '⬇ SHAP CSV';
+            if (pObj.hasShap) {
+                shapCsvBtn.onclick = () => {
+                    if (!pObj.rawShapData || !pObj.rawShapData.features) return;
+                    const sd = pObj.rawShapData;
+                    const csvRows = [['Feature', 'Feature_Value', 'SHAP_Value']];
+                    sd.features.forEach((feat, i) => {
+                        sd.shap_values[i].forEach((sv, j) => {
+                            csvRows.push([feat, sd.feature_values[i][j], sv.toFixed(6)]);
+                        });
+                    });
+                    _downloadCSV(csvRows, `SA_SHAP_${obj}`);
+                };
+            } else {
+                shapCsvBtn.disabled = true;
+                shapCsvBtn.style.opacity = '0.5';
+            }
+            btnGroup.appendChild(shapCsvBtn);
+
+            headerRow.appendChild(btnGroup);
+            container.appendChild(headerRow);
+
+            // Symmetrical Plot Row: Both bar and SHAP plots are direct peers
+            const plotRow = document.createElement('div');
+            plotRow.style.cssText = 'display: flex; flex-wrap: wrap; gap: 15px; width: 100%; align-items: stretch;';
+
+            const barDiv = document.createElement('div');
+            barDiv.id = `sa-bar-active`;
+            barDiv.style.cssText = 'flex: 1; min-width: 350px; height: 400px;';
+            plotRow.appendChild(barDiv);
+
+            const shapDiv = document.createElement('div');
+            shapDiv.id = `sa-shap-active`;
+            shapDiv.style.cssText = 'flex: 1.3; min-width: 450px; height: 400px;';
+            plotRow.appendChild(shapDiv);
+
+            container.appendChild(plotRow);
+            impactContainer.appendChild(container);
+
+            Plotly.newPlot(barDiv.id, pObj.barData, pObj.barLayout, { responsive: true });
+
+            if (pObj.hasShap) {
+                Plotly.newPlot(shapDiv.id, pObj.shapTraces, pObj.shapLayout, { responsive: true });
+            } else {
+                shapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-style:italic;">No SHAP data available for this model.</div>';
+            }
+        };
+
+        const selectEl = document.getElementById('sa-impact-obj-select');
+        if (selectEl) selectEl.addEventListener('change', renderActiveImpact);
+        renderActiveImpact();
+    } else {
+        impactContainer.innerHTML = '<p class="text-secondary"><i>No objectives available for feature impact analysis.</i></p>';
+    }
 
     const getFittingSuggestion = (status) => {
         switch(status) {
@@ -720,6 +785,7 @@ export async function exportSAReport() {
         const catInteractions  = window.lastSAResult ? window.lastSAResult.cat_interactions : {};
         const objNames         = window.lastSAResult ? window.lastSAResult.extended_obj_names : [];
         const parcoordsData    = window.saParcoordsPlotData || {};
+        const impactPlotData   = window.saImpactPlotData || {};
 
         let reportHtml = `
 <!DOCTYPE html>
@@ -811,6 +877,7 @@ export async function exportSAReport() {
         const plotsData       = ${JSON.stringify(plotsData)};
         const catInteractions = ${JSON.stringify(catInteractions)};
         const parcoordsData   = ${JSON.stringify(parcoordsData)};
+        const impactPlotData  = ${JSON.stringify(impactPlotData)};
 
         const corrPlot = plotsData.find(p => p.id === 'sa-num-corr');
         if (corrPlot) {
@@ -854,36 +921,36 @@ export async function exportSAReport() {
             updatePCPlot();
         }
 
-        const impactSection = document.getElementById('impact-section');
-        const barPlots      = plotsData.filter(p => p.id.startsWith('sa-bar'));
-        if (barPlots.length > 0) {
+        const impKeys = Object.keys(impactPlotData);
+        if (impKeys.length > 0) {
+            const impactSection = document.getElementById('impact-section');
             const head = document.createElement('h2');
             head.textContent = 'Feature Impact Analysis';
             impactSection.appendChild(head);
-            barPlots.forEach((p, idx) => {
-                const group   = document.createElement('div');
+
+            impKeys.forEach((objKey, idx) => {
+                const pObj = impactPlotData[objKey];
+                const group = document.createElement('div');
                 group.className = 'card';
-                group.innerHTML = '<h3>' + (p.title || p.layout.title?.text || p.layout.title || 'Feature Impact Group') + '</h3><div class="impact-group"></div>';
+                group.innerHTML = '<h3>Feature Impact: ' + pObj.objDisplay + '</h3><div class="impact-group"></div>';
                 const container = group.querySelector('.impact-group');
 
                 const barDiv = document.createElement('div');
-                barDiv.id = p.id; barDiv.className = 'plot-box';
+                barDiv.id = 'report-bar-' + idx;
+                barDiv.className = 'plot-box';
                 container.appendChild(barDiv);
 
-                const shapPlot = plotsData.find(pd => pd.id === 'sa-shap-' + p.id.split('-')[2]);
-                if (shapPlot) {
-                    const shapDiv = document.createElement('div');
-                    shapDiv.id = shapPlot.id; shapDiv.className = 'plot-box';
-                    container.appendChild(shapDiv);
-                }
+                const shapDiv = document.createElement('div');
+                shapDiv.id = 'report-shap-' + idx;
+                shapDiv.className = 'plot-box';
+                container.appendChild(shapDiv);
 
                 impactSection.appendChild(group);
-                Plotly.newPlot(p.id, p.data, p.layout, { responsive: true });
-
-                if (shapPlot) {
-                    const finalLayout = Object.assign({}, shapPlot.layout);
-                    finalLayout.yaxis = Object.assign({}, finalLayout.yaxis, { showticklabels: true });
-                    Plotly.newPlot(shapPlot.id, shapPlot.data, finalLayout, { responsive: true });
+                Plotly.newPlot(barDiv.id, pObj.barData, pObj.barLayout, { responsive: true });
+                if (pObj.hasShap) {
+                    Plotly.newPlot(shapDiv.id, pObj.shapTraces, pObj.shapLayout, { responsive: true });
+                } else {
+                    shapDiv.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-style:italic;">No SHAP data available for this model.</div>';
                 }
             });
         }

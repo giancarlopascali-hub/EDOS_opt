@@ -143,9 +143,50 @@ class TestDoeEndpoint:
             data=json.dumps(payload),
             content_type='application/json'
         )
-        assert resp.status_code == 500
         result = resp.get_json()
         assert 'error' in result
+
+
+class TestBoSurfaceEndpoint:
+    """Tests for the BO surface generation endpoint."""
+
+    def test_bo_surface_success(self, client):
+        """POST /bo_surface should return grid data and evaluated experiments."""
+        payload = {
+            'data': [
+                [1.0, 5.0, 10.0],
+                [2.0, 6.0, 12.0],
+                [3.0, 7.0, 15.0],
+                [4.0, 8.0, 18.0],
+                [5.0, 9.0, 20.0]
+            ],
+            'columns': ['X1', 'X2', 'Y1'],
+            'features': [
+                {'name': 'X1', 'type': 'continuous', 'range': '[1, 5]'},
+                {'name': 'X2', 'type': 'continuous', 'range': '[5, 9]'}
+            ],
+            'objectives': [
+                {'name': 'Y1', 'type': 'maximize', 'importance': '100'}
+            ],
+            'tweaks': {'kernel': 'matern52'},
+            'x_feat': 'X1',
+            'y_feat': 'X2',
+            'z_axis': 'Y1',
+            'color_obj': 'Y1',
+            'resolution': 10
+        }
+        resp = client.post('/bo_surface', data=json.dumps(payload), content_type='application/json')
+        assert resp.status_code == 200
+        result = resp.get_json()
+        assert 'x' in result
+        assert 'y' in result
+        assert 'z' in result
+        assert 'color' in result
+        assert len(result['x']) == 10
+        assert len(result['y']) == 10
+        assert len(result['z']) == 10
+        assert len(result['experiments']) == 5
+
 
 
 

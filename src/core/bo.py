@@ -1014,3 +1014,229 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
     global_score = np.average(processed_success, weights=weights_list) if processed_success else 0
 
     return raw_predictions, raw_std_errors, success_scores, round(float(global_score * 100), 1)
+
+
+def run_bo_surface(
+    df,
+    features_config,
+    objectives_config,
+    tweaks,
+    x_feat,
+    y_feat,
+    z_axis=None,
+    color_obj=None,
+    fixed_values=None,
+    resolution=25,
+    device=torch.device('cpu'),
+    compute_device=torch.device('cpu')
+):
+    """
+    Computes a 2D prediction grid (response surface) using the fitted GP surrogate
+    for contour and 3D surface visualizations.
+    """
+    df_clean = clean_dataframe(df, features_config, objectives_config)
+    if df_clean.empty:
+        raise ValueError('No valid data points left after filtering missing features/objectives.')
+
+    if not x_feat or not y_feat:
+        raise ValueError('X-axis and Y-axis features are required.')
+    if not color_obj:
+        color_obj = objectives_config[0]['name'] if objectives_config else None
+    if not color_obj:
+        raise ValueError('Color objective is required.')
+
+    if fixed_values is None:
+        fixed_values = {}
+
+    # Build Feature Matrix (X) and bounds
+    train_x_list = []
+    bounds = []
+    categorical_features = []
+    feat_ranges = {}
+
+    for idx, f in enumerate(features_config):
+        name = f['name']
+        f_range = f.get('range', '')
+
+        if f['type'] == 'continuous':
+            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
+            low, high = sorted([float(matches[0]), float(matches[1])]) if len(matches) >= 2 else (0.0, 1.0)
+            if low == high:
+                high = low + abs(low) * 0.01 + 0.1
+            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(0).values
+            train_x_list.append(feat_vals)
+            bounds.append([low, high])
+            feat_ranges[name] = (low, high, 'continuous', None)
+
+        elif f['type'] in ['discrete', 'regular']:
+            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
+            if f['type'] == 'discrete':
+                clean_range = f_range.replace('[', '').replace(']', '')
+                values = sorted([float(x.strip()) for x in clean_range.split(',') if x.strip()])
+                if not values:
+                    values = [0.0]
+            else:
+                if len(matches) >= 3:
+                    low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
+                    values = np.linspace(low, high, steps).tolist()
+                elif len(matches) == 2:
+                    low, high = sorted([float(matches[0]), float(matches[1])])
+                    values = np.linspace(low, high, 10).tolist()
+                else:
+                    values = [0.0]
+            low, high = values[0], values[-1]
+            if low == high:
+                high = low + abs(low) * 0.01 + 0.1
+            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(values[0]).values
+            train_x_list.append(feat_vals)
+            bounds.append([low, high])
+            feat_ranges[name] = (low, high, f['type'], values)
+
+        elif f['type'] == 'categorical':
+            choices = [str(x).strip() for x in f_range.split(',')]
+            mapping = {choice: c_idx for c_idx, choice in enumerate(choices)}
+            encoded = df_clean[name].astype(str).map(mapping).fillna(0).values
+            train_x_list.append(encoded)
+            low, high = 0, len(choices) - 1
+            if low == high:
+                high = low + 0.1
+            bounds.append([low, high])
+            categorical_features.append(idx)
+            feat_ranges[name] = (0, len(choices) - 1, 'categorical', choices)
+
+    train_x = torch.tensor(np.stack(train_x_list, axis=1), dtype=torch.float32).to(device)
+    bounds_t = torch.tensor(bounds, dtype=torch.float32).T.to(device)
+
+    res = max(5, min(int(resolution), 50))
+
+    x_info = feat_ranges.get(x_feat, (0.0, 1.0, 'continuous', None))
+    x_vals = np.linspace(x_info[0], x_info[1], res)
+
+    y_info = feat_ranges.get(y_feat, (0.0, 1.0, 'continuous', None))
+    y_vals = np.linspace(y_info[0], y_info[1], res)
+
+    X_mesh, Y_mesh = np.meshgrid(x_vals, y_vals)
+    x_flat = X_mesh.ravel()
+    y_flat = Y_mesh.ravel()
+    n_points = len(x_flat)
+
+    eval_matrix = np.zeros((n_points, len(features_config)), dtype=np.float32)
+    for idx, f in enumerate(features_config):
+        fname = f['name']
+        if fname == x_feat:
+            eval_matrix[:, idx] = x_flat
+        elif fname == y_feat:
+            eval_matrix[:, idx] = y_flat
+        else:
+            raw_fixed = fixed_values.get(fname, None)
+            f_inf = feat_ranges.get(fname, (0.0, 1.0, 'continuous', None))
+            if raw_fixed is None:
+                if f_inf[2] == 'categorical' and f_inf[3]:
+                    val = 0.0
+                else:
+                    val = (f_inf[0] + f_inf[1]) / 2.0
+            else:
+                if f_inf[2] == 'categorical' and f_inf[3]:
+                    val = float(f_inf[3].index(str(raw_fixed))) if str(raw_fixed) in f_inf[3] else 0.0
+                else:
+                    try:
+                        val = float(raw_fixed)
+                    except Exception:
+                        val = (f_inf[0] + f_inf[1]) / 2.0
+            eval_matrix[:, idx] = val
+
+    eval_x = torch.tensor(eval_matrix, dtype=torch.float32).to(compute_device)
+
+    kernel_name = tweaks.get('kernel', 'matern52')
+    def get_kernel(k_name):
+        if k_name == 'rbf':      return ScaleKernel(RBFKernel()).to(device)
+        if k_name == 'matern32': return ScaleKernel(MaternKernel(nu=1.5)).to(device)
+        if k_name == 'matern12': return ScaleKernel(MaternKernel(nu=0.5)).to(device)
+        return ScaleKernel(MaternKernel(nu=2.5)).to(device)
+
+    def build_single_model(tx, ty_slice):
+        all_dims = list(range(tx.shape[1]))
+        cont_dims = [i for i in all_dims if i not in categorical_features]
+        input_tf = (
+            Normalize(d=tx.shape[1], bounds=bounds_t.to(compute_device)[:, cont_dims], indices=cont_dims).to(compute_device)
+            if cont_dims else None
+        )
+        if categorical_features and len(cont_dims) > 0:
+            return MixedSingleTaskGP(tx.to(compute_device), ty_slice.to(compute_device),
+                                     cat_dims=categorical_features, outcome_transform=Standardize(m=1),
+                                     input_transform=input_tf).to(compute_device)
+        return SingleTaskGP(tx.to(compute_device), ty_slice.to(compute_device),
+                            covar_module=get_kernel(kernel_name).to(compute_device),
+                            outcome_transform=Standardize(m=1), input_transform=input_tf).to(compute_device)
+
+    obj_dict = {o['name']: o for o in objectives_config}
+
+    def fit_and_predict_obj(obj_name):
+        prec = infer_decimal_precision(df_clean[obj_name])
+        y_raw = pd.to_numeric(df_clean[obj_name], errors='coerce').values
+        non_nan_mask = ~np.isnan(y_raw)
+        tx_i = train_x[non_nan_mask]
+        y_t = torch.tensor(y_raw[non_nan_mask], dtype=torch.float32).unsqueeze(-1).to(device)
+        if tx_i.shape[0] == 0:
+            return np.zeros((res, res), dtype=float)
+        m = build_single_model(tx_i, y_t)
+        mll = ExactMarginalLogLikelihood(m.likelihood, m).to(compute_device)
+        try:
+            fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 60}})
+        except Exception:
+            pass
+        m.eval()
+        with torch.no_grad():
+            post = m.posterior(eval_x)
+            pred = post.mean.squeeze(-1).cpu().numpy()
+        pred_grid = np.round(pred.reshape(res, res), prec)
+        return pred_grid
+
+    color_grid = fit_and_predict_obj(color_obj).tolist()
+
+    if z_axis and z_axis in obj_dict:
+        if z_axis == color_obj:
+            z_grid = color_grid
+        else:
+            z_grid = fit_and_predict_obj(z_axis).tolist()
+    else:
+        z_grid = color_grid
+
+    x_col_raw = df_clean[x_feat].tolist()
+    y_col_raw = df_clean[y_feat].tolist()
+    color_col_raw = df_clean[color_obj].tolist() if color_obj in df_clean.columns else []
+    z_col_raw = df_clean[z_axis].tolist() if z_axis and z_axis in df_clean.columns else color_col_raw
+
+    experiments = []
+    for i in range(len(df_clean)):
+        try:
+            exp_x = float(x_col_raw[i]) if pd.notna(x_col_raw[i]) else None
+            exp_y = float(y_col_raw[i]) if pd.notna(y_col_raw[i]) else None
+            exp_c = float(color_col_raw[i]) if i < len(color_col_raw) and pd.notna(color_col_raw[i]) else None
+            exp_z = float(z_col_raw[i]) if i < len(z_col_raw) and pd.notna(z_col_raw[i]) else exp_c
+            if exp_x is not None and exp_y is not None:
+                experiments.append({
+                    "exp_id": i + 1,
+                    "x": exp_x,
+                    "y": exp_y,
+                    "z": exp_z,
+                    "color": exp_c
+                })
+        except Exception:
+            pass
+
+    prec_x = infer_decimal_precision(df_clean[x_feat])
+    prec_y = infer_decimal_precision(df_clean[y_feat])
+
+    return {
+        "x": [round(float(v), prec_x) for v in x_vals],
+        "y": [round(float(v), prec_y) for v in y_vals],
+        "z": z_grid,
+        "color": color_grid,
+        "x_feat": x_feat,
+        "y_feat": y_feat,
+        "z_axis": z_axis or color_obj,
+        "color_obj": color_obj,
+        "experiments": experiments
+    }
+

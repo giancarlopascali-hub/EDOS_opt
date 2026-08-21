@@ -211,10 +211,26 @@
 
         <!-- 2. BO MODULE VIEW (EDOS Optimization logic) -->
         <div id="bo-module" class="module-view hidden">
-            <div id="bo-visuals" class="hidden">
-                <section id="trend-plot-section" class="card">
-                    <div class="card-header"><h2>Objectives Trend</h2></div>
-                    <div id="trend-plot" style="width: 100%; height: 400px;"></div>
+                <section id="bo-visualization-section" class="card">
+                    <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                        <h2 id="bo-vis-title" style="margin: 0;">BO Visualization</h2>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <label for="bo-vis-type-select" style="font-weight: 600; font-size: 0.9rem; margin: 0; white-space: nowrap;">View:</label>
+                            <select id="bo-vis-type-select" style="padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border-color); font-weight: 500; background: #fff;">
+                                <option value="trend">Objectives Trend</option>
+                                <option value="contour">Contour Plot</option>
+                                <option value="surface">3D Surface Plot</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="bo-vis-controls" class="tweak-grid" style="margin-top: 1rem; margin-bottom: 1rem; border-bottom: 1px dashed var(--border-color); padding-bottom: 1rem; display: none;">
+                        <!-- Injected dynamically for contour / surface -->
+                    </div>
+                    <div id="bo-vis-plot-container" style="width: 100%; min-height: 400px; position: relative;">
+                        <div id="trend-plot" style="width: 100%; height: 400px;"></div>
+                        <div id="bo-contour-plot" style="width: 100%; height: 500px; display: none;"></div>
+                        <div id="bo-surface-plot" style="width: 100%; height: 550px; display: none;"></div>
+                    </div>
                 </section>
                 <section id="pareto-plot-section" class="card">
                     <div class="card-header">
@@ -500,13 +516,15 @@
                 </section>
 
                 <section class="card">
-                    <h2>Feature Impact</h2>
-                    <div id="sa-results-head" style="margin-bottom: 1rem;">
-                        <!-- Global Success reliability info injected here -->
-                        <div id="sa-reliability-info"></div>
+                    <div class="card-header">
+                        <h2>Feature Impact</h2>
+                    </div>
+                    <p class="text-secondary" style="font-size: 0.9rem; margin-bottom: 1rem;">Select an objective to inspect feature importance (%) and SHAP value distributions.</p>
+                    <div id="sa-impact-controls" class="tweak-grid" style="margin-bottom: 1rem; border-bottom: 1px dashed var(--border-color); padding-bottom: 1rem;">
+                        <!-- JS will inject objective selector dropdown here -->
                     </div>
                     <div id="sa-impact-container">
-                        <!-- Impact plots injected here -->
+                        <!-- Active impact plot set (percent + SHAP) injected here -->
                     </div>
                 </section>
 

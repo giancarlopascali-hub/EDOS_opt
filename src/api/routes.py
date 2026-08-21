@@ -6,7 +6,7 @@ from flask import Blueprint, request, jsonify, render_template
 
 # Import core modules
 from src.core.doe import generate_doe
-from src.core.bo import run_bo_optimization, run_bo_estimation
+from src.core.bo import run_bo_optimization, run_bo_estimation, run_bo_surface
 from src.core.sa import run_sa, estimate_sa
 
 # Create the blueprint
@@ -182,6 +182,50 @@ def estimate_bo():
             'success_scores': success_scores,
             'global_success': global_score
         }))
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/bo_surface', methods=['POST'])
+def bo_surface():
+    """Computes a response surface grid using the BO GP model for contour/3D plots."""
+    try:
+        req_data          = request.get_json()
+        data              = req_data.get('data')
+        columns           = req_data.get('columns')
+        features_config   = req_data.get('features', [])
+        objectives_config = req_data.get('objectives', [])
+        tweaks            = req_data.get('tweaks', {})
+        x_feat            = req_data.get('x_feat')
+        y_feat            = req_data.get('y_feat')
+        z_axis            = req_data.get('z_axis')
+        color_obj         = req_data.get('color_obj')
+        fixed_values      = req_data.get('fixed_values', {})
+        resolution        = req_data.get('resolution', 25)
+
+        df = pd.DataFrame(data, columns=columns)
+        if df.empty:
+            return jsonify({'error': 'Cannot generate surface with no data points.'}), 400
+
+        result = run_bo_surface(
+            df=df,
+            features_config=features_config,
+            objectives_config=objectives_config,
+            tweaks=tweaks,
+            x_feat=x_feat,
+            y_feat=y_feat,
+            z_axis=z_axis,
+            color_obj=color_obj,
+            fixed_values=fixed_values,
+            resolution=resolution,
+            device=DEVICE,
+            compute_device=COMPUTE_DEVICE
+        )
+
+        return jsonify(clean_json_data(result))
 
     except Exception as e:
         import traceback
