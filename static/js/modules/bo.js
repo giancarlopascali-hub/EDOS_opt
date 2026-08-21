@@ -960,7 +960,12 @@ async function updateContourPlot() {
         }, { responsive: true });
 
     } catch (err) {
-        if (err.name === 'AbortError') return;
+        if (err.name === 'AbortError') {
+            // Aborted by a newer request — clear the spinner so it never gets stuck
+            try { Plotly.purge(plotContainer); } catch(e) {}
+            plotContainer.innerHTML = '';
+            return;
+        }
         if (thisRequestId !== currentSurfaceRequestId) return;
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate contour: ${err.message}</div>`;
@@ -1135,7 +1140,12 @@ async function updateSurfacePlot() {
 
 
     } catch (err) {
-        if (err.name === 'AbortError') return;
+        if (err.name === 'AbortError') {
+            // Aborted by a newer request — clear the spinner so it never gets stuck
+            try { Plotly.purge(plotContainer); } catch(e) {}
+            plotContainer.innerHTML = '';
+            return;
+        }
         if (thisRequestId !== currentSurfaceRequestId) return;
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate surface: ${err.message}</div>`;
