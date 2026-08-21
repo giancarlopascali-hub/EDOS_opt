@@ -1182,7 +1182,7 @@ def run_bo_surface(
         m = build_single_model(tx_i, y_t)
         mll = ExactMarginalLogLikelihood(m.likelihood, m).to(compute_device)
         try:
-            fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 60}})
+            fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 35}})
         except Exception:
             pass
         m.eval()
