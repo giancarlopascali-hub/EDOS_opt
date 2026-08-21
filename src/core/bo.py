@@ -1038,12 +1038,24 @@ def run_bo_surface(
     if df_clean.empty:
         raise ValueError('No valid data points left after filtering missing features/objectives.')
 
-    if not x_feat or not y_feat:
-        raise ValueError('X-axis and Y-axis features are required.')
-    if not color_obj:
-        color_obj = objectives_config[0]['name'] if objectives_config else None
-    if not color_obj:
-        raise ValueError('Color objective is required.')
+    feat_names = [f['name'] for f in features_config if f['name'] in df_clean.columns]
+    if len(feat_names) < 2:
+        raise ValueError('At least two included numerical features are required for response surface.')
+
+    if not x_feat or x_feat not in feat_names:
+        x_feat = feat_names[0]
+    if not y_feat or y_feat not in feat_names or y_feat == x_feat:
+        remaining = [f for f in feat_names if f != x_feat]
+        y_feat = remaining[0] if remaining else feat_names[1]
+
+    obj_names = [o['name'] for o in objectives_config if o['name'] in df_clean.columns]
+    if not obj_names:
+        raise ValueError('At least one included objective is required for response surface.')
+
+    if not color_obj or color_obj not in obj_names:
+        color_obj = obj_names[0]
+    if not z_axis or z_axis not in obj_names:
+        z_axis = color_obj
 
     if fixed_values is None:
         fixed_values = {}

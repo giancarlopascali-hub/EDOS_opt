@@ -819,28 +819,38 @@ async function updateContourPlot() {
         fixedValues[el.dataset.feat] = el.tagName === 'SELECT' ? el.value : parseFloat(el.value);
     });
 
-    const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
-        .filter(tr => tr.querySelector('.bo-f-include')?.checked)
-        .map(tr => ({
-            name: tr.querySelector('.bo-f-type').dataset.col,
-            type: tr.querySelector('.bo-f-type').value,
-            range: tr.querySelector('.bo-f-range').value
-        }));
+    const features = window.currentColumns
+        .filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true))
+        .map(c => {
+            const cfg = window.boFeatureConfigs[c] || {};
+            return {
+                name: c,
+                type: cfg.type || 'continuous',
+                range: cfg.range || ''
+            };
+        });
 
-    const objectives = Array.from(document.querySelectorAll('#bo-objectives-list tr'))
-        .filter(tr => tr.querySelector('.bo-o-include')?.checked)
-        .map(tr => ({
-            name: tr.querySelector('.bo-o-type').dataset.col,
-            type: tr.querySelector('.bo-o-type').value,
-            target: tr.querySelector('.bo-o-target').value,
-            importance: tr.querySelector('.bo-o-importance').value
-        }));
+    const objectives = window.currentColumns
+        .filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true))
+        .map(c => {
+            const cfg = window.objectiveConfigs[c] || {};
+            return {
+                name: c,
+                type: cfg.type || 'maximize',
+                target: cfg.target || '',
+                importance: cfg.importance || 0
+            };
+        });
 
     if (features.length < 2 || objectives.length === 0) {
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = '';
         return;
     }
+
+    // Ensure colorObj is valid
+    const validObjNames = objectives.map(o => o.name);
+    const effectiveColorObj = validObjNames.includes(colorObj) ? colorObj : validObjNames[0];
 
     const tweaks = {
         kernel: document.getElementById('kernel-select')?.value || 'matern52'
@@ -868,8 +878,8 @@ async function updateContourPlot() {
                 tweaks,
                 x_feat: xFeat,
                 y_feat: yFeat,
-                z_axis: colorObj,
-                color_obj: colorObj,
+                z_axis: effectiveColorObj,
+                color_obj: effectiveColorObj,
                 fixed_values: fixedValues,
                 resolution: res
             })
@@ -979,28 +989,39 @@ async function updateSurfacePlot() {
         fixedValues[el.dataset.feat] = el.tagName === 'SELECT' ? el.value : parseFloat(el.value);
     });
 
-    const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
-        .filter(tr => tr.querySelector('.bo-f-include')?.checked)
-        .map(tr => ({
-            name: tr.querySelector('.bo-f-type').dataset.col,
-            type: tr.querySelector('.bo-f-type').value,
-            range: tr.querySelector('.bo-f-range').value
-        }));
+    const features = window.currentColumns
+        .filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true))
+        .map(c => {
+            const cfg = window.boFeatureConfigs[c] || {};
+            return {
+                name: c,
+                type: cfg.type || 'continuous',
+                range: cfg.range || ''
+            };
+        });
 
-    const objectives = Array.from(document.querySelectorAll('#bo-objectives-list tr'))
-        .filter(tr => tr.querySelector('.bo-o-include')?.checked)
-        .map(tr => ({
-            name: tr.querySelector('.bo-o-type').dataset.col,
-            type: tr.querySelector('.bo-o-type').value,
-            target: tr.querySelector('.bo-o-target').value,
-            importance: tr.querySelector('.bo-o-importance').value
-        }));
+    const objectives = window.currentColumns
+        .filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true))
+        .map(c => {
+            const cfg = window.objectiveConfigs[c] || {};
+            return {
+                name: c,
+                type: cfg.type || 'maximize',
+                target: cfg.target || '',
+                importance: cfg.importance || 0
+            };
+        });
 
     if (features.length < 2 || objectives.length === 0) {
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = '';
         return;
     }
+
+    // Ensure colorObj and zAxis are valid
+    const validObjNames = objectives.map(o => o.name);
+    const effectiveColorObj = validObjNames.includes(colorObj) ? colorObj : validObjNames[0];
+    const effectiveZAxis = validObjNames.includes(zAxis) ? zAxis : effectiveColorObj;
 
     const tweaks = {
         kernel: document.getElementById('kernel-select')?.value || 'matern52'
@@ -1028,8 +1049,8 @@ async function updateSurfacePlot() {
                 tweaks,
                 x_feat: xFeat,
                 y_feat: yFeat,
-                z_axis: zAxis,
-                color_obj: colorObj,
+                z_axis: effectiveZAxis,
+                color_obj: effectiveColorObj,
                 fixed_values: fixedValues,
                 resolution: res
             })
