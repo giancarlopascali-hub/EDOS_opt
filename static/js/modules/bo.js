@@ -569,41 +569,82 @@ export function renderTrendPlot() {
     renderBOVisualization();
 }
 
+// Helper: get feature type ('categorical' | 'continuous' | 'discrete' | 'regular') from bo-features-list table
+function getBOFeatureType(featName) {
+    const row = Array.from(document.querySelectorAll('#bo-features-list tr'))
+        .find(tr => tr.querySelector('.bo-f-type')?.dataset.col === featName);
+    return row ? row.querySelector('.bo-f-type').value : 'continuous';
+}
+
+// Helper: get unique string values of a categorical feature from current data
+function getBOFeatureCategoricalValues(featName) {
+    const colIdx = window.currentColumns.indexOf(featName);
+    if (colIdx < 0) return [];
+    const seen = new Set();
+    window.currentData.forEach(r => { if (r[colIdx] != null && r[colIdx] !== '') seen.add(String(r[colIdx])); });
+    return Array.from(seen).sort();
+}
+
+// Helper: build a fixed-value input for a feature (dropdown for categorical, number for others)
+function buildFixedInput(f, cssClass) {
+    const colIdx = window.currentColumns.indexOf(f);
+    const fType  = getBOFeatureType(f);
+    const vals   = window.currentData.map(r => r[colIdx]).filter(v => v != null && v !== '');
+
+    if (fType === 'categorical') {
+        const options = getBOFeatureCategoricalValues(f);
+        const defaultVal = options[0] || '';
+        const optHtml = options.map(v => `<option value="${v}">${v}</option>`).join('');
+        return `<div class="tweak-item"><label>${f}: <span style="font-size:0.75rem;color:var(--text-secondary);">(categorical)</span></label>
+                    <select class="${cssClass}" data-feat="${f}" style="width:100%;">${optHtml}</select></div>`;
+    } else {
+        const numVals   = vals.map(v => parseFloat(v)).filter(v => !isNaN(v));
+        const defaultVal = numVals.length > 0 ? (numVals.reduce((a,b) => a+b, 0) / numVals.length).toFixed(3) : '';
+        return `<div class="tweak-item"><label>${f}:</label>
+                    <input type="number" class="${cssClass}" data-feat="${f}" value="${defaultVal}" step="any" style="width:100%;"></div>`;
+    }
+}
+
 function renderContourControls() {
     const controls = document.getElementById('bo-vis-controls');
     if (!controls) return;
-    const featCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
-    const objCols  = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
 
-    if (featCols.length < 2 || objCols.length === 0) {
-        controls.innerHTML = '<p class="text-secondary" style="grid-column: 1 / -1;"><i>Contour plot requires at least 2 included features and 1 objective.</i></p>';
+    const allFeatCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
+    // Only numeric features can be on the X/Y axes
+    const numFeatCols = allFeatCols.filter(f => getBOFeatureType(f) !== 'categorical');
+    const catFeatCols = allFeatCols.filter(f => getBOFeatureType(f) === 'categorical');
+    const objCols     = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
+
+    if (numFeatCols.length < 2 || objCols.length === 0) {
+        controls.innerHTML = `<p class="text-secondary" style="grid-column: 1 / -1;"><i>Contour plot requires at least 2 included <b>numerical</b> features and 1 objective.${
+            catFeatCols.length > 0 ? ' Categorical features can only be set as fixed values.' : ''}</i></p>`;
         controls.style.display = 'grid';
         return;
     }
 
-    const currentX = document.getElementById('bo-contour-x')?.value;
-    const currentY = document.getElementById('bo-contour-y')?.value;
+    const currentX   = document.getElementById('bo-contour-x')?.value;
+    const currentY   = document.getElementById('bo-contour-y')?.value;
     const currentObj = document.getElementById('bo-contour-obj')?.value;
 
-    const xSelected = featCols.includes(currentX) ? currentX : featCols[0];
-    const ySelected = featCols.includes(currentY) ? currentY : (featCols[1] || featCols[0]);
-    const objSelected = objCols.includes(currentObj) ? currentObj : objCols[0];
+    const xSelected   = numFeatCols.includes(currentX) ? currentX : numFeatCols[0];
+    const ySelected   = numFeatCols.includes(currentY) && currentY !== xSelected ? currentY : (numFeatCols.find(f => f !== xSelected) || numFeatCols[0]);
+    const objSelected = objCols.includes(currentObj)   ? currentObj : objCols[0];
 
     let html = `
         <div class="tweak-item">
-            <label>X-Axis Feature:</label>
+            <label>X-Axis Feature (numerical):</label>
             <select id="bo-contour-x" style="width: 100%;">
-                ${featCols.map(f => `<option value="${f}" ${f === xSelected ? 'selected' : ''}>${f}</option>`).join('')}
+                ${numFeatCols.map(f => `<option value="${f}" ${f === xSelected ? 'selected' : ''}>${f}</option>`).join('')}
             </select>
         </div>
         <div class="tweak-item">
-            <label>Y-Axis Feature:</label>
+            <label>Y-Axis Feature (numerical):</label>
             <select id="bo-contour-y" style="width: 100%;">
-                ${featCols.map(f => `<option value="${f}" ${f === ySelected ? 'selected' : ''}>${f}</option>`).join('')}
+                ${numFeatCols.map(f => `<option value="${f}" ${f === ySelected ? 'selected' : ''}>${f}</option>`).join('')}
             </select>
         </div>
         <div class="tweak-item">
-            <label>Objective (Color & Contours):</label>
+            <label>Objective (Color &amp; Contours):</label>
             <select id="bo-contour-obj" style="width: 100%;">
                 ${objCols.map(o => `<option value="${o}" ${o === objSelected ? 'selected' : ''}>${o}</option>`).join('')}
             </select>
@@ -611,41 +652,29 @@ function renderContourControls() {
         <div class="tweak-item">
             <label>Grid Resolution:</label>
             <select id="bo-contour-res" style="width: 100%;">
-                <option value="15">15 x 15 (Fast)</option>
-                <option value="25" selected>25 x 25 (Standard)</option>
-                <option value="40">40 x 40 (High)</option>
+                <option value="15">15 &#215; 15 (Fast)</option>
+                <option value="25" selected>25 &#215; 25 (Standard)</option>
+                <option value="40">40 &#215; 40 (High)</option>
             </select>
         </div>
     `;
 
-    const otherFeats = featCols.filter(f => f !== xSelected && f !== ySelected);
-    if (otherFeats.length > 0) {
+    // Fixed value inputs for all non-axis features (categorical → dropdown, numerical → number)
+    const fixedFeats = allFeatCols.filter(f => f !== xSelected && f !== ySelected);
+    if (fixedFeats.length > 0) {
         html += `<div style="grid-column: 1 / -1; margin-top: 0.5rem;"><b style="font-size: 0.85rem; color: var(--text-secondary);">Fixed values for remaining features:</b></div>`;
-        otherFeats.forEach(f => {
-            const colIdx = window.currentColumns.indexOf(f);
-            const vals = window.currentData.map(r => r[colIdx]).filter(v => v !== null && v !== '');
-            const numVals = vals.map(v => parseFloat(v)).filter(v => !isNaN(v));
-            const defaultVal = numVals.length > 0 ? (numVals.reduce((a,b)=>a+b,0)/numVals.length).toFixed(2) : (vals[0] || '');
-
-            html += `
-                <div class="tweak-item">
-                    <label>${f}:</label>
-                    <input type="number" class="bo-contour-fixed" data-feat="${f}" value="${defaultVal}" step="any" style="width: 100%;">
-                </div>
-            `;
-        });
+        fixedFeats.forEach(f => { html += buildFixedInput(f, 'bo-contour-fixed'); });
     }
 
-    html += `
-        <div style="grid-column: 1 / -1; display: flex; justify-content: flex-end; margin-top: 0.5rem;">
-            <button id="bo-contour-update-btn" class="btn primary small">Calculate & Update Contour</button>
-        </div>
-    `;
+    html += `<div style="grid-column: 1 / -1; display: flex; justify-content: flex-end; margin-top: 0.5rem;">
+                <button id="bo-contour-update-btn" class="btn primary small">Calculate &amp; Update Contour</button>
+             </div>`;
 
     controls.innerHTML = html;
     controls.style.display = 'grid';
 
     document.getElementById('bo-contour-update-btn').addEventListener('click', updateContourPlot);
+    // Re-render when X/Y change (so fixed-value fields update too)
     document.getElementById('bo-contour-x').addEventListener('change', () => { renderContourControls(); updateContourPlot(); });
     document.getElementById('bo-contour-y').addEventListener('change', () => { renderContourControls(); updateContourPlot(); });
     document.getElementById('bo-contour-obj').addEventListener('change', updateContourPlot);
@@ -654,23 +683,29 @@ function renderContourControls() {
 function renderSurfaceControls() {
     const controls = document.getElementById('bo-vis-controls');
     if (!controls) return;
-    const featCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
-    const objCols  = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
 
-    if (featCols.length < 2 || objCols.length === 0) {
-        controls.innerHTML = '<p class="text-secondary" style="grid-column: 1 / -1;"><i>3D surface plot requires at least 2 included features and 1 objective.</i></p>';
+    const allFeatCols = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true));
+    // Only numeric features can be on X/Y axes
+    const numFeatCols = allFeatCols.filter(f => getBOFeatureType(f) !== 'categorical');
+    const catFeatCols = allFeatCols.filter(f => getBOFeatureType(f) === 'categorical');
+    const objCols     = window.currentColumns.filter(c => window.columnRoles[c] === 'objective' && (window.objectiveConfigs[c] ? window.objectiveConfigs[c].included : true));
+
+    if (numFeatCols.length < 2 || objCols.length === 0) {
+        controls.innerHTML = `<p class="text-secondary" style="grid-column: 1 / -1;"><i>3D surface plot requires at least 2 included <b>numerical</b> features and 1 objective.${
+            catFeatCols.length > 0 ? ' Categorical features can only be set as fixed values.' : ''}</i></p>`;
         controls.style.display = 'grid';
         return;
     }
 
-    const currentX = document.getElementById('bo-surf-x')?.value;
-    const currentY = document.getElementById('bo-surf-y')?.value;
-    const currentZ = document.getElementById('bo-surf-z')?.value;
+    const currentX     = document.getElementById('bo-surf-x')?.value;
+    const currentY     = document.getElementById('bo-surf-y')?.value;
+    const currentZ     = document.getElementById('bo-surf-z')?.value;
     const currentColor = document.getElementById('bo-surf-color')?.value;
+    const currentRes   = document.getElementById('bo-surf-res')?.value || '15';
 
-    const xSelected = featCols.includes(currentX) ? currentX : featCols[0];
-    const ySelected = featCols.includes(currentY) ? currentY : (featCols[1] || featCols[0]);
-    const zSelected = (objCols.includes(currentZ) || featCols.includes(currentZ)) ? currentZ : objCols[0];
+    const xSelected     = numFeatCols.includes(currentX) ? currentX : numFeatCols[0];
+    const ySelected     = numFeatCols.includes(currentY) && currentY !== xSelected ? currentY : (numFeatCols.find(f => f !== xSelected) || numFeatCols[0]);
+    const zSelected     = (objCols.includes(currentZ)) ? currentZ : objCols[0];
     const colorSelected = objCols.includes(currentColor) ? currentColor : objCols[0];
 
     let zOptionsHtml = `<optgroup label="Objectives">`;
@@ -678,31 +713,22 @@ function renderSurfaceControls() {
         zOptionsHtml += `<option value="${o}" ${o === zSelected ? 'selected' : ''}>${o} (Objective)</option>`;
     });
     zOptionsHtml += `</optgroup>`;
-    if (featCols.length >= 3) {
-        zOptionsHtml += `<optgroup label="Features">`;
-        featCols.forEach(f => {
-            if (f !== xSelected && f !== ySelected) {
-                zOptionsHtml += `<option value="${f}" ${f === zSelected ? 'selected' : ''}>${f} (Feature)</option>`;
-            }
-        });
-        zOptionsHtml += `</optgroup>`;
-    }
 
     let html = `
         <div class="tweak-item">
-            <label>X-Axis Feature:</label>
+            <label>X-Axis Feature (numerical):</label>
             <select id="bo-surf-x" style="width: 100%;">
-                ${featCols.map(f => `<option value="${f}" ${f === xSelected ? 'selected' : ''}>${f}</option>`).join('')}
+                ${numFeatCols.map(f => `<option value="${f}" ${f === xSelected ? 'selected' : ''}>${f}</option>`).join('')}
             </select>
         </div>
         <div class="tweak-item">
-            <label>Y-Axis Feature:</label>
+            <label>Y-Axis Feature (numerical):</label>
             <select id="bo-surf-y" style="width: 100%;">
-                ${featCols.map(f => `<option value="${f}" ${f === ySelected ? 'selected' : ''}>${f}</option>`).join('')}
+                ${numFeatCols.map(f => `<option value="${f}" ${f === ySelected ? 'selected' : ''}>${f}</option>`).join('')}
             </select>
         </div>
         <div class="tweak-item">
-            <label>Z-Axis (Height):</label>
+            <label>Z-Axis / Height (Objective):</label>
             <select id="bo-surf-z" style="width: 100%;">
                 ${zOptionsHtml}
             </select>
@@ -716,41 +742,29 @@ function renderSurfaceControls() {
         <div class="tweak-item">
             <label>Grid Resolution:</label>
             <select id="bo-surf-res" style="width: 100%;">
-                <option value="15" selected>15 x 15 (Smooth 3D)</option>
-                <option value="20">20 x 20 (Detailed)</option>
-                <option value="30">30 x 30 (Ultra)</option>
+                <option value="15" ${currentRes === '15' ? 'selected' : ''}>15 &#215; 15 (Smooth 3D)</option>
+                <option value="20" ${currentRes === '20' ? 'selected' : ''}>20 &#215; 20 (Detailed)</option>
+                <option value="30" ${currentRes === '30' ? 'selected' : ''}>30 &#215; 30 (Ultra)</option>
             </select>
         </div>
     `;
 
-    const otherFeats = featCols.filter(f => f !== xSelected && f !== ySelected && f !== zSelected);
-    if (otherFeats.length > 0) {
+    // Fixed value inputs for ALL non-axis features: dropdown for categorical, number for numeric
+    const fixedFeats = allFeatCols.filter(f => f !== xSelected && f !== ySelected);
+    if (fixedFeats.length > 0) {
         html += `<div style="grid-column: 1 / -1; margin-top: 0.5rem;"><b style="font-size: 0.85rem; color: var(--text-secondary);">Fixed values for remaining features:</b></div>`;
-        otherFeats.forEach(f => {
-            const colIdx = window.currentColumns.indexOf(f);
-            const vals = window.currentData.map(r => r[colIdx]).filter(v => v !== null && v !== '');
-            const numVals = vals.map(v => parseFloat(v)).filter(v => !isNaN(v));
-            const defaultVal = numVals.length > 0 ? (numVals.reduce((a,b)=>a+b,0)/numVals.length).toFixed(2) : (vals[0] || '');
-
-            html += `
-                <div class="tweak-item">
-                    <label>${f}:</label>
-                    <input type="number" class="bo-surf-fixed" data-feat="${f}" value="${defaultVal}" step="any" style="width: 100%;">
-                </div>
-            `;
-        });
+        fixedFeats.forEach(f => { html += buildFixedInput(f, 'bo-surf-fixed'); });
     }
 
-    html += `
-        <div style="grid-column: 1 / -1; display: flex; justify-content: flex-end; margin-top: 0.5rem;">
-            <button id="bo-surf-update-btn" class="btn primary small">Calculate & Update 3D Surface</button>
-        </div>
-    `;
+    html += `<div style="grid-column: 1 / -1; display: flex; justify-content: flex-end; margin-top: 0.5rem;">
+                <button id="bo-surf-update-btn" class="btn primary small">Calculate &amp; Update 3D Surface</button>
+             </div>`;
 
     controls.innerHTML = html;
     controls.style.display = 'grid';
 
     document.getElementById('bo-surf-update-btn').addEventListener('click', updateSurfacePlot);
+    // Re-render full controls on X/Y change so fixed-value fields update dynamically
     document.getElementById('bo-surf-x').addEventListener('change', () => { renderSurfaceControls(); updateSurfacePlot(); });
     document.getElementById('bo-surf-y').addEventListener('change', () => { renderSurfaceControls(); updateSurfacePlot(); });
     document.getElementById('bo-surf-z').addEventListener('change', updateSurfacePlot);
@@ -771,8 +785,9 @@ async function updateContourPlot() {
     }
 
     const fixedValues = {};
-    document.querySelectorAll('.bo-contour-fixed').forEach(inp => {
-        fixedValues[inp.dataset.feat] = parseFloat(inp.value);
+    document.querySelectorAll('.bo-contour-fixed').forEach(el => {
+        // select = categorical (keep as string); input = numerical (parse as float)
+        fixedValues[el.dataset.feat] = el.tagName === 'SELECT' ? el.value : parseFloat(el.value);
     });
 
     const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
@@ -884,8 +899,9 @@ async function updateSurfacePlot() {
     }
 
     const fixedValues = {};
-    document.querySelectorAll('.bo-surf-fixed').forEach(inp => {
-        fixedValues[inp.dataset.feat] = parseFloat(inp.value);
+    document.querySelectorAll('.bo-surf-fixed').forEach(el => {
+        // select = categorical (keep as string); input = numerical (parse as float)
+        fixedValues[el.dataset.feat] = el.tagName === 'SELECT' ? el.value : parseFloat(el.value);
     });
 
     const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
