@@ -517,8 +517,18 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 filtered_combos = [filtered_combos[idx] for idx in feasible_indices]
                 candidates_grid = torch.tensor(filtered_combos, dtype=torch.float32).to(OPT_DEVICE)
 
+            if not is_mo and acq_type == 'EI':
+                try:
+                    from botorch.acquisition.analytic import LogExpectedImprovement
+                    acq_func_grid = LogExpectedImprovement(model=model, best_f=train_y.to(OPT_DEVICE).max().item()).to(OPT_DEVICE)
+                except ImportError:
+                    from botorch.acquisition.analytic import ExpectedImprovement
+                    acq_func_grid = ExpectedImprovement(model=model, best_f=train_y.to(OPT_DEVICE).max().item()).to(OPT_DEVICE)
+            else:
+                acq_func_grid = acq_func
+
             candidates, _ = optimize_acqf_discrete(
-                acq_function=acq_func,
+                acq_function=acq_func_grid,
                 q=batch_size,
                 choices=candidates_grid,
                 unique=True
