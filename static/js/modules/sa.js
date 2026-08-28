@@ -311,22 +311,29 @@ export function renderSAResults(result) {
             const dimensions = plotCols.map(col => {
                 const colIdx  = window.currentColumns.indexOf(col);
                 const rawVals = window.currentData.map(r => r[colIdx]);
-                const numVals = rawVals.map(v => parseFloat(v));
-                const isCat   = numVals.some(isNaN);
+                // Filter out null/undefined/empty before deciding if column is categorical.
+                // parseFloat(null) === NaN, so a numeric column with missing results would
+                // otherwise be misclassified as categorical and rendered with string tick-labels.
+                const nonEmptyRaw = rawVals.filter(v => v !== null && v !== undefined && v !== '');
+                const numVals     = rawVals.map(v => parseFloat(v));
+                const isCat       = nonEmptyRaw.some(v => isNaN(parseFloat(v)));
 
                 if (isCat) {
-                    const uniqueVals = [...new Set(rawVals.filter(v => v !== '' && v !== null))];
+                    const uniqueVals = [...new Set(rawVals.filter(v => v !== '' && v !== null && v !== undefined))];
                     return {
                         label: col,
-                        values:   rawVals.map(v => uniqueVals.indexOf(v) >= 0 ? uniqueVals.indexOf(v) : 0),
+                        values:   rawVals.map(v => uniqueVals.indexOf(v) >= 0 ? uniqueVals.indexOf(v) : -1),
                         tickvals: uniqueVals.map((_, i) => i),
                         ticktext: uniqueVals,
                         range: [0, Math.max(1, uniqueVals.length - 1)]
                     };
                 } else {
-                    const cleanVals = numVals.map(v => isFinite(v) ? v : 0);
-                    let min = cleanVals.length > 0 ? Math.min(...cleanVals) : 0;
-                    let max = cleanVals.length > 0 ? Math.max(...cleanVals) : 1;
+                    // Use only the finite (non-null) values for range; map nulls to null so
+                    // Plotly skips them rather than snapping them to 0.
+                    const cleanVals   = numVals.map(v => isFinite(v) ? v : null);
+                    const finiteVals  = cleanVals.filter(v => v !== null);
+                    let min = finiteVals.length > 0 ? Math.min(...finiteVals) : 0;
+                    let max = finiteVals.length > 0 ? Math.max(...finiteVals) : 1;
                     if (min === max) { min -= 0.5; max += 0.5; }
                     return { label: col, values: cleanVals, range: [min, max] };
                 }
