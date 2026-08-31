@@ -1064,7 +1064,13 @@ def run_bo_surface(
 
     if not color_obj or color_obj not in obj_names:
         color_obj = obj_names[0]
-    if not z_axis or z_axis not in obj_names:
+    # z_axis can be an objective OR a numerical feature (not x_feat or y_feat)
+    num_feat_names = [
+        f['name'] for f in features_config
+        if f['name'] in df_clean.columns and f.get('type', 'continuous') != 'categorical'
+    ]
+    valid_z_options = obj_names + [f for f in num_feat_names if f != x_feat and f != y_feat]
+    if not z_axis or z_axis not in valid_z_options:
         z_axis = color_obj
 
     if fixed_values is None:
@@ -1216,13 +1222,22 @@ def run_bo_surface(
 
     color_grid = fit_and_predict_obj(color_obj).tolist()
 
-    if z_axis and z_axis in obj_dict:
+    if z_axis in obj_dict:
+        # z_axis is an objective — predict with GP
         if z_axis == color_obj:
             z_grid = color_grid
         else:
             z_grid = fit_and_predict_obj(z_axis).tolist()
     else:
-        z_grid = color_grid
+        # z_axis is a numerical feature — use the actual feature values from the eval grid
+        feat_idx_map = {f['name']: idx for idx, f in enumerate(features_config)}
+        if z_axis in feat_idx_map:
+            col_idx = feat_idx_map[z_axis]
+            z_flat = eval_matrix[:, col_idx]
+            prec_z = infer_decimal_precision(df_clean[z_axis])
+            z_grid = np.round(z_flat.reshape(res, res), prec_z).tolist()
+        else:
+            z_grid = color_grid
 
     x_col_raw = df_clean[x_feat].tolist()
     y_col_raw = df_clean[y_feat].tolist()

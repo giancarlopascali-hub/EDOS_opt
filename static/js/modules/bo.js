@@ -738,7 +738,10 @@ function renderSurfaceControls() {
 
     const xSelected     = numFeatCols.includes(currentX) ? currentX : numFeatCols[0];
     const ySelected     = numFeatCols.includes(currentY) && currentY !== xSelected ? currentY : (numFeatCols.find(f => f !== xSelected) || numFeatCols[0]);
-    const zSelected     = (objCols.includes(currentZ)) ? currentZ : objCols[0];
+    // Z-axis can be any objective OR any non-axis numerical feature
+    const zFeatCols = numFeatCols.filter(f => f !== xSelected && f !== ySelected);
+    const validZOptions = [...objCols, ...zFeatCols];
+    const zSelected = validZOptions.includes(currentZ) ? currentZ : objCols[0];
     const colorSelected = objCols.includes(currentColor) ? currentColor : objCols[0];
 
     let zOptionsHtml = `<optgroup label="Objectives">`;
@@ -746,6 +749,13 @@ function renderSurfaceControls() {
         zOptionsHtml += `<option value="${o}" ${o === zSelected ? 'selected' : ''}>${o} (Objective)</option>`;
     });
     zOptionsHtml += `</optgroup>`;
+    if (zFeatCols.length > 0) {
+        zOptionsHtml += `<optgroup label="Features">`;
+        zFeatCols.forEach(f => {
+            zOptionsHtml += `<option value="${f}" ${f === zSelected ? 'selected' : ''}>${f} (Feature)</option>`;
+        });
+        zOptionsHtml += `</optgroup>`;
+    }
 
     let html = `
         <div class="tweak-item">
@@ -761,7 +771,7 @@ function renderSurfaceControls() {
             </select>
         </div>
         <div class="tweak-item">
-            <label>Z-Axis / Height (Objective):</label>
+            <label>Z-Axis / Height (Objective or Feature):</label>
             <select id="bo-surf-z" style="width: 100%;">
                 ${zOptionsHtml}
             </select>
@@ -1023,10 +1033,12 @@ async function updateSurfacePlot() {
         return;
     }
 
-    // Ensure colorObj and zAxis are valid
+    // Ensure colorObj is an objective; zAxis can be an objective OR a non-axis numerical feature
     const validObjNames = objectives.map(o => o.name);
+    const allFeatColsForZ = window.currentColumns.filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true) && getBOFeatureType(c) !== 'categorical');
+    const validZNames = [...validObjNames, ...allFeatColsForZ.filter(f => f !== xFeat && f !== yFeat)];
     const effectiveColorObj = validObjNames.includes(colorObj) ? colorObj : validObjNames[0];
-    const effectiveZAxis = validObjNames.includes(zAxis) ? zAxis : effectiveColorObj;
+    const effectiveZAxis = validZNames.includes(zAxis) ? zAxis : effectiveColorObj;
 
     const tweaks = {
         kernel: document.getElementById('kernel-select')?.value || 'matern52'
