@@ -280,10 +280,27 @@ export function renderDoEResults(metrics) {
                     <div>
                         <strong>Oversampling detected:</strong>
                         <p style="margin:0.25rem 0 0 0;">The requested number of experiments
-                        exceeds the natural size of this design. Extra rows have been added
-                        with small jitter, which may reduce orthogonality and D-efficiency.
-                        Consider switching to <em>LHS</em> or <em>D-Optimal</em> for a
-                        fully flexible run count.</p>
+                        exceeds the natural size of this design. Extra runs have been augmented
+                        using space-filling sampling to provide maximal coverage without duplicates.</p>
+                    </div>
+                </div>`;
+            warningBanner.classList.remove('hidden');
+        }
+
+        // Center-point replicates info banner (blue, informational)
+        if (metrics && metrics.center_replicates > 0) {
+            warningBanner.innerHTML += `
+                <div style="background:#eff6ff; border:1px solid #bfdbfe; color:#1e40af;
+                            padding:1rem; border-radius:12px; margin-bottom:1rem;
+                            font-size:0.9rem; line-height:1.5; display:flex; gap:0.75rem;
+                            align-items:flex-start; text-align:left;">
+                    <span style="font-size:1.25rem;">ℹ️</span>
+                    <div>
+                        <strong>Center-point replicates included (${metrics.center_replicates} runs):</strong>
+                        <p style="margin:0.25rem 0 0 0;">This design includes ${metrics.center_replicates} repeated experiment(s) at the
+                        center point of the design space. These are placed <em>last</em> in the table
+                        and highlighted with an amber indicator. They are statistically necessary for estimating
+                        pure experimental error and testing model lack-of-fit in Response Surface Methodology (RSM).</p>
                     </div>
                 </div>`;
             warningBanner.classList.remove('hidden');
@@ -323,6 +340,16 @@ export function renderDoEResults(metrics) {
         const resFlag   = getFlag(metrics.resolution,    'res');
         const curveFlag = getFlag(metrics.curvature,     'curve');
 
+        let centerCard = '';
+        if (metrics.center_replicates !== undefined && metrics.center_replicates > 0) {
+            centerCard = `
+            <div class="quality-card">
+                <span class="metric-label">Center Replicates</span>
+                <span class="metric-value">${metrics.center_replicates}</span>
+                <span class="quality-flag flag-limited" title="Classical RSM pure-error replicates at center point (placed last in table)">Placed Last</span>
+            </div>`;
+        }
+
         dashboard.innerHTML = `
             <div class="quality-card">
                 <span class="metric-label">Orthogonality</span>
@@ -344,6 +371,7 @@ export function renderDoEResults(metrics) {
                 <span class="metric-value">${metrics.curvature}</span>
                 <span class="quality-flag ${curveFlag.class}">${curveFlag.text}</span>
             </div>
+            ${centerCard}
         `;
         dashboard.classList.remove('hidden');
     }
@@ -355,7 +383,18 @@ export function renderDoEResults(metrics) {
 
     head.innerHTML = '<tr>' + feats.map(f => `<th>${f}</th>`).join('') + objHeaders + '</tr>';
 
-    body.innerHTML = window.suggestionsData.map(row => {
+    body.innerHTML = window.suggestionsData.map((row, idx) => {
+        const isReplicate = (
+            metrics && metrics.center_replicates > 0 &&
+            idx >= window.suggestionsData.length - metrics.center_replicates
+        );
+        const rowStyle = isReplicate
+            ? 'background: rgba(251, 191, 36, 0.08); border-left: 4px solid #f59e0b;'
+            : '';
+        const rowTitle = isReplicate
+            ? ' title="Center-point replicate run (for pure error estimation)"'
+            : '';
+
         const featCells = feats.map(f =>
             `<td contenteditable="true" class="feat-input-cell editable-cell" style="background:#f8fafc; border: 1px dashed #94a3b8;">${row[f]}</td>`
         ).join('');
@@ -365,7 +404,7 @@ export function renderDoEResults(metrics) {
               ).join('')
             : `<td contenteditable="true" class="obj-input-cell editable-cell" style="background:#f0fdf4; border: 1px dashed #22c55e;"></td>`;
 
-        return '<tr>' + featCells + objCells + '</tr>';
+        return `<tr style="${rowStyle}"${rowTitle}>` + featCells + objCells + '</tr>';
     }).join('');
 
     section.classList.remove('hidden');

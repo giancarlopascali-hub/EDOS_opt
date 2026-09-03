@@ -12,6 +12,8 @@ def _doptimal_coordinate_exchange(candidates, N, model_order, max_iter=500, seed
 
     Selects N rows from *candidates* (a coded [-1, 1] array of shape (M, k))
     that maximise det(X'X) for the specified model order.
+    Candidate selection is enforced WITHOUT replacement so that no two
+    design rows are identical.
 
     Parameters
     ----------
@@ -25,9 +27,11 @@ def _doptimal_coordinate_exchange(candidates, N, model_order, max_iter=500, seed
     -------
     design : (N, k) ndarray
     """
-    rng    = np.random.default_rng(seed)
-    idx    = rng.choice(len(candidates), size=N, replace=False)
-    design = candidates[idx].copy()
+    rng = np.random.default_rng(seed)
+    # Initial selection WITHOUT replacement — guarantees a unique starting design
+    selected_idx = rng.choice(len(candidates), size=N, replace=False)
+    design       = candidates[selected_idx].copy()
+    selected_set = set(int(i) for i in selected_idx)
 
     def build_model_matrix(X):
         """Expand X into a model matrix according to model_order."""
@@ -49,18 +53,62 @@ def _doptimal_coordinate_exchange(candidates, N, model_order, max_iter=500, seed
     for _ in range(max_iter):
         improved = False
         for row_i in range(N):
-            best_row = design[row_i].copy()
-            for cand_row in candidates:
-                design[row_i] = cand_row
+            current_idx = int(selected_idx[row_i])
+            best_row    = design[row_i].copy()
+            best_idx    = current_idx
+
+            # Temporarily remove the current row's index so we can consider
+            # swapping it with any other candidate (including keeping it as-is)
+            occupied_without_current = selected_set - {current_idx}
+
+            for j in range(len(candidates)):
+                if j in occupied_without_current:
+                    continue            # skip candidates already used in other rows
+                design[row_i] = candidates[j]
                 d = det_XtX(design)
                 if d > best_det + 1e-12:
                     best_det = d
-                    best_row = cand_row.copy()
+                    best_row = candidates[j].copy()
+                    best_idx = j
                     improved = True
+
+            # Commit the best candidate found for this position
             design[row_i] = best_row
+            selected_set.discard(current_idx)
+            selected_set.add(best_idx)
+            selected_idx[row_i] = best_idx
+
         if not improved:
             break
     return design
+
+
+def _move_centers_to_end(design):
+    """
+    Reorder a coded design matrix so that all center-point rows
+    (rows where every coded value is within 1e-9 of zero) appear last,
+    preserving the relative order of the non-center rows.
+
+    This ensures that replicate center points — used for pure-error estimation
+    in Box-Behnken and Central Composite designs — are placed after all unique
+    factorial / star / edge runs in the suggested experiments table, so
+    researchers perform the informative unique conditions first.
+
+    Parameters
+    ----------
+    design : (n, k) ndarray – coded design matrix
+
+    Returns
+    -------
+    sorted_design : (n, k) ndarray
+    n_centers     : int  – number of center-point rows moved to the end
+    """
+    is_center     = np.all(np.abs(design) < 1e-9, axis=1)
+    non_center    = design[~is_center]
+    centers       = design[is_center]
+    n_centers     = int(is_center.sum())
+    sorted_design = np.vstack([non_center, centers]) if n_centers > 0 else design.copy()
+    return sorted_design, n_centers
 
 
 def generate_doe(features_config, tweaks):
@@ -68,10 +116,11 @@ def generate_doe(features_config, tweaks):
     Generates a Design of Experiments (DoE) table using classical statistical
     designs from the pyDOE2 library, or a D-Optimal design via coordinate exchange.
     """
-    model_type     = tweaks.get('model', 'bbdesign')
-    max_runs       = int(float(tweaks.get('max_runs', 50)))
-    use_exact_runs = bool(tweaks.get('use_exact_runs', False))
+    model_type           = tweaks.get('model', 'bbdesign')
+    max_runs             = int(float(tweaks.get('max_runs', 50)))
+    use_exact_runs       = bool(tweaks.get('use_exact_runs', False))
     oversampling_warning = False
+    n_center_replicates  = 0    # set by _move_centers_to_end for bbdesign / ccdesign
 
     # Parse and Validate Features
     valid_features = []
@@ -134,9 +183,9 @@ def generate_doe(features_config, tweaks):
     # Generate Design Matrix (in [-1, 1] coded space)
     try:
         if model_type == 'ccdesign':
-            design = doe.ccdesign(n_factors)
+            design, n_center_replicates = _move_centers_to_end(doe.ccdesign(n_factors))
         elif model_type == 'bbdesign':
-            design = doe.bbdesign(n_factors)
+            design, n_center_replicates = _move_centers_to_end(doe.bbdesign(n_factors))
         elif model_type == 'fracfact':
             if n_factors <= 4:
                 design = doe.fullfact([2] * n_factors).astype(float)
@@ -203,15 +252,27 @@ def generate_doe(features_config, tweaks):
 
         if use_exact_runs:
             if max_runs > natural_len:
-                # Oversampling: pad with jittered copies of existing rows
+                # Oversampling: augment with space-filling maximin candidates.
+                # A greedy maximin approach using a large LHS candidate pool avoids
+                # the collapsed-jitter duplicates that occur with the old +/-0.02 approach.
                 oversampling_warning = True
                 n_to_pad = max_runs - natural_len
-                rng_pad  = np.random.default_rng(42)
-                pad_idx  = rng_pad.integers(0, natural_len, size=n_to_pad)
-                pad_rows = design[pad_idx].copy()
-                jitter   = rng_pad.uniform(-0.02, 0.02, pad_rows.shape)
-                pad_rows = np.clip(pad_rows + jitter, -1.0, 1.0)
-                design   = np.vstack([design, pad_rows])
+                k_cols   = design.shape[1]
+                from pyDOE2 import lhs as _lhs_pad
+                n_pool   = max(500, n_to_pad * 20)
+                pool     = _lhs_pad(k_cols, samples=n_pool, criterion='maximin') * 2 - 1
+                existing = design.copy()
+                pad_rows = []
+                for _ in range(n_to_pad):
+                    # Pick the candidate that is farthest from all already-selected rows
+                    dists  = np.min(
+                        np.linalg.norm(pool[:, None, :] - existing[None, :, :], axis=2),
+                        axis=1
+                    )
+                    best_c = pool[np.argmax(dists)]
+                    pad_rows.append(best_c)
+                    existing = np.vstack([existing, best_c])
+                design = np.vstack([design, np.array(pad_rows)])
             elif max_runs < natural_len:
                 # Trim to exact count (quality metrics will reflect the reduction)
                 design = design[:max_runs]
@@ -351,20 +412,26 @@ def generate_doe(features_config, tweaks):
                 else:                           curvature = "None (Linear only)"
 
         metrics = {
-            'orthogonality':      round(ortho_score, 1) if isinstance(ortho_score, (int, float)) else ortho_score,
-            'efficiency':         round(d_eff,        1) if isinstance(d_eff,        (int, float)) else d_eff,
-            'resolution':         resolution,
-            'curvature':          curvature,
-            'runs':               len(suggested_table),
-            'model':              model_type,
+            'orthogonality':        round(ortho_score, 1) if isinstance(ortho_score, (int, float)) else ortho_score,
+            'efficiency':           round(d_eff,        1) if isinstance(d_eff,        (int, float)) else d_eff,
+            'resolution':           resolution,
+            'curvature':            curvature,
+            'runs':                 len(suggested_table),
+            'model':                model_type,
             'oversampling_warning': oversampling_warning,
+            'center_replicates':    n_center_replicates,
         }
     except Exception as met_err:
         print(f"Metrics calculation error: {met_err}")
         metrics = {
-            'orthogonality': 0, 'efficiency': 0, 'resolution': "Error",
-            'curvature': "Error", 'runs': len(suggested_table), 'model': model_type,
+            'orthogonality':        0,
+            'efficiency':           0,
+            'resolution':           "Error",
+            'curvature':            "Error",
+            'runs':                 len(suggested_table),
+            'model':                model_type,
             'oversampling_warning': oversampling_warning,
+            'center_replicates':    n_center_replicates,
         }
 
     return suggested_table, metrics

@@ -222,3 +222,171 @@ class TestFeaturePrecision:
                 if len(parts) == 2:
                     assert len(parts[1]) <= 2
 
+
+# ==============================================================================
+# Test: Central Composite Design (ccdesign)
+# ==============================================================================
+
+class TestCentralCompositeDesign:
+    """Tests for the Central Composite design algorithm."""
+
+    def test_returns_non_empty_table(self, three_cont_features):
+        """generate_doe should return a non-empty table for 3 continuous features."""
+        table, metrics = generate_doe(three_cont_features, {'model': 'ccdesign'})
+        assert len(table) > 0
+        assert metrics['model'] == 'ccdesign'
+        assert metrics['center_replicates'] > 0
+
+    def test_ccdesign_no_unexpected_duplicates(self, three_cont_features):
+        """The only duplicate rows in CCD should be the center-point replicates."""
+        table, metrics = generate_doe(three_cont_features, {'model': 'ccdesign'})
+        rows = [tuple(r.items()) for r in table]
+        unique_rows = set(rows)
+        # Total minus unique is the number of excess duplicate rows
+        n_dups = len(rows) - len(unique_rows)
+        # All duplicates should belong to the single center-point condition
+        assert n_dups == metrics['center_replicates'] - 1
+
+
+# ==============================================================================
+# Test: Center-Point Ordering (RSM models)
+# ==============================================================================
+
+class TestCenterPointOrdering:
+    """Tests verifying that replicate center points appear at the end of the table."""
+
+    def test_bbdesign_center_points_are_last(self, three_cont_features):
+        """For Box-Behnken, all center points (midpoint of all features) must be at the end."""
+        table, metrics = generate_doe(three_cont_features, {'model': 'bbdesign'})
+        n_centers = metrics['center_replicates']
+        assert n_centers > 0
+
+        # Midpoint for each feature: A: 5.0, B: 12.5, C: 150.0
+        center_row = {'A': 5.0, 'B': 12.5, 'C': 150.0}
+
+        # The last n_centers rows must all be the center point
+        for row in table[-n_centers:]:
+            for k, v in center_row.items():
+                assert abs(row[k] - v) < 1e-3
+
+        # None of the earlier rows should be the center point
+        for row in table[:-n_centers]:
+            is_center = all(abs(row[k] - center_row[k]) < 1e-3 for k in center_row)
+            assert not is_center, "Center point found before the end of the table!"
+
+    def test_ccdesign_center_points_are_last(self, three_cont_features):
+        """For CCD, all center points must be at the end of the table (not split mid-design)."""
+        table, metrics = generate_doe(three_cont_features, {'model': 'ccdesign'})
+        n_centers = metrics['center_replicates']
+        assert n_centers > 0
+
+        center_row = {'A': 5.0, 'B': 12.5, 'C': 150.0}
+
+        # The last n_centers rows must all be the center point
+        for row in table[-n_centers:]:
+            for k, v in center_row.items():
+                assert abs(row[k] - v) < 1e-3
+
+        # None of the earlier rows should be the center point
+        for row in table[:-n_centers]:
+            is_center = all(abs(row[k] - center_row[k]) < 1e-3 for k in center_row)
+            assert not is_center, "Center point found before the end of the table!"
+
+    def test_metrics_reports_center_replicates(self, three_cont_features):
+        """center_replicates metric should be >0 for RSM models and 0 for others."""
+        _, bb_metrics = generate_doe(three_cont_features, {'model': 'bbdesign'})
+        assert bb_metrics['center_replicates'] == 3
+
+        _, cc_metrics = generate_doe(three_cont_features, {'model': 'ccdesign'})
+        assert cc_metrics['center_replicates'] == 8
+
+        _, lhs_metrics = generate_doe(three_cont_features, {'model': 'lhs', 'max_runs': 10})
+        assert lhs_metrics['center_replicates'] == 0
+
+        _, dopt_metrics = generate_doe(three_cont_features, {'model': 'doptimal', 'max_runs': 10})
+        assert dopt_metrics['center_replicates'] == 0
+
+
+# ==============================================================================
+# Test: D-Optimal Design Uniqueness
+# ==============================================================================
+
+class TestDOptimalUniqueness:
+    """Tests verifying that D-Optimal design generates 100% unique experimental runs."""
+
+    def test_doptimal_no_duplicate_runs_linear(self, three_cont_features):
+        """Linear model D-optimal must contain zero duplicate rows."""
+        table, metrics = generate_doe(three_cont_features, {
+            'model': 'doptimal', 'dopt_model_order': 'linear', 'max_runs': 20
+        })
+        rows = [tuple(r.items()) for r in table]
+        assert len(rows) == len(set(rows)), "D-optimal linear produced duplicate rows!"
+        assert metrics['center_replicates'] == 0
+
+    def test_doptimal_no_duplicate_runs_interaction(self, three_cont_features):
+        """Interaction model D-optimal must contain zero duplicate rows."""
+        table, metrics = generate_doe(three_cont_features, {
+            'model': 'doptimal', 'dopt_model_order': 'interaction', 'max_runs': 20
+        })
+        rows = [tuple(r.items()) for r in table]
+        assert len(rows) == len(set(rows)), "D-optimal interaction produced duplicate rows!"
+
+    def test_doptimal_no_duplicate_runs_quadratic(self, three_cont_features):
+        """Quadratic model D-optimal must contain zero duplicate rows."""
+        table, metrics = generate_doe(three_cont_features, {
+            'model': 'doptimal', 'dopt_model_order': 'quadratic', 'max_runs': 20
+        })
+        rows = [tuple(r.items()) for r in table]
+        assert len(rows) == len(set(rows)), "D-optimal quadratic produced duplicate rows!"
+
+    def test_doptimal_no_duplicate_runs_large(self, three_cont_features):
+        """50-run D-optimal must contain zero duplicate rows."""
+        table, _ = generate_doe(three_cont_features, {
+            'model': 'doptimal', 'dopt_model_order': 'quadratic', 'max_runs': 50
+        })
+        rows = [tuple(r.items()) for r in table]
+        assert len(rows) == len(set(rows)), f"Expected 50 unique rows, got {len(set(rows))}"
+
+
+# ==============================================================================
+# Test: Oversampling Uniqueness (Space-Filling Augmentation)
+# ==============================================================================
+
+class TestOversamplingUniqueness:
+    """Tests verifying that exact-N oversampling produces unique points, not duplicate rows."""
+
+    def test_fracfact_oversampling_no_duplicates(self, three_cont_features):
+        """Oversampling fracfact from 8 to 25 runs must not duplicate rows."""
+        table, metrics = generate_doe(three_cont_features, {
+            'model': 'fracfact', 'use_exact_runs': True, 'max_runs': 25
+        })
+        assert len(table) == 25
+        assert metrics['oversampling_warning'] is True
+        rows = [tuple(r.items()) for r in table]
+        assert len(rows) == len(set(rows)), f"Expected 25 unique rows, got {len(set(rows))}"
+
+    def test_def_screening_oversampling_no_duplicates(self, three_cont_features):
+        """Oversampling def_screening from 4 to 15 runs must not duplicate rows."""
+        table, metrics = generate_doe(three_cont_features, {
+            'model': 'def_screening', 'use_exact_runs': True, 'max_runs': 15
+        })
+        assert len(table) == 15
+        assert metrics['oversampling_warning'] is True
+        rows = [tuple(r.items()) for r in table]
+        assert len(rows) == len(set(rows)), f"Expected 15 unique rows, got {len(set(rows))}"
+
+    def test_bbdesign_oversampling_no_extra_duplicates(self, three_cont_features):
+        """Oversampling Box-Behnken: only the 3 center points should be repeated."""
+        table, metrics = generate_doe(three_cont_features, {
+            'model': 'bbdesign', 'use_exact_runs': True, 'max_runs': 25
+        })
+        assert len(table) == 25
+        rows = [tuple(r.items()) for r in table]
+        unique_rows = set(rows)
+        # Expected duplicates: exactly metrics['center_replicates'] - 1 (which is 2)
+        n_dups = len(rows) - len(unique_rows)
+        assert n_dups == metrics['center_replicates'] - 1, (
+            f"Expected only {metrics['center_replicates'] - 1} duplicates from center points, but found {n_dups}!"
+        )
+
+
