@@ -807,10 +807,10 @@ window.toggleRowTarget = (select) => {
 
 window.updatePlaceholder = (select) => {
     const tr    = select.closest('tr');
-    const input = tr.querySelector('.doe-f-range');
+    const input = tr.querySelector('.doe-f-range, .bo-f-range');
     const type  = select.value;
-    if      (type === 'continuous') input.placeholder = '[min, max]';
-    else if (type === 'regular')    input.placeholder = '[min, max]steps';
-    else if (type === 'discrete')   input.placeholder = 'xx, yy, zz,...';
+    if      (type === 'continuous')  input.placeholder = '[min, max]';
+    else if (type === 'regular')     input.placeholder = '[min, max]steps';
+    else if (type === 'discrete')    input.placeholder = 'xx, yy, zz,...';
     else if (type === 'categorical') input.placeholder = 'A, B, C,...';
 };

@@ -41,6 +41,14 @@ function _wireSelectAll(headerId, rowSelector, syncFn) {
     refreshHeader();
 }
 
+// Returns the appropriate range-input placeholder for a given feature type.
+function getBOPlaceholder(type) {
+    if (type === 'regular')     return '[min, max]steps';
+    if (type === 'discrete')    return 'xx, yy, zz,...';
+    if (type === 'categorical') return 'A, B, C,...';
+    return '[min, max]';  // continuous (default)
+}
+
 export function renderBOSetup() {
     const featuresList  = document.getElementById('bo-features-list');
     const objectivesList = document.getElementById('bo-objectives-list');
@@ -48,15 +56,16 @@ export function renderBOSetup() {
     let featuresHtml = '';
     window.currentColumns.filter(col => window.columnRoles[col] === 'feature').forEach(col => {
         const cfg = window.boFeatureConfigs[col] || { type: 'continuous', range: '', included: true };
+        const ph  = getBOPlaceholder(cfg.type);
         featuresHtml += `<tr>
             <td>${col}</td>
-            <td><select class="bo-f-type" data-col="${col}" onchange="window.syncBOFeatureConfig('${col}', 'type')">
+            <td><select class="bo-f-type" data-col="${col}" onchange="window.syncBOFeatureConfig('${col}', 'type'); window.updatePlaceholder(this);">
                 <option value="continuous" ${cfg.type === 'continuous' ? 'selected' : ''}>continuous</option>
                 <option value="regular"    ${cfg.type === 'regular'    ? 'selected' : ''}>regular</option>
                 <option value="discrete"   ${cfg.type === 'discrete'   ? 'selected' : ''}>discrete</option>
                 <option value="categorical"${cfg.type === 'categorical'? 'selected' : ''}>categorical</option>
             </select></td>
-            <td><input type="text" class="bo-f-range" data-col="${col}" value="${cfg.range}" placeholder="[min, max] or [min, max]steps" onchange="window.syncBOFeatureConfig('${col}', 'range')"></td>
+            <td><input type="text" class="bo-f-range" data-col="${col}" value="${cfg.range}" placeholder="${ph}" onchange="window.syncBOFeatureConfig('${col}', 'range')"></td>
             <td><input type="checkbox" class="bo-f-include" data-col="${col}" ${cfg.included ? 'checked' : ''} onchange="window.syncBOFeatureConfig('${col}', 'include')"></td>
         </tr>`;
     });
