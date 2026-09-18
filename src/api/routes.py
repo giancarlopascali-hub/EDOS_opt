@@ -157,10 +157,25 @@ def _run_sa_job(job_id, payload):
         )
 
 
+def _shutdown_is_allowed():
+    """Return True only for a local request in a non-hosted environment."""
+    client_ip = request.remote_addr
+    is_local = client_ip in ('127.0.0.1', '::1')
+    environment = os.environ.get('ENVIRONMENT', '').strip().lower()
+    hostname = (request.host or '').split(':', 1)[0].strip().lower()
+    is_hosted = (
+        environment in ('production', 'prod')
+        or bool(os.environ.get('SPACE_ID'))
+        or bool(os.environ.get('HF_SPACE'))
+        or hostname.endswith('.hf.space')
+    )
+    return is_local and not is_hosted
+
+
 @api_bp.route('/')
 def index():
     """Serves the main single-page application (SPA)."""
-    return render_template('index.html')
+    return render_template('index.html', show_shutdown=_shutdown_is_allowed())
 
 
 @api_bp.route('/guide')
@@ -172,15 +187,7 @@ def guide():
 @api_bp.route('/shutdown', methods=['POST'])
 def shutdown():
     """Gracefully shuts down the local Flask server (local development only)."""
-    client_ip = request.remote_addr
-    is_local = client_ip in ('127.0.0.1', '::1')
-    environment = os.environ.get('ENVIRONMENT', '').strip().lower()
-    is_prod = (
-        environment in ('production', 'prod')
-        or bool(os.environ.get('SPACE_ID'))
-        or bool(os.environ.get('HF_SPACE'))
-    )
-    if not is_local or is_prod:
+    if not _shutdown_is_allowed():
         return jsonify({'error': 'Shutdown endpoint is restricted to local development.'}), 403
 
     def _stop():
