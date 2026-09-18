@@ -1,3 +1,4 @@
+import ast
 import re
 import itertools
 import numpy as np
@@ -39,7 +40,11 @@ from botorch.optim import optimize_acqf, optimize_acqf_discrete
 from botorch.utils.sampling import draw_sobol_samples
 from botorch.sampling.normal import SobolQMCNormalSampler
 
-from src.core.constraints import check_constraints
+from src.core.constraints import check_constraints, check_objective_constraints
+from src.core.feasibility import (
+    ProbabilityOfFeasibilityAcquisition,
+    candidate_feasibility_report,
+)
 
 def generate_feasible_initial_conditions(bounds_t, q, num_restarts, p_constraints, max_attempts=500):
     """
@@ -78,20 +83,22 @@ def generate_feasible_initial_conditions(bounds_t, q, num_restarts, p_constraint
 
 
 def clean_dataframe(df, features_config, objectives_config):
-    # 1. Feature filtering: Drop rows missing any required feature value
-    valid_feat_mask = pd.Series(True, index=df.index)
+    # 1. Feature filtering: Drop rows missing continuous/discrete numerical features.
+    # For categorical features, treat missing/empty as 'None' level rather than dropping rows.
+    df_clean = df.copy()
+    valid_feat_mask = pd.Series(True, index=df_clean.index)
     for f in features_config:
         name = f['name']
-        if name not in df.columns:
+        if name not in df_clean.columns:
             continue
-        col_series = df[name]
-        if f['type'] in ['continuous', 'discrete', 'regular']:
+        col_series = df_clean[name]
+        if f.get('type') in ['continuous', 'discrete', 'regular']:
             num_col = pd.to_numeric(col_series, errors='coerce')
             valid_feat_mask = valid_feat_mask & num_col.notna()
         else:
-            valid_feat_mask = valid_feat_mask & col_series.notna() & (col_series.astype(str).str.strip() != "")
+            df_clean[name] = col_series.fillna('None').astype(str).replace(r'^\s*$', 'None', regex=True)
             
-    df_clean = df[valid_feat_mask].copy()
+    df_clean = df_clean[valid_feat_mask].copy()
     
     if not objectives_config:
         return df_clean
@@ -255,6 +262,8 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
     constraints_cfg  = tweaks.get('constraints', {})
     num_rules        = constraints_cfg.get('numerical', [])
     disallowed_rules = constraints_cfg.get('disallowed', [])
+    objective_constraints = tweaks.get('objective_constraints', [])
+    feasibility_models = {}
 
     # STEP 3 — Optimization Logic
     if df_clean.empty:
@@ -385,11 +394,12 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
         mc_samples = int(base_mc_samples * intensity)
         sampler    = SobolQMCNormalSampler(sample_shape=torch.Size([mc_samples]))
 
+        acq_is_logarithmic = False
         if is_mo:
             if is_uniform:
                 mo_obj = WeightedMCMultiOutputObjective(weights=weights_t.to(OPT_DEVICE))
                 ty_compute = train_y.to(OPT_DEVICE)
-                
+
                 mins_list = []
                 maxs_list = []
                 for idx in range(ty_compute.shape[1]):
@@ -402,7 +412,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                         maxs_list.append(torch.tensor(1.0, device=OPT_DEVICE))
                 mins = torch.stack(mins_list)
                 maxs = torch.stack(maxs_list)
-                
+
                 ref_point = (mins - 0.2 * (maxs - mins + 1e-6)) * weights_t.to(OPT_DEVICE)
                 acq_func = qLogNoisyExpectedHypervolumeImprovement(
                     model=model,
@@ -412,6 +422,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                     objective=mo_obj,
                     prune_baseline=True
                 ).to(OPT_DEVICE)
+                acq_is_logarithmic = True
             else:
                 post_tf = ScalarizedPosteriorTransform(weights=weights_t.to(OPT_DEVICE))
                 
@@ -430,6 +441,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                     sampler=sampler,
                     posterior_transform=post_tf
                 ).to(OPT_DEVICE)
+                acq_is_logarithmic = True
         else:
             if acq_type == 'EI':
                 acq_func = qLogExpectedImprovement(
@@ -438,6 +450,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                     sampler=sampler,
                     objective=None
                 ).to(OPT_DEVICE)
+                acq_is_logarithmic = True
             elif acq_type == 'LCB':
                 beta     = (1.0 - exploration) * 10.0 + 0.1
                 acq_func = qUpperConfidenceBound(model, beta=beta, sampler=sampler).to(OPT_DEVICE)
@@ -448,6 +461,48 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                     sampler=sampler,
                     objective=None
                 ).to(OPT_DEVICE)
+                acq_is_logarithmic = True
+
+        if objective_constraints:
+            constrained_names = {c['objective'] for c in objective_constraints}
+            for objective_name in constrained_names:
+                raw_values = pd.to_numeric(
+                    df_clean[objective_name], errors='coerce'
+                ).values
+                valid_mask_np = ~np.isnan(raw_values)
+                valid_mask = torch.tensor(
+                    valid_mask_np, dtype=torch.bool, device=train_x.device
+                )
+                raw_x = train_x[valid_mask]
+                raw_y = torch.tensor(
+                    raw_values[valid_mask_np], dtype=torch.float32
+                ).unsqueeze(-1).to(device)
+                if raw_x.shape[0] == 0:
+                    raise ValueError(
+                        f"No valid observations for constrained objective '{objective_name}'."
+                    )
+                raw_model = build_single_model(raw_x, raw_y)
+                raw_mll = ExactMarginalLogLikelihood(
+                    raw_model.likelihood, raw_model
+                ).to(compute_device)
+                try:
+                    fit_gpytorch_mll(
+                        raw_mll, optimizer_kwargs={"options": {"maxiter": 75}}
+                    )
+                except Exception as exc:
+                    print(
+                        f"Warning: Feasibility model fit failed for "
+                        f"{objective_name}: {exc}"
+                    )
+                raw_model.eval()
+                feasibility_models[objective_name] = raw_model.to(OPT_DEVICE)
+
+            acq_func = ProbabilityOfFeasibilityAcquisition(
+                acq_func,
+                feasibility_models,
+                objective_constraints,
+                logarithmic=acq_is_logarithmic,
+            ).to(OPT_DEVICE)
 
         strategy = tweaks.get('optimization_strategy', 'gradient_based')
 
@@ -517,7 +572,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 filtered_combos = [filtered_combos[idx] for idx in feasible_indices]
                 candidates_grid = torch.tensor(filtered_combos, dtype=torch.float32).to(OPT_DEVICE)
 
-            if not is_mo and acq_type == 'EI':
+            if not objective_constraints and not is_mo and acq_type == 'EI':
                 try:
                     from botorch.acquisition.analytic import LogExpectedImprovement
                     acq_func_grid = LogExpectedImprovement(model=model, best_f=train_y.to(OPT_DEVICE).max().item()).to(OPT_DEVICE)
@@ -539,11 +594,48 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
             p_constraints = []
             if num_rules:
                 indices = {f['name']: idx for idx, f in enumerate(features_config)}
+                sorted_names = sorted(indices.keys(), key=len, reverse=True)
+
+                def _eval_tensor_ast(node, X, ph_to_idx):
+                    if isinstance(node, ast.Expression):
+                        return _eval_tensor_ast(node.body, X, ph_to_idx)
+                    elif isinstance(node, ast.Constant):
+                        return float(node.value)
+                    elif isinstance(node, ast.Num):
+                        return float(node.n)
+                    elif isinstance(node, ast.Name):
+                        if node.id in ph_to_idx:
+                            return X[..., ph_to_idx[node.id]]
+                        raise ValueError(f"Unknown variable in constraint: {node.id}")
+                    elif isinstance(node, ast.UnaryOp):
+                        opnd = _eval_tensor_ast(node.operand, X, ph_to_idx)
+                        if isinstance(node.op, ast.USub):
+                            return -opnd
+                        elif isinstance(node.op, ast.UAdd):
+                            return opnd
+                        raise ValueError(f"Unsupported unary operator: {type(node.op)}")
+                    elif isinstance(node, ast.BinOp):
+                        l = _eval_tensor_ast(node.left, X, ph_to_idx)
+                        r = _eval_tensor_ast(node.right, X, ph_to_idx)
+                        if isinstance(node.op, ast.Add):
+                            return l + r
+                        elif isinstance(node.op, ast.Sub):
+                            return l - r
+                        elif isinstance(node.op, ast.Mult):
+                            return l * r
+                        elif isinstance(node.op, ast.Div):
+                            return l / r
+                        elif isinstance(node.op, ast.Pow):
+                            return l ** r
+                        raise ValueError(f"Unsupported binary operator: {type(node.op)}")
+                    raise ValueError(f"Unsupported constraint node: {type(node)}")
+
                 for expr in num_rules:
                     try:
                         clean_expr = expr.strip()
+                        clean_expr = re.sub(r'(?<![<>=!])=(?!=)', '==', clean_expr)
                         op_found = None
-                        for op in ['<=', '>=', '<', '>']:
+                        for op in ['<=', '>=', '==', '<', '>']:
                             if op in clean_expr:
                                 op_found = op
                                 break
@@ -552,19 +644,28 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                             lhs_str = parts[0].strip()
                             rhs_str = parts[1].strip()
                             
-                            for name, idx in indices.items():
-                                lhs_str = re.sub(rf'\b{re.escape(name)}\b', f'X[..., {idx}]', lhs_str)
-                                rhs_str = re.sub(rf'\b{re.escape(name)}\b', f'X[..., {idx}]', rhs_str)
+                            ph_to_idx = {}
+                            for i, name in enumerate(sorted_names):
+                                ph = f"_ph_{i}"
+                                ph_to_idx[ph] = indices[name]
+                                pattern = rf'(?<![\w]){re.escape(name)}(?![\w])'
+                                lhs_str = re.sub(pattern, ph, lhs_str)
+                                rhs_str = re.sub(pattern, ph, rhs_str)
                             
                             if op_found in ('<=', '<'):
                                 vec_expr = f"({rhs_str}) - ({lhs_str})"
+                                is_inequality = True
+                            elif op_found == '==':
+                                vec_expr = f"({lhs_str}) - ({rhs_str})"
+                                is_inequality = False
                             else:
                                 vec_expr = f"({lhs_str}) - ({rhs_str})"
+                                is_inequality = True
                                 
-                            code = compile(vec_expr, '<string>', 'eval')
-                            def constraint_func(X, code=code):
-                                return eval(code, {"X": X, "torch": torch, "np": np, "__builtins__": {}})
-                            p_constraints.append((constraint_func, True))
+                            parsed_tree = ast.parse(vec_expr, mode='eval')
+                            def constraint_func(X, tree=parsed_tree, mapping=ph_to_idx):
+                                return _eval_tensor_ast(tree, X, mapping)
+                            p_constraints.append((constraint_func, is_inequality))
                     except Exception as ex:
                         print(f"Error compiling continuous constraint '{expr}': {ex}")
 
@@ -832,11 +933,55 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 'status': 'Good' if avg_r2_g > 0.7 else ('Limited' if avg_r2_g >= 0.4 else 'Poor')
             }
 
+    constraint_status = {
+        'constrained': bool(objective_constraints),
+        'all_likely_feasible': True,
+        'candidates': [],
+    }
+    if objective_constraints and df_clean.empty:
+        constraint_status.update({
+            'cold_start': True,
+            'all_likely_feasible': None,
+            'message': (
+                'Cold Start: objective constraints will be evaluated once the '
+                'first experimental observation is recorded.'
+            ),
+        })
+    elif objective_constraints and suggestions:
+        encoded_suggestions = []
+        for suggestion in suggestions:
+            encoded = []
+            for feature in features_config:
+                value = suggestion[feature['name']]
+                if feature['type'] == 'categorical':
+                    choices = [x.strip() for x in feature['range'].split(',')]
+                    value = choices.index(str(value))
+                encoded.append(float(value))
+            encoded_suggestions.append(encoded)
+        report_tensor = torch.tensor(
+            encoded_suggestions, dtype=torch.float32, device=OPT_DEVICE
+        )
+        constraint_status = candidate_feasibility_report(
+            feasibility_models,
+            objective_constraints,
+            report_tensor,
+        )
+        if not constraint_status['all_likely_feasible']:
+            best_probability = max(
+                (item['probability'] for item in constraint_status['candidates']),
+                default=0.0,
+            )
+            constraint_status['message'] = (
+                '⚠️ Feasibility Warning: at least one recommended candidate '
+                'does not confidently satisfy every objective constraint '
+                f'(best predicted feasibility: {best_probability:.1%}).'
+            )
+
     # Return exhaustion sentinel after CV so performance table is still populated
     if is_exhausted:
-        return None, performance_results
+        return None, performance_results, constraint_status
 
-    return suggestions, performance_results
+    return suggestions, performance_results, constraint_status
 
 
 def run_bo_estimation(df, input_values, features_config, objectives_config, tweaks, device, compute_device):
@@ -1021,9 +1166,30 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
         success_scores[name] = round(float(np.clip(norm_s, 0, 1) * 100), 1)
         processed_success.append(np.clip(norm_s, 0, 1))
 
-    global_score = np.average(processed_success, weights=weights_list) if processed_success else 0
+    _, violations = check_objective_constraints(
+        raw_predictions, tweaks.get('objective_constraints', [])
+    )
+    violated_objectives = {item['objective'] for item in violations}
+    for objective_name in violated_objectives:
+        if objective_name in success_scores:
+            success_scores[objective_name] = 0.0
 
-    return raw_predictions, raw_std_errors, success_scores, round(float(global_score * 100), 1)
+    weighted_scores = [
+        float(success_scores.get(obj['name'], 0.0)) / 100.0
+        for obj in objectives_config
+    ]
+    global_score = (
+        np.average(weighted_scores, weights=weights_list)
+        if weighted_scores else 0.0
+    )
+
+    return (
+        raw_predictions,
+        raw_std_errors,
+        success_scores,
+        round(float(global_score * 100), 1),
+        violations,
+    )
 
 
 def run_bo_surface(
@@ -1344,5 +1510,3 @@ def run_bo_surface(
         "experiments": experiments,
         "slice_targets": {k: v['label'] for k, v in slice_targets.items()}
     }
-
-

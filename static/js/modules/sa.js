@@ -20,43 +20,14 @@ function _downloadCSV(rows, fname) {
 }
 
 
-function _wireSelectAll(headerId, rowSelector, syncFn) {
-    const header = document.getElementById(headerId);
-    if (!header) return;
-
-    const refreshHeader = () => {
-        const rows    = Array.from(document.querySelectorAll(rowSelector));
-        const total   = rows.length;
-        const checked = rows.filter(cb => cb.checked).length;
-        header.checked       = checked === total;
-        header.indeterminate = checked > 0 && checked < total;
-    };
-
-    header.addEventListener('change', () => {
-        const rows = Array.from(document.querySelectorAll(rowSelector));
-        rows.forEach(cb => {
-            if (cb.checked !== header.checked) {
-                cb.checked = header.checked;
-                syncFn(cb.dataset.col);
-            }
-        });
-        header.indeterminate = false;
-    });
-
-    document.querySelectorAll(rowSelector).forEach(cb => {
-        cb.addEventListener('change', refreshHeader);
-    });
-
-    refreshHeader();
-}
-
 export function renderSASetup() {
     const list    = document.getElementById('sa-features-list');
     const objList = document.getElementById('sa-objectives-list');
 
     let featHtml = '';
     window.currentColumns.filter(c => window.columnRoles[c] === 'feature').forEach(col => {
-        const cfg = window.saFeatureConfigs[col] || { type: 'continuous', included: true };
+        const defaultType = window.boFeatureConfigs?.[col]?.type || 'continuous';
+        const cfg = window.saFeatureConfigs[col] || { type: defaultType, included: true };
         featHtml += `<tr>
             <td>${col}</td>
             <td><select class="sa-f-type" data-col="${col}" onchange="window.syncSAFeatureConfig('${col}', 'type')">
@@ -89,18 +60,64 @@ export function renderSASetup() {
     objList.innerHTML = objHtml;
 
     // --- Select-all / deselect-all for SA Features ---
-    _wireSelectAll(
+    wireSelectAll(
         'sa-select-all-features',
         '#sa-features-list .sa-f-include',
-        col => window.syncSAFeatureConfig(col, 'include')
+        (columns, checked) => {
+            columns.forEach(col => {
+                if (window.saFeatureConfigs[col]) window.saFeatureConfigs[col].included = checked;
+            });
+            renderSASetup();
+        }
     );
 
     // --- Select-all / deselect-all for SA Objectives ---
-    _wireSelectAll(
+    wireSelectAll(
         'sa-select-all-objectives',
         '#sa-objectives-list .sa-o-include',
-        col => window.syncObjectiveConfig(col, 'sa', 'include')
+        (columns, checked) => {
+            columns.forEach(col => {
+                if (window.objectiveConfigs[col]) window.objectiveConfigs[col].included = checked;
+            });
+            rebalanceObjectiveConfigs();
+            renderSASetup();
+        }
     );
+    window.refreshObjectiveConstraintRows?.('sa');
+}
+
+let activeSAJobId = null;
+let saAbortController = null;
+let saCancellationRequested = false;
+
+function waitForPoll(milliseconds, signal) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, milliseconds);
+        signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+    });
+}
+
+export async function abortSA() {
+    if (!activeSAJobId && !saAbortController) return;
+    saCancellationRequested = true;
+    const abortButton = document.getElementById('sa-abort-btn');
+    if (abortButton) abortButton.disabled = true;
+    const statusText = document.getElementById('sa-status-text');
+    if (statusText) statusText.textContent = 'Requesting cancellation...';
+    if (activeSAJobId) {
+        try {
+            await fetch(`/sa_cancel/${encodeURIComponent(activeSAJobId)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+        } catch (error) {
+            console.warn('Unable to send SA cancellation request:', error);
+        }
+    }
+    saAbortController?.abort();
 }
 
 
@@ -125,6 +142,14 @@ export async function runSA() {
     window.saSelectedObjectives = objectives.map(o => o.name);
     window.saSelectedFeatures   = Array.from(document.querySelectorAll('.sa-f-include:checked')).map(cb => cb.dataset.col);
 
+    let objectiveConstraints;
+    try {
+        objectiveConstraints = window.collectObjectiveConstraints?.('sa') || [];
+    } catch (error) {
+        alert(error.message);
+        return;
+    }
+
     const tweaks = {
         model: document.getElementById('sa-model-select').value,
         params: {
@@ -132,33 +157,77 @@ export async function runSA() {
             max_depth:    document.getElementById('sa-rf-depth').value,
             mlp_layers:   document.getElementById('sa-mlp-layers').value,
             mlp_iter:     document.getElementById('sa-mlp-iter').value
-        }
+        },
+        objective_constraints: objectiveConstraints
     };
 
-    document.getElementById('loading-text').textContent = "Analyzing...";
-    document.getElementById('loading-overlay').classList.remove('hidden');
+    const runBtn = document.getElementById('sa-run-btn');
+    const progressContainer = document.getElementById('sa-progress-container');
+    const progressBar = document.getElementById('sa-progress-bar');
+    const statusText = document.getElementById('sa-status-text');
+    const timerText = document.getElementById('sa-timer-text');
+    const abortButton = document.getElementById('sa-abort-btn');
+    if (runBtn) runBtn.disabled = true;
+    if (abortButton) abortButton.disabled = false;
+    if (progressContainer) progressContainer.classList.remove('hidden');
+    document.getElementById('sa-results-container')?.classList.add('hidden');
     document.getElementById('sa-estimate-results').innerHTML = '';
 
-    window.currentAbortController = new AbortController();
+    const startTime = Date.now();
+    const tickerInterval = setInterval(() => {
+        if (timerText) timerText.textContent = `${Math.round((Date.now() - startTime) / 1000)}s`;
+    }, 400);
+    saCancellationRequested = false;
+    saAbortController = new AbortController();
+    window.saAbortController = saAbortController;
+    window.currentAbortController = saAbortController;
     try {
-        const res    = await fetch('/sa', {
+        const res = await fetch('/sa_submit', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ data: window.currentData, columns: window.currentColumns, features, objectives, tweaks }),
-            signal: window.currentAbortController.signal
+            signal: saAbortController.signal
         });
-        const result = await res.json();
-        document.getElementById('loading-overlay').classList.add('hidden');
-        if (result.error) return alert("SA Error: " + result.error);
+        const submitted = await safeJson(res);
+        if (!res.ok || submitted.error) throw new Error(submitted.error || 'Unable to start analysis.');
+        activeSAJobId = submitted.job_id;
+
+        let result = null;
+        while (!result) {
+            await waitForPoll(1500, saAbortController.signal);
+            const statusResponse = await fetch(`/sa_status/${encodeURIComponent(activeSAJobId)}`, { signal: saAbortController.signal });
+            const status = await safeJson(statusResponse);
+            if (!statusResponse.ok || (status.error && status.status !== 'cancelled')) {
+                throw new Error(status.error || 'Unable to read analysis status.');
+            }
+            if (statusText && status.phase) statusText.textContent = status.phase;
+            if (progressBar) progressBar.style.width = `${Math.max(0, Math.min(100, status.percent || 0))}%`;
+            if (status.status === 'completed') result = status.result;
+            else if (status.status === 'failed') throw new Error(status.error || 'Statistical analysis failed.');
+            else if (status.status === 'cancelled') {
+                saCancellationRequested = true;
+                throw new DOMException('Analysis aborted by user.', 'AbortError');
+            }
+        }
 
         window.lastSAResult = result;
         renderSAResults(result);
     } catch(err) {
-        document.getElementById('loading-overlay').classList.add('hidden');
-        if (err.name === 'AbortError') return console.log('SA calculation aborted by user.');
-        alert("A critical error occurred during SA: " + err.message);
-        console.error(err);
+        if (err.name === 'AbortError' || saCancellationRequested) {
+            if (statusText) statusText.textContent = 'Analysis aborted by user.';
+            setTimeout(() => progressContainer?.classList.add('hidden'), 1200);
+        } else {
+            alert("Statistical Analysis notice: " + err.message);
+            console.error(err);
+        }
     } finally {
+        clearInterval(tickerInterval);
+        if (progressContainer && !saCancellationRequested) progressContainer.classList.add('hidden');
+        if (runBtn) runBtn.disabled = false;
+        if (abortButton) abortButton.disabled = true;
+        activeSAJobId = null;
+        saAbortController = null;
+        window.saAbortController = null;
         window.currentAbortController = null;
     }
 }
@@ -173,6 +242,15 @@ function purgeAllPlots(container) {
 
 export function renderSAResults(result) {
     document.getElementById('sa-results-container').classList.remove('hidden');
+
+    document.getElementById('sa-approximation-notice')?.remove();
+    if (result.metadata?.shap_approximated) {
+        const notice = document.createElement('div');
+        notice.id = 'sa-approximation-notice';
+        notice.style.cssText = 'margin:0.75rem 0;padding:0.8rem 1rem;border-radius:8px;background:#eff6ff;border:1px solid #93c5fd;color:#1e40af;';
+        notice.textContent = `SHAP values were approximated for this ${result.metadata.original_rows}-row dataset using ${result.metadata.shap_background_rows} background rows and ${result.metadata.shap_nsamples} samples.`;
+        document.getElementById('sa-results-container')?.prepend(notice);
+    }
 
     // Purge any existing WebGL & SVG Plotly instances to free GPU WebGL contexts
     purgeAllPlots(document.getElementById('sa-parcoords-container'));
@@ -702,7 +780,8 @@ export async function runEstimate() {
 
     const featList = (window.saSelectedFeatures || window.currentColumns.filter(c => window.columnRoles[c] === 'feature'))
         .map(c => {
-            const cfg = window.saFeatureConfigs[c] || { type: 'continuous' };
+            const defaultType = window.boFeatureConfigs?.[c]?.type || 'continuous';
+            const cfg = window.saFeatureConfigs[c] || { type: defaultType };
             return {
                 name: c,
                 type: cfg.type
@@ -717,6 +796,14 @@ export async function runEstimate() {
             target:     tr.querySelector('.sa-o-target').value,
             importance: tr.querySelector('.sa-o-importance').value
         }));
+
+    let objectiveConstraints;
+    try {
+        objectiveConstraints = window.collectObjectiveConstraints?.('sa') || [];
+    } catch (error) {
+        document.getElementById('sa-estimate-results').textContent = error.message;
+        return;
+    }
 
     document.getElementById('sa-estimate-results').innerHTML = '<div style="color: var(--text-secondary); animation: pulse 1.5s infinite;"><i>Calculating predictions...</i></div>';
 
@@ -733,10 +820,11 @@ export async function runEstimate() {
                     max_depth:    document.getElementById('sa-rf-depth').value,
                     mlp_layers:   document.getElementById('sa-mlp-layers').value,
                     mlp_iter:     document.getElementById('sa-mlp-iter').value
-                }
+                },
+                tweaks: { objective_constraints: objectiveConstraints }
             })
         });
-        const result = await res.json();
+        const result = await safeJson(res);
         if (result.error) {
             document.getElementById('sa-estimate-results').innerHTML = `<span style="color:red">Error: ${result.error}</span>`;
             return;
@@ -745,13 +833,18 @@ export async function runEstimate() {
         let html = '<div style="margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid var(--border-color);">';
         html += `<b>Global Success Score: <span style="font-size: 1.2rem; color: var(--accent-color);">${result.global_success}%</span></b></div>`;
         html += '<b>Predictions:</b><br>';
+        const violationMap = new Map((result.violations || []).map(item => [item.objective, item]));
         for (const obj in result.predictions) {
             const val  = result.predictions[obj];
             const err  = result.std_errors ? result.std_errors[obj] : null;
             const succ = result.success_scores[obj];
+            const violation = violationMap.get(obj);
+            const violationBadge = violation
+                ? `<span title="Predicted ${violation.predicted ?? 'N/A'} violates ${violation.operator} ${violation.limit}" style="display:inline-block;margin-left:6px;color:#b91c1c;font-weight:700;">🚫 Violated: ${violation.operator} ${violation.limit}</span>`
+                : '';
             const errBadge = (err !== null && err !== undefined) ? `<span style="font-size: 0.85rem; color: var(--text-secondary); margin-left: 4px;">(&plusmn; ${err})</span>` : '';
             html += `<div style="display: flex; justify-content: space-between; align-items: center; margin: 4px 0;">
-                        <span><b>${obj}:</b> ${val}${errBadge}</span>
+                        <span><b>${obj}:</b> ${val}${errBadge}${violationBadge}</span>
                         <span style="color: ${succ > 80 ? '#22c55e' : (succ > 50 ? '#f59e0b' : '#ef4444')}">Success: ${succ}%</span>
                      </div>`;
         }
@@ -990,3 +1083,4 @@ window.syncSAFeatureConfig = (col, field) => {
 
 // Bind to window for inline calls
 window.syncSAFeatureConfig = window.syncSAFeatureConfig;
+import { safeJson, wireSelectAll, rebalanceObjectiveConfigs } from '../utils.js';

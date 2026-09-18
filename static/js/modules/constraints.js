@@ -233,6 +233,116 @@ export function updateAllConstraintsDropdowns(modulePrefix) {
     });
 }
 
+function getIncludedObjectiveNames(modulePrefix) {
+    const selectors = {
+        bo: '#bo-objectives-list .bo-o-include',
+        sa: '#sa-objectives-list .sa-o-include'
+    };
+    const selector = selectors[modulePrefix];
+    if (!selector) return [];
+    return Array.from(document.querySelectorAll(selector))
+        .filter(checkbox => checkbox.checked)
+        .map(checkbox => checkbox.dataset.col)
+        .filter(Boolean);
+}
+
+function setObjectiveOptions(select, objectiveNames, preferredValue = '') {
+    select.replaceChildren();
+    objectiveNames.forEach(name => {
+        const option = document.createElement('option');
+        option.value = name;
+        option.textContent = name;
+        select.appendChild(option);
+    });
+    if (objectiveNames.includes(preferredValue)) select.value = preferredValue;
+}
+
+export function addObjectiveConstraintRow(
+    modulePrefix,
+    constraint = { objective: '', operator: '>=', value: '' }
+) {
+    const list = document.getElementById(`${modulePrefix}-objective-constraints-list`);
+    if (!list) return;
+    const objectiveNames = getIncludedObjectiveNames(modulePrefix);
+    if (objectiveNames.length === 0) {
+        alert('Include at least one objective before adding an objective constraint.');
+        return;
+    }
+
+    const row = document.createElement('tr');
+    row.className = 'objective-constraint-row';
+
+    const objectiveCell = document.createElement('td');
+    const objectiveSelect = document.createElement('select');
+    objectiveSelect.className = 'objective-constraint-objective';
+    setObjectiveOptions(objectiveSelect, objectiveNames, constraint.objective);
+    objectiveCell.appendChild(objectiveSelect);
+
+    const operatorCell = document.createElement('td');
+    const operatorSelect = document.createElement('select');
+    operatorSelect.className = 'objective-constraint-operator';
+    [['>=', '≥'], ['<=', '≤']].forEach(([value, label]) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        option.selected = value === constraint.operator;
+        operatorSelect.appendChild(option);
+    });
+    operatorCell.appendChild(operatorSelect);
+
+    const valueCell = document.createElement('td');
+    const valueInput = document.createElement('input');
+    valueInput.type = 'number';
+    valueInput.step = 'any';
+    valueInput.className = 'objective-constraint-value';
+    valueInput.placeholder = 'Boundary';
+    valueInput.value = constraint.value ?? '';
+    valueCell.appendChild(valueInput);
+
+    const actionCell = document.createElement('td');
+    const deleteButton = document.createElement('button');
+    deleteButton.type = 'button';
+    deleteButton.className = 'btn secondary small delete-constraint';
+    deleteButton.textContent = '×';
+    deleteButton.title = 'Delete objective constraint';
+    deleteButton.addEventListener('click', () => row.remove());
+    actionCell.appendChild(deleteButton);
+
+    row.append(objectiveCell, operatorCell, valueCell, actionCell);
+    list.appendChild(row);
+}
+
+export function refreshObjectiveConstraintRows(modulePrefix) {
+    const list = document.getElementById(`${modulePrefix}-objective-constraints-list`);
+    if (!list) return;
+    const objectiveNames = getIncludedObjectiveNames(modulePrefix);
+    list.querySelectorAll('.objective-constraint-objective').forEach(select => {
+        setObjectiveOptions(select, objectiveNames, select.value);
+    });
+}
+
+export function collectObjectiveConstraints(modulePrefix) {
+    const list = document.getElementById(`${modulePrefix}-objective-constraints-list`);
+    if (!list) return [];
+    const included = new Set(getIncludedObjectiveNames(modulePrefix));
+    return Array.from(list.querySelectorAll('.objective-constraint-row')).map((row, index) => {
+        const objective = row.querySelector('.objective-constraint-objective')?.value || '';
+        const operator = row.querySelector('.objective-constraint-operator')?.value || '';
+        const rawValue = row.querySelector('.objective-constraint-value')?.value;
+        const value = Number(rawValue);
+        if (!included.has(objective)) throw new Error(`Objective constraint ${index + 1} references an excluded objective.`);
+        if (!['>=', '<='].includes(operator)) throw new Error(`Objective constraint ${index + 1} has an invalid operator.`);
+        if (rawValue === '' || !Number.isFinite(value)) throw new Error(`Objective constraint ${index + 1} requires a finite number.`);
+        return { objective, operator, value };
+    });
+}
+
+export function clearObjectiveConstraints() {
+    ['bo', 'sa'].forEach(prefix => {
+        document.getElementById(`${prefix}-objective-constraints-list`)?.replaceChildren();
+    });
+}
+
 // Bind to window for inline HTML events
 window.addNumericalConstraintRow = addNumericalConstraintRow;
 window.validateNumericalConstraintRow = validateNumericalConstraintRow;
@@ -242,3 +352,7 @@ window.addConditionToRow = addConditionToRow;
 window.updateConditionValues = updateConditionValues;
 window.removeCondition = removeCondition;
 window.updateAllConstraintsDropdowns = updateAllConstraintsDropdowns;
+window.addObjectiveConstraintRow = addObjectiveConstraintRow;
+window.refreshObjectiveConstraintRows = refreshObjectiveConstraintRows;
+window.collectObjectiveConstraints = collectObjectiveConstraints;
+window.clearObjectiveConstraints = clearObjectiveConstraints;
