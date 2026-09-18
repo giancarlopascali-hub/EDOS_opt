@@ -1,4 +1,11 @@
-import { exportData, detectParetoIndices } from '../utils.js';
+import {
+    exportData,
+    detectParetoIndices,
+    wireSelectAll,
+    rebalanceObjectiveConfigs,
+    safeJson,
+    rangePlaceholderForType
+} from '../utils.js';
 import { updateAllConstraintsDropdowns } from './constraints.js';
 
 /**
@@ -7,46 +14,19 @@ import { updateAllConstraintsDropdowns } from './constraints.js';
  * @param {string} rowSelector - CSS selector for the row checkboxes
  * @param {function} syncFn   - called with the column name after each row toggle
  */
-function _wireSelectAll(headerId, rowSelector, syncFn) {
-    const header = document.getElementById(headerId);
-    if (!header) return;
-
-    /** Recomputes header state from the current row states */
-    const refreshHeader = () => {
-        const rows    = Array.from(document.querySelectorAll(rowSelector));
-        const total   = rows.length;
-        const checked = rows.filter(cb => cb.checked).length;
-        header.checked       = checked === total;
-        header.indeterminate = checked > 0 && checked < total;
-    };
-
-    // Header click → bulk toggle all rows
-    header.addEventListener('change', () => {
-        const rows = Array.from(document.querySelectorAll(rowSelector));
-        rows.forEach(cb => {
-            if (cb.checked !== header.checked) {
-                cb.checked = header.checked;
-                syncFn(cb.dataset.col);
-            }
-        });
-        header.indeterminate = false;
-    });
-
-    // Individual row click → update header state
-    document.querySelectorAll(rowSelector).forEach(cb => {
-        cb.addEventListener('change', refreshHeader);
-    });
-
-    // Set initial header state
-    refreshHeader();
+function collectBOObjectiveConstraints() {
+    return window.collectObjectiveConstraints?.('bo') || [];
 }
 
 // Returns the appropriate range-input placeholder for a given feature type.
-function getBOPlaceholder(type) {
-    if (type === 'regular')     return '[min, max]steps';
-    if (type === 'discrete')    return 'xx, yy, zz,...';
-    if (type === 'categorical') return 'A, B, C,...';
-    return '[min, max]';  // continuous (default)
+function renderBOFeasibilityStatus(status) {
+    document.getElementById('bo-feasibility-warning')?.remove();
+    if (!status || (!status.cold_start && status.all_likely_feasible !== false)) return;
+    const banner = document.createElement('div');
+    banner.id = 'bo-feasibility-warning';
+    banner.style.cssText = 'margin:0.75rem 0;padding:0.8rem 1rem;border-radius:8px;background:#fff7ed;border:1px solid #fdba74;color:#9a3412;font-weight:600;';
+    banner.textContent = status.message || '⚠️ The returned candidate has low predicted feasibility for one or more objective constraints.';
+    document.getElementById('bo-results-container')?.prepend(banner);
 }
 
 export function renderBOSetup() {
@@ -56,10 +36,10 @@ export function renderBOSetup() {
     let featuresHtml = '';
     window.currentColumns.filter(col => window.columnRoles[col] === 'feature').forEach(col => {
         const cfg = window.boFeatureConfigs[col] || { type: 'continuous', range: '', included: true };
-        const ph  = getBOPlaceholder(cfg.type);
+        const ph = rangePlaceholderForType(cfg.type);
         featuresHtml += `<tr>
             <td>${col}</td>
-            <td><select class="bo-f-type" data-col="${col}" onchange="window.syncBOFeatureConfig('${col}', 'type'); window.updatePlaceholder(this);">
+            <td><select class="bo-f-type" data-col="${col}" onchange="window.syncBOFeatureConfig('${col}', 'type')">
                 <option value="continuous" ${cfg.type === 'continuous' ? 'selected' : ''}>continuous</option>
                 <option value="regular"    ${cfg.type === 'regular'    ? 'selected' : ''}>regular</option>
                 <option value="discrete"   ${cfg.type === 'discrete'   ? 'selected' : ''}>discrete</option>
@@ -93,18 +73,30 @@ export function renderBOSetup() {
     updateAllConstraintsDropdowns('bo');
 
     // --- Select-all / deselect-all for BO Features ---
-    _wireSelectAll(
+    wireSelectAll(
         'bo-select-all-features',
         '#bo-features-list .bo-f-include',
-        col => window.syncBOFeatureConfig(col, 'include')
+        (columns, checked) => {
+            columns.forEach(col => {
+                if (window.boFeatureConfigs[col]) window.boFeatureConfigs[col].included = checked;
+            });
+            renderBOSetup();
+        }
     );
 
     // --- Select-all / deselect-all for BO Objectives ---
-    _wireSelectAll(
+    wireSelectAll(
         'bo-select-all-objectives',
         '#bo-objectives-list .bo-o-include',
-        col => window.syncObjectiveConfig(col, 'bo', 'include')
+        (columns, checked) => {
+            columns.forEach(col => {
+                if (window.objectiveConfigs[col]) window.objectiveConfigs[col].included = checked;
+            });
+            rebalanceObjectiveConfigs();
+            renderBOSetup();
+        }
     );
+    window.refreshObjectiveConstraintRows?.('bo');
 }
 
 
@@ -184,6 +176,14 @@ export async function runBO() {
         })
         .filter(conds => conds.length > 0);
 
+    let objectiveConstraints;
+    try {
+        objectiveConstraints = collectBOObjectiveConstraints();
+    } catch (error) {
+        alert(error.message);
+        return;
+    }
+
     const tweaks = {
         batch_size:            document.getElementById('batch-size').value,
         acq_type:              document.getElementById('acq-type-select').value,
@@ -195,7 +195,8 @@ export async function runBO() {
         constraints: {
             numerical: numericalConstraints,
             disallowed: disallowedCombinations
-        }
+        },
+        objective_constraints: objectiveConstraints
     };
 
     document.getElementById('loading-text').textContent = "Optimizing...";
@@ -209,7 +210,7 @@ export async function runBO() {
             body: JSON.stringify({ data: window.currentData, columns: window.currentColumns, features, objectives, tweaks }),
             signal: window.currentAbortController.signal
         });
-        const result = await res.json();
+        const result = await safeJson(res);
         document.getElementById('loading-overlay').classList.add('hidden');
         if (result.error) return alert("Optimization Error: " + result.error);
 
@@ -220,6 +221,7 @@ export async function runBO() {
         }
 
         window.suggestionsData = result.suggestions;
+        renderBOFeasibilityStatus(result.constraint_status);
 
         if (result.performance) renderBOPerformanceTable(result.performance);
         renderBOEstimator();
@@ -439,9 +441,17 @@ export async function runBOEstimate() {
         }));
 
     const strategy = document.querySelector('input[name="bo-strategy"]:checked').value;
+    let objectiveConstraints;
+    try {
+        objectiveConstraints = collectBOObjectiveConstraints();
+    } catch (error) {
+        document.getElementById('bo-estimate-results').textContent = error.message;
+        return;
+    }
     const tweaks   = {
         kernel:                document.getElementById('kernel-select').value,
-        optimization_strategy: strategy
+        optimization_strategy: strategy,
+        objective_constraints: objectiveConstraints
     };
 
     const resultsDiv = document.getElementById('bo-estimate-results');
@@ -453,7 +463,7 @@ export async function runBOEstimate() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ data: window.currentData, columns: window.currentColumns, features, objectives, tweaks, inputs })
         });
-        const result = await res.json();
+        const result = await safeJson(res);
         if (result.error) {
             resultsDiv.innerHTML = `<span style="color:red">Error: ${result.error}</span>`;
             return;
@@ -466,9 +476,13 @@ export async function runBOEstimate() {
             const val  = result.predictions[obj];
             const err  = result.std_errors ? result.std_errors[obj] : null;
             const succ = result.success_scores[obj];
+            const violation = (result.violations || []).find(item => item.objective === obj);
+            const violationBadge = violation
+                ? `<span title="Predicted ${violation.predicted ?? 'N/A'} violates ${violation.operator} ${violation.limit}" style="display:inline-block;margin-left:6px;color:#b91c1c;font-weight:700;">🚫 Violated: ${violation.operator} ${violation.limit}</span>`
+                : '';
             const errBadge = (err !== null && err !== undefined) ? `<span style="font-size: 0.85rem; color: var(--text-secondary); margin-left: 4px;">(&plusmn; ${err})</span>` : '';
             html += `<div style="display: flex; justify-content: space-between; align-items: center; margin: 4px 0;">
-                        <span><b>${obj}:</b> ${val}${errBadge}</span>
+                        <span><b>${obj}:</b> ${val}${errBadge}${violationBadge}</span>
                         <span style="color: ${succ > 80 ? '#22c55e' : (succ > 50 ? '#f59e0b' : '#ef4444')}">Success: ${succ}%</span>
                      </div>`;
         }
@@ -1342,7 +1356,10 @@ window.syncBOFeatureConfig = (col, field) => {
     const tr = document.querySelector(`.bo-f-type[data-col="${col}"]`)?.closest('tr');
     if (!tr || !window.boFeatureConfigs[col]) return;
 
-    if (field === 'type'    || !field) window.boFeatureConfigs[col].type     = tr.querySelector('.bo-f-type').value;
+    if (field === 'type' || !field) {
+        window.boFeatureConfigs[col].type = tr.querySelector('.bo-f-type').value;
+        window.updateRangePlaceholder?.(window.boFeatureConfigs[col].type, tr.querySelector('.bo-f-range'));
+    }
     if (field === 'range'   || !field) window.boFeatureConfigs[col].range    = tr.querySelector('.bo-f-range').value;
     if (field === 'include' || !field) window.boFeatureConfigs[col].included = tr.querySelector('.bo-f-include').checked;
     updateAllConstraintsDropdowns('bo');

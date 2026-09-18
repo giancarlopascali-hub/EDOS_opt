@@ -332,6 +332,19 @@
                         <thead><tr><th>Name</th><th>Type</th><th>Target</th><th>Importance (%)</th><th><input type="checkbox" id="bo-select-all-objectives" title="Select / deselect all objectives" style="margin-right:4px;cursor:pointer;"><span>Include</span></th></tr></thead>
                         <tbody id="bo-objectives-list"></tbody>
                     </table>
+                    <details class="constraints-collapsible" style="margin-top: 1.5rem;">
+                        <summary class="constraints-toggle">
+                            <span class="constraints-toggle-label">Objective Constraints</span>
+                            <span class="constraints-chevron">&#8250;</span>
+                        </summary>
+                        <div class="constraints-body">
+                            <table class="setup-table">
+                                <thead><tr><th>Objective</th><th>Operator</th><th>Value</th><th></th></tr></thead>
+                                <tbody id="bo-objective-constraints-list"></tbody>
+                            </table>
+                            <button type="button" class="btn secondary small" onclick="window.addObjectiveConstraintRow('bo')">+ Add Objective Constraint</button>
+                        </div>
+                    </details>
                 </div>
                 <div id="bo-tweaks-tab" class="tab-content hidden">
                     <div class="tweak-grid">
@@ -432,6 +445,19 @@
                         <thead><tr><th>Name</th><th>Type</th><th>Target</th><th>Importance (%)</th><th><input type="checkbox" id="sa-select-all-objectives" title="Select / deselect all objectives" style="margin-right:4px;cursor:pointer;"><span>Include</span></th></tr></thead>
                         <tbody id="sa-objectives-list"></tbody>
                     </table>
+                    <details class="constraints-collapsible" style="margin-top: 1.5rem;">
+                        <summary class="constraints-toggle">
+                            <span class="constraints-toggle-label">Objective Constraints</span>
+                            <span class="constraints-chevron">&#8250;</span>
+                        </summary>
+                        <div class="constraints-body">
+                            <table class="setup-table">
+                                <thead><tr><th>Objective</th><th>Operator</th><th>Value</th><th></th></tr></thead>
+                                <tbody id="sa-objective-constraints-list"></tbody>
+                            </table>
+                            <button type="button" class="btn secondary small" onclick="window.addObjectiveConstraintRow('sa')">+ Add Objective Constraint</button>
+                        </div>
+                    </details>
                 </div>
                 <div id="sa-tweaks-tab" class="tab-content hidden">
                     <div class="tweak-grid">
@@ -464,6 +490,22 @@
             </section>
             <div class="run-container">
                 <button id="sa-run-btn" class="btn primary x-large">Run the Statistical Analysis</button>
+            </div>
+
+            <div id="sa-progress-container" class="hidden" style="margin: 1.5rem auto; max-width: 650px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 1.25rem; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                    <span id="sa-status-text" style="font-size: 0.9rem; font-weight: 600; color: #1e293b;">Preparing analysis...</span>
+                    <span id="sa-timer-text" style="font-size: 0.85rem; font-weight: 600; color: var(--accent-color, #3b82f6);">0s</span>
+                </div>
+                <div style="width: 100%; height: 10px; background: #f1f5f9; border-radius: 6px; overflow: hidden; position: relative;">
+                    <div id="sa-progress-bar" style="width: 0; height: 100%; background: linear-gradient(90deg, #3b82f6, #60a5fa); border-radius: 6px; transition: width 0.4s ease;"></div>
+                </div>
+                <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #94a3b8; margin-top: 0.4rem;">
+                    <span>Metrics</span><span>Interactions</span><span>Model fitting</span><span>SHAP</span>
+                </div>
+                <div style="display:flex; justify-content:flex-end; margin-top:0.9rem;">
+                    <button id="sa-abort-btn" type="button" class="btn secondary small" style="color:var(--danger-color); border-color:var(--danger-color);">⏹ Abort</button>
+                </div>
             </div>
 
             <!-- SA Results overhauled -->

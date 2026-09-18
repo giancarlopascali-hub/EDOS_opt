@@ -1,7 +1,15 @@
 export function safeAddListener(id, event, callback) {
     const el = document.getElementById(id);
-    if (el) el.addEventListener(event, callback);
-    else console.warn(`Element with ID "${id}" not found. skipping listener.`);
+    if (!el) {
+        console.warn(`Element with ID "${id}" not found. skipping listener.`);
+        return;
+    }
+    if (!el._safeListeners) el._safeListeners = {};
+    if (el._safeListeners[event]) {
+        el.removeEventListener(event, el._safeListeners[event]);
+    }
+    el._safeListeners[event] = callback;
+    el.addEventListener(event, callback);
 }
 
 export function exportData(data, columns) {
@@ -57,14 +65,10 @@ export function detectParetoIndices(data, objCols) {
 
 export function rebalanceRemaining(changedIdOrEl, newValue, selector) {
     const inputs = Array.from(document.querySelectorAll(selector));
-    let activeInputs = inputs;
-
-    if (selector.includes('bo') || selector.includes('sa')) {
-        activeInputs = inputs.filter(el => {
-            const col = el.dataset.col;
-            return window.objectiveConfigs[col] && window.objectiveConfigs[col].included;
-        });
-    }
+    const activeInputs = inputs.filter(el => {
+        const col = el.dataset.col;
+        return !window.objectiveConfigs || !window.objectiveConfigs[col] || window.objectiveConfigs[col].included !== false;
+    });
 
     if (activeInputs.length <= 1) {
         if (activeInputs.length === 1) activeInputs[0].value = (100).toFixed(1);
@@ -87,8 +91,8 @@ export function rebalanceRemaining(changedIdOrEl, newValue, selector) {
         let changedVal = Math.round(parseFloat(newValue) * 10) || 0;
         if (sumAbove + changedVal > total) {
             changedVal = Math.max(0, total - sumAbove);
-            activeInputs[changedIdx].value = (changedVal / 10).toFixed(1);
         }
+        activeInputs[changedIdx].value = (changedVal / 10).toFixed(1);
         const remainingForBelow = total - sumAbove - changedVal;
         const belowRows = activeInputs.slice(changedIdx + 1);
         const share     = Math.floor(remainingForBelow / belowRows.length);
@@ -102,7 +106,8 @@ export function rebalanceRemaining(changedIdOrEl, newValue, selector) {
         });
     } else {
         let changedVal = Math.round(parseFloat(newValue) * 10) || 0;
-        if (changedVal > total) { changedVal = total; activeInputs[changedIdx].value = (100).toFixed(1); }
+        if (changedVal > total) changedVal = total;
+        activeInputs[changedIdx].value = (changedVal / 10).toFixed(1);
 
         const remainderForAbove = total - changedVal;
         const aboveRows = activeInputs.slice(0, changedIdx);
@@ -141,3 +146,58 @@ export function rebalanceObjectiveConfigs() {
         }
     });
 }
+
+/** Parse a fetch Response as JSON and produce a readable error for proxy failures. */
+export async function safeJson(response) {
+    const text = await response.text();
+    try {
+        return JSON.parse(text);
+    } catch (_) {
+        const status = response.status;
+        if (status === 413) return { error: 'The dataset is too large for the server to process in a single request. Try reducing the number of rows or columns.' };
+        if (status === 504 || status === 502) return { error: `Gateway/Timeout error (HTTP ${status}): The calculation timed out on the server.` };
+        if (status === 500) return { error: 'Server error (HTTP 500): The calculation crashed or exceeded available memory. Check server console for details.' };
+        return { error: `Server response error (HTTP ${status}): The server returned an unexpected response.` };
+    }
+}
+
+export function updateRangePlaceholder(typeValue, rangeInput) {
+    if (!rangeInput) return;
+    rangeInput.placeholder = rangePlaceholderForType(typeValue);
+}
+
+export function rangePlaceholderForType(typeValue) {
+    if (typeValue === 'regular') return '[min, max]steps';
+    if (typeValue === 'discrete') return 'xx, yy, zz,...';
+    if (typeValue === 'categorical') return 'A, B, C,...';
+    return '[min, max]';
+}
+window.updateRangePlaceholder = updateRangePlaceholder;
+
+export function wireSelectAll(headerId, rowSelector, syncFn) {
+    const header = document.getElementById(headerId);
+    if (!header) return;
+    const refreshHeader = () => {
+        const rows = Array.from(document.querySelectorAll(rowSelector));
+        const checked = rows.filter(cb => cb.checked).length;
+        header.checked = rows.length > 0 && checked === rows.length;
+        header.indeterminate = checked > 0 && checked < rows.length;
+    };
+    header.onchange = () => {
+        const changedColumns = [];
+        document.querySelectorAll(rowSelector).forEach(cb => {
+            if (cb.checked !== header.checked) {
+                cb.checked = header.checked;
+                changedColumns.push(cb.dataset.col);
+            }
+        });
+        if (changedColumns.length > 0) syncFn(changedColumns, header.checked);
+        header.indeterminate = false;
+    };
+    document.querySelectorAll(rowSelector).forEach(cb => {
+        cb.removeEventListener('change', refreshHeader);
+        cb.addEventListener('change', refreshHeader);
+    });
+    refreshHeader();
+}
+window.wireSelectAll = wireSelectAll;

@@ -1,8 +1,8 @@
 import './state.js';
-import { safeAddListener, exportData, detectParetoIndices, rebalanceRemaining, rebalanceObjectiveConfigs } from './utils.js';
+import { safeAddListener, exportData, detectParetoIndices, rebalanceRemaining, rebalanceObjectiveConfigs, updateRangePlaceholder } from './utils.js';
 import { runDoE, renderDoEResults, rebalanceDoEDOM, attachDeleteEvents } from './modules/doe.js';
 import { renderBOSetup, runBO, runBOEstimate, renderTrendPlot, renderParetoPlot, updateAcqSelectForMultiObj } from './modules/bo.js';
-import { renderSASetup, runSA, runEstimate, exportSAReport } from './modules/sa.js';
+import { renderSASetup, runSA, runEstimate, exportSAReport, abortSA } from './modules/sa.js';
 import { updateAllConstraintsDropdowns } from './modules/constraints.js';
 
 // Bind utilities to window for inline calls
@@ -37,10 +37,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         document.getElementById('loading-overlay').classList.add('hidden');
     });
+    safeAddListener('sa-abort-btn', 'click', abortSA);
 
     // Clear Data button listener
     safeAddListener('clear-data-btn', 'click', () => {
         if (confirm('Are you sure you want to clear all loaded data and reset the module configurations? This cannot be undone.')) {
+            abortSA();
+            window.clearObjectiveConstraints?.();
             window.currentData      = null;
             window.currentColumns   = [];
             window.columnRoles      = {};
@@ -210,6 +213,8 @@ function initFileUpload() {
 
 async function handleFiles(files) {
     if (files.length === 0) return;
+    abortSA();
+    window.clearObjectiveConstraints?.();
     const formData = new FormData();
     formData.append('file', files[0]);
 
@@ -808,9 +813,5 @@ window.toggleRowTarget = (select) => {
 window.updatePlaceholder = (select) => {
     const tr    = select.closest('tr');
     const input = tr.querySelector('.doe-f-range, .bo-f-range');
-    const type  = select.value;
-    if      (type === 'continuous')  input.placeholder = '[min, max]';
-    else if (type === 'regular')     input.placeholder = '[min, max]steps';
-    else if (type === 'discrete')    input.placeholder = 'xx, yy, zz,...';
-    else if (type === 'categorical') input.placeholder = 'A, B, C,...';
+    updateRangePlaceholder(select.value, input);
 };
