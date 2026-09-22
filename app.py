@@ -64,7 +64,7 @@ if __name__ == '__main__':
     url  = f"http://127.0.0.1:{port}"
 
     print(f"\n" + "=" * 40)
-    print(f"       EDOS v6.1 STANDALONE")
+    print(f"       EDOS v7.1 STANDALONE")
     print(f"=" * 40)
     print(f"Server is starting...")
     print(f"Local URL: {url}")
