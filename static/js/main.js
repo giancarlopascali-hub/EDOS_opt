@@ -211,6 +211,24 @@ function initFileUpload() {
     }
 }
 
+// A value is numeric only when its complete trimmed representation is finite.
+// parseFloat('10 mg') returns 10, which would incorrectly classify labels that
+// begin with a number as continuous features.
+function detectColumnIsNumeric(vals) {
+    return vals.length > 0 && vals.every(v => {
+        const text = String(v).trim();
+        return text !== '' && Number.isFinite(Number(text));
+    });
+}
+
+function computeColumnNumericRange(vals) {
+    const numericVals = vals.map(v => Number(String(v).trim()));
+    return {
+        min: Math.min(...numericVals),
+        max: Math.max(...numericVals)
+    };
+}
+
 async function handleFiles(files) {
     if (files.length === 0) return;
     abortSA();
@@ -248,9 +266,8 @@ async function handleFiles(files) {
         window.currentColumns.forEach((col, idx) => {
             if (window.columnRoles[col] === 'feature') {
                 const vals  = window.currentData.map(r => r[idx]).filter(v => v != null && v !== '');
-                const isNum = vals.every(v => !isNaN(parseFloat(v)));
-                const min   = vals.length ? Math.min(...vals.map(v => parseFloat(v))) : 0;
-                const max   = vals.length ? Math.max(...vals.map(v => parseFloat(v))) : 1;
+                const isNum = detectColumnIsNumeric(vals);
+                const { min = 0, max = 1 } = isNum ? computeColumnNumericRange(vals) : {};
                 const range = isNum ? `[${min}, ${max}]` : [...new Set(vals)].join(', ');
 
                 window.boFeatureConfigs[col] = { type: isNum ? 'continuous' : 'categorical', range, included: true };
@@ -315,9 +332,8 @@ window.toggleColumnRole = (colName) => {
     if (newRole === 'feature') {
         const idx   = window.currentColumns.indexOf(colName);
         const vals  = window.currentData.map(r => r[idx]).filter(v => v != null && v !== '');
-        const isNum = vals.every(v => !isNaN(parseFloat(v)));
-        const min   = vals.length ? Math.min(...vals.map(v => parseFloat(v))) : 0;
-        const max   = vals.length ? Math.max(...vals.map(v => parseFloat(v))) : 1;
+        const isNum = detectColumnIsNumeric(vals);
+        const { min = 0, max = 1 } = isNum ? computeColumnNumericRange(vals) : {};
         const range = isNum ? `[${min}, ${max}]` : [...new Set(vals)].join(', ');
 
         if (!window.boFeatureConfigs[colName]) window.boFeatureConfigs[colName] = { type: isNum ? 'continuous' : 'categorical', range, included: true };
