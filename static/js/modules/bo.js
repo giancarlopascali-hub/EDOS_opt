@@ -4,7 +4,9 @@ import {
     wireSelectAll,
     rebalanceObjectiveConfigs,
     safeJson,
-    rangePlaceholderForType
+    rangePlaceholderForType,
+    submitAndPollJob,
+    cancelBackgroundJob
 } from '../utils.js';
 import { updateAllConstraintsDropdowns } from './constraints.js';
 
@@ -495,18 +497,62 @@ export async function runBOEstimate() {
 
 export function initBOVisualizationDropdown() {
     const visSelect = document.getElementById('bo-vis-type-select');
-    if (!visSelect || visSelect.dataset.initialized) return;
-    visSelect.dataset.initialized = 'true';
-
-    visSelect.addEventListener('change', () => {
-        renderBOVisualization();
-    });
+    if (visSelect && !visSelect.dataset.initialized) {
+        visSelect.dataset.initialized = 'true';
+        visSelect.addEventListener('change', () => renderBOVisualization());
+    }
+    const cancelButton = document.getElementById('bo-plot-cancel-btn');
+    if (cancelButton && !cancelButton.dataset.initialized) {
+        cancelButton.dataset.initialized = 'true';
+        cancelButton.addEventListener('click', () => cancelActiveBOPlot({ showMessage: true }));
+    }
 }
 
 let currentSurfaceRequestId = 0;
 let currentSurfaceAbortController = null;
+let currentSurfaceJobId = null;
+let currentSurfaceCancellation = null;
+const BO_SURFACE_MAX_ROWS = 650;
+
+function setBOPlotCancelEnabled(enabled) {
+    const button = document.getElementById('bo-plot-cancel-btn');
+    if (!button) return;
+    button.disabled = !enabled;
+    button.classList.toggle('hidden', !enabled);
+}
+
+async function cancelActiveBOPlot({ showMessage = false } = {}) {
+    const controller = currentSurfaceAbortController;
+    const jobId = currentSurfaceJobId;
+    currentSurfaceRequestId += 1;
+    if (controller) controller.abort();
+    currentSurfaceAbortController = null;
+    setBOPlotCancelEnabled(false);
+    if (jobId && !currentSurfaceCancellation) {
+        const cancellation = cancelBackgroundJob(jobId, { waitForTerminal: true }).finally(() => {
+            if (currentSurfaceCancellation === cancellation) {
+                currentSurfaceCancellation = null;
+                if (currentSurfaceJobId === jobId) currentSurfaceJobId = null;
+            }
+        });
+        currentSurfaceCancellation = cancellation;
+    }
+    if (currentSurfaceCancellation) await currentSurfaceCancellation;
+    if (showMessage) {
+        const plot = document.getElementById('bo-vis-type-select')?.value === 'surface'
+            ? document.getElementById('bo-surface-plot') : document.getElementById('bo-contour-plot');
+        if (plot) plot.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#64748b;font-style:italic;">Plot calculation cancelled.</div>';
+    }
+}
+
+function showBOSurfaceRowLimitWarning(plotContainer) {
+    if (!plotContainer) return;
+    try { Plotly.purge(plotContainer); } catch (e) {}
+    plotContainer.innerHTML = `<div style="margin:1rem;padding:1rem;border:1px solid #f59e0b;border-radius:8px;background:#fffbeb;color:#92400e;line-height:1.5;"><b>Plot not created.</b> BO contour and 3D plots are limited to ${BO_SURFACE_MAX_ROWS.toLocaleString()} dataset rows for reliable completion. This dataset has ${(window.currentData?.length || 0).toLocaleString()} rows. Filter or reduce the dataset, then try again.</div>`;
+}
 
 export function renderBOVisualization() {
+    cancelActiveBOPlot();
     if (!window.currentData || window.currentData.length === 0) {
         try {
             Plotly.purge('trend-plot');
@@ -838,6 +884,41 @@ function renderSurfaceControls() {
     return true;
 }
 
+async function calculateBOPlot(payload, plotContainer, message) {
+    await cancelActiveBOPlot();
+    const controller = new AbortController();
+    const requestId = ++currentSurfaceRequestId;
+    let jobId = null;
+    currentSurfaceAbortController = controller;
+    setBOPlotCancelEnabled(false);
+    plotContainer.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;min-height:300px;color:#64748b;gap:0.75rem;"><div class="spinner" style="width:24px;height:24px;margin:0;"></div><span>${message}</span></div>`;
+    try {
+        const completed = await submitAndPollJob('/bo_surface_submit', payload, {
+            signal: controller.signal,
+            onProgress: (status, submittedJobId) => {
+                jobId = submittedJobId;
+                if (requestId !== currentSurfaceRequestId) {
+                    cancelBackgroundJob(submittedJobId);
+                    return;
+                }
+                currentSurfaceJobId = submittedJobId;
+                setBOPlotCancelEnabled(true);
+                if (status.phase) {
+                    plotContainer.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;min-height:300px;color:#64748b;gap:0.75rem;"><div class="spinner" style="width:24px;height:24px;margin:0;"></div><span>${status.phase}…</span></div>`;
+                }
+            }
+        });
+        return requestId === currentSurfaceRequestId ? completed.result : null;
+    } finally {
+        if (controller.signal.aborted) await cancelBackgroundJob(jobId);
+        if (currentSurfaceAbortController === controller) {
+            currentSurfaceAbortController = null;
+            currentSurfaceJobId = null;
+            setBOPlotCancelEnabled(false);
+        }
+    }
+}
+
 async function updateContourPlot() {
     const xFeat = document.getElementById('bo-contour-x')?.value;
     const yFeat = document.getElementById('bo-contour-y')?.value;
@@ -846,6 +927,10 @@ async function updateContourPlot() {
     const plotContainer = document.getElementById('bo-contour-plot');
 
     if (!xFeat || !yFeat || !colorObj || !plotContainer) return;
+    if ((window.currentData?.length || 0) > BO_SURFACE_MAX_ROWS) {
+        showBOSurfaceRowLimitWarning(plotContainer);
+        return;
+    }
     if (xFeat === yFeat) {
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ef4444;font-style:italic;">Please select two distinct features for X and Y axes.</div>';
@@ -895,42 +980,13 @@ async function updateContourPlot() {
         kernel: document.getElementById('kernel-select')?.value || 'matern52'
     };
 
-    // Cancel any previous active request
-    if (currentSurfaceAbortController) {
-        try { currentSurfaceAbortController.abort(); } catch(e) {}
-    }
-    currentSurfaceAbortController = new AbortController();
-    const thisRequestId = ++currentSurfaceRequestId;
-
-    // Silent background computation — no spinner injected into DOM
     try {
-        const response = await fetch('/bo_surface', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: currentSurfaceAbortController.signal,
-            body: JSON.stringify({
-                data: window.currentData,
-                columns: window.currentColumns,
-                features,
-                objectives,
-                tweaks,
-                x_feat: xFeat,
-                y_feat: yFeat,
-                z_axis: effectiveColorObj,
-                color_obj: effectiveColorObj,
-                fixed_values: fixedValues,
-                resolution: res
-            })
-        });
-
-        if (thisRequestId !== currentSurfaceRequestId) return;
-
-        const result = await response.json();
-        if (result.error) {
-            try { Plotly.purge(plotContainer); } catch(e) {}
-            plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Contour calculation error: ${result.error}</div>`;
-            return;
-        }
+        const result = await calculateBOPlot({
+            data: window.currentData, columns: window.currentColumns, features, objectives, tweaks,
+            x_feat: xFeat, y_feat: yFeat, z_axis: effectiveColorObj, color_obj: effectiveColorObj,
+            fixed_values: fixedValues, resolution: res
+        }, plotContainer, 'Computing response surface');
+        if (!result) return;
 
         const contourTrace = {
             x: result.x,
@@ -999,7 +1055,6 @@ async function updateContourPlot() {
 
     } catch (err) {
         if (err.name === 'AbortError') return;
-        if (thisRequestId !== currentSurfaceRequestId) return;
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate contour: ${err.message}</div>`;
         console.error(err);
@@ -1015,6 +1070,10 @@ async function updateSurfacePlot() {
     const plotContainer = document.getElementById('bo-surface-plot');
 
     if (!xFeat || !yFeat || !colorObj || !plotContainer) return;
+    if ((window.currentData?.length || 0) > BO_SURFACE_MAX_ROWS) {
+        showBOSurfaceRowLimitWarning(plotContainer);
+        return;
+    }
     if (xFeat === yFeat) {
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#ef4444;font-style:italic;">Please select two distinct features for X and Y axes.</div>';
@@ -1067,42 +1126,13 @@ async function updateSurfacePlot() {
         kernel: document.getElementById('kernel-select')?.value || 'matern52'
     };
 
-    // Cancel any previous active request
-    if (currentSurfaceAbortController) {
-        try { currentSurfaceAbortController.abort(); } catch(e) {}
-    }
-    currentSurfaceAbortController = new AbortController();
-    const thisRequestId = ++currentSurfaceRequestId;
-
-    // Silent background computation — no spinner injected into DOM
     try {
-        const response = await fetch('/bo_surface', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: currentSurfaceAbortController.signal,
-            body: JSON.stringify({
-                data: window.currentData,
-                columns: window.currentColumns,
-                features,
-                objectives,
-                tweaks,
-                x_feat: xFeat,
-                y_feat: yFeat,
-                z_axis: effectiveZAxis,
-                color_obj: effectiveColorObj,
-                fixed_values: fixedValues,
-                resolution: res
-            })
-        });
-
-        if (thisRequestId !== currentSurfaceRequestId) return;
-
-        const result = await response.json();
-        if (result.error) {
-            try { Plotly.purge(plotContainer); } catch(e) {}
-            plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Surface calculation error: ${result.error}</div>`;
-            return;
-        }
+        const result = await calculateBOPlot({
+            data: window.currentData, columns: window.currentColumns, features, objectives, tweaks,
+            x_feat: xFeat, y_feat: yFeat, z_axis: effectiveZAxis, color_obj: effectiveColorObj,
+            fixed_values: fixedValues, resolution: res
+        }, plotContainer, 'Generating 3D response surface');
+        if (!result) return;
 
         const surfaceTrace = {
             x: result.x,
@@ -1175,7 +1205,6 @@ async function updateSurfacePlot() {
 
     } catch (err) {
         if (err.name === 'AbortError') return;
-        if (thisRequestId !== currentSurfaceRequestId) return;
         try { Plotly.purge(plotContainer); } catch(e) {}
         plotContainer.innerHTML = `<div style="color:red;padding:1rem;">Failed to calculate surface: ${err.message}</div>`;
         console.error(err);

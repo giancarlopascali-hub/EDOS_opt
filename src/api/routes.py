@@ -1,15 +1,25 @@
 import os
 import sys
-import threading
 import time
-import uuid
 import torch
 import pandas as pd
 from flask import Blueprint, request, jsonify, render_template
 
 # Import core modules
 from src.core.doe import generate_doe
-from src.core.bo import run_bo_optimization, run_bo_estimation, run_bo_surface
+from src.core.bo import (
+    SurfaceCalculationCancelled,
+    run_bo_optimization,
+    run_bo_estimation,
+    run_bo_surface,
+)
+from src.api.jobs import (
+    cancel_background_job,
+    get_background_job_response,
+    get_cancel_event,
+    queue_background_job,
+    update_background_job,
+)
 from src.core.sa import run_sa, estimate_sa, AnalysisCancelled
 from src.core.constraints import (
     validate_feature_constraints,
@@ -32,27 +42,17 @@ try:
 except Exception:
     pass
 
-_SA_JOBS = {}
-_SA_JOBS_LOCK = threading.Lock()
-_SA_JOB_TTL_SECONDS = 3600
+BO_SURFACE_MAX_ROWS = 650
 
 
-def _cleanup_sa_jobs():
-    cutoff = time.time() - _SA_JOB_TTL_SECONDS
-    with _SA_JOBS_LOCK:
-        expired = [
-            job_id for job_id, job in _SA_JOBS.items()
-            if job.get('finished_at', float('inf')) < cutoff
-        ]
-        for job_id in expired:
-            _SA_JOBS.pop(job_id, None)
-
-
-def _update_sa_job(job_id, **updates):
-    with _SA_JOBS_LOCK:
-        job = _SA_JOBS.get(job_id)
-        if job is not None:
-            job.update(updates)
+def _validate_bo_surface_row_count(data):
+    """Protect the local exact-GP surface calculation from huge datasets."""
+    if isinstance(data, list) and len(data) > BO_SURFACE_MAX_ROWS:
+        raise ValueError(
+            f'BO response-surface plots are limited to {BO_SURFACE_MAX_ROWS:,} '
+            f'dataset rows for reliable completion; this dataset has {len(data):,}. '
+            'Filter or reduce the dataset before creating a contour or 3D plot.'
+        )
 
 
 def _validated_tweaks(raw_tweaks, features_config, objectives_config=None):
@@ -116,16 +116,14 @@ def _format_sa_result(sa_output):
 
 
 def _run_sa_job(job_id, payload):
-    with _SA_JOBS_LOCK:
-        job = _SA_JOBS.get(job_id)
-        if job is None:
-            return
-        cancel_event = job['cancel_event']
+    cancel_event = get_cancel_event(job_id)
+    if cancel_event is None:
+        return
 
     def progress_callback(phase, percent):
-        _update_sa_job(job_id, phase=phase, percent=percent, updated_at=time.time())
+        update_background_job(job_id, phase=phase, percent=percent)
 
-    _update_sa_job(
+    update_background_job(
         job_id, status='running', phase='Preparing analysis', percent=1,
         started_at=time.time()
     )
@@ -139,21 +137,73 @@ def _run_sa_job(job_id, payload):
             progress_callback=progress_callback,
             cancel_event=cancel_event,
         )
-        _update_sa_job(
+        update_background_job(
             job_id, status='completed', phase='Completed', percent=100,
             result=_format_sa_result(output), finished_at=time.time()
         )
     except AnalysisCancelled as exc:
-        _update_sa_job(
+        update_background_job(
             job_id, status='cancelled', phase='Cancelled', error=str(exc),
             finished_at=time.time()
         )
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        _update_sa_job(
+        update_background_job(
             job_id, status='failed', phase='Failed', error=str(exc),
             finished_at=time.time()
+        )
+
+
+def _run_bo_surface_job(job_id, payload):
+    cancel_event = get_cancel_event(job_id)
+    if cancel_event is None:
+        return
+    update_background_job(
+        job_id, status='running', phase='Preparing response surface', percent=5,
+        started_at=time.time(),
+    )
+    try:
+        dataframe = pd.DataFrame(payload['data'], columns=payload['columns'])
+        if dataframe.empty:
+            raise ValueError('Cannot generate surface with no data points.')
+        result = run_bo_surface(
+            df=dataframe,
+            features_config=payload['features'],
+            objectives_config=payload['objectives'],
+            tweaks=payload['tweaks'],
+            x_feat=payload.get('x_feat'),
+            y_feat=payload.get('y_feat'),
+            z_axis=payload.get('z_axis'),
+            color_obj=payload.get('color_obj'),
+            fixed_values=payload.get('fixed_values', {}),
+            resolution=payload.get('resolution', 25),
+            device=DEVICE,
+            compute_device=COMPUTE_DEVICE,
+            cancel_event=cancel_event,
+            progress_callback=lambda phase, percent: update_background_job(
+                job_id, status='running', phase=phase, percent=percent,
+            ),
+        )
+        if cancel_event.is_set():
+            raise SurfaceCalculationCancelled(
+                'Response-surface calculation cancelled by user.'
+            )
+        update_background_job(
+            job_id, status='completed', phase='Completed', percent=100,
+            result=clean_json_data(result), finished_at=time.time(),
+        )
+    except SurfaceCalculationCancelled as exc:
+        update_background_job(
+            job_id, status='cancelled', phase='Cancelled', error=str(exc),
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        update_background_job(
+            job_id, status='failed', phase='Failed', error=str(exc),
+            finished_at=time.time(),
         )
 
 
@@ -379,11 +429,56 @@ def bo_surface():
         return jsonify({'error': str(e)}), 500
 
 
+@api_bp.route('/bo_surface_submit', methods=['POST'])
+def bo_surface_submit():
+    """Queue a cancellable BO response-surface calculation."""
+    try:
+        req_data = request.get_json() or {}
+        data = req_data.get('data')
+        columns = req_data.get('columns')
+        features = req_data.get('features', [])
+        objectives = req_data.get('objectives', [])
+        if not isinstance(data, list) or not isinstance(columns, list):
+            return jsonify({'error': 'A valid dataset and columns are required.'}), 400
+        _validate_bo_surface_row_count(data)
+        if len(features) < 2 or not objectives:
+            return jsonify({'error': 'At least two features and one objective are required.'}), 400
+        tweaks = _validated_tweaks(req_data.get('tweaks', {}), features, objectives)
+        payload = {
+            'data': data,
+            'columns': columns,
+            'features': features,
+            'objectives': objectives,
+            'x_feat': req_data.get('x_feat'),
+            'y_feat': req_data.get('y_feat'),
+            'z_axis': req_data.get('z_axis'),
+            'color_obj': req_data.get('color_obj'),
+            'fixed_values': req_data.get('fixed_values', {}),
+            'resolution': req_data.get('resolution', 25),
+            'tweaks': tweaks,
+        }
+        job_id = queue_background_job(
+            'bo-surface', payload, _run_bo_surface_job,
+            'Queued response surface',
+        )
+        if job_id is None:
+            return jsonify({
+                'error': 'Another analysis job is already running. '
+                         'Wait for it to finish or cancel it first.'
+            }), 429
+        return jsonify({'job_id': job_id, 'status': 'queued'}), 202
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(exc)}), 500
+
+
 @api_bp.route('/sa_submit', methods=['POST'])
 def submit_sa_job():
     """Queue a long-running SA calculation and return immediately."""
     try:
-        _cleanup_sa_jobs()
         req_data = request.get_json() or {}
         features_config = req_data.get('features', [])
         objectives_config = req_data.get('objectives', [])
@@ -397,27 +492,6 @@ def submit_sa_job():
             req_data.get('tweaks', {}), features_config, objectives_config
         )
 
-        max_jobs = max(1, int(os.environ.get('SA_MAX_CONCURRENT_JOBS', '1')))
-        with _SA_JOBS_LOCK:
-            active_jobs = sum(
-                job.get('status') in ('queued', 'running', 'cancelling')
-                for job in _SA_JOBS.values()
-            )
-            if active_jobs >= max_jobs:
-                return jsonify({
-                    'error': 'Another statistical analysis is already running. '
-                             'Wait for it to finish or cancel it first.'
-                }), 429
-            job_id = str(uuid.uuid4())
-            _SA_JOBS[job_id] = {
-                'status': 'queued',
-                'phase': 'Queued',
-                'percent': 0,
-                'created_at': time.time(),
-                'updated_at': time.time(),
-                'cancel_event': threading.Event(),
-            }
-
         payload = {
             'data': data,
             'columns': columns,
@@ -425,13 +499,14 @@ def submit_sa_job():
             'objectives': objectives_config,
             'tweaks': tweaks,
         }
-        worker = threading.Thread(
-            target=_run_sa_job,
-            args=(job_id, payload),
-            name=f'sa-job-{job_id[:8]}',
-            daemon=True,
+        job_id = queue_background_job(
+            'sa-analysis', payload, _run_sa_job, 'Queued statistical analysis'
         )
-        worker.start()
+        if job_id is None:
+            return jsonify({
+                'error': 'Another statistical analysis is already running. '
+                         'Wait for it to finish or cancel it first.'
+            }), 429
         return jsonify({'job_id': job_id, 'status': 'queued'}), 202
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
@@ -439,37 +514,34 @@ def submit_sa_job():
 
 @api_bp.route('/sa_status/<job_id>', methods=['GET'])
 def sa_job_status(job_id):
-    _cleanup_sa_jobs()
-    with _SA_JOBS_LOCK:
-        job = _SA_JOBS.get(job_id)
-        if job is None:
-            return jsonify({'error': 'Analysis job not found or expired.'}), 404
-        response = {
-            'job_id': job_id,
-            'status': job.get('status'),
-            'phase': job.get('phase'),
-            'percent': job.get('percent', 0),
-        }
-        if job.get('status') == 'completed':
-            response['result'] = job.get('result')
-        elif job.get('status') in ('failed', 'cancelled'):
-            response['error'] = job.get('error')
+    response = get_background_job_response(job_id)
+    if response is None:
+        return jsonify({'error': 'Analysis job not found or expired.'}), 404
     return jsonify(clean_json_data(response))
 
 
 @api_bp.route('/sa_cancel/<job_id>', methods=['POST'])
 def cancel_sa_job(job_id):
-    with _SA_JOBS_LOCK:
-        job = _SA_JOBS.get(job_id)
-        if job is None:
-            return jsonify({'error': 'Analysis job not found or expired.'}), 404
-        if job.get('status') in ('completed', 'failed', 'cancelled'):
-            return jsonify({'job_id': job_id, 'status': job.get('status')})
-        job['cancel_event'].set()
-        job['status'] = 'cancelling'
-        job['phase'] = 'Cancellation requested'
-        job['updated_at'] = time.time()
-    return jsonify({'job_id': job_id, 'status': 'cancelling'})
+    response = cancel_background_job(job_id)
+    if response is None:
+        return jsonify({'error': 'Analysis job not found or expired.'}), 404
+    return jsonify(response)
+
+
+@api_bp.route('/job_status/<job_id>', methods=['GET'])
+def background_job_status(job_id):
+    response = get_background_job_response(job_id)
+    if response is None:
+        return jsonify({'error': 'Background job not found or expired.'}), 404
+    return jsonify(clean_json_data(response))
+
+
+@api_bp.route('/job_cancel/<job_id>', methods=['POST'])
+def cancel_background_job_endpoint(job_id):
+    response = cancel_background_job(job_id)
+    if response is None:
+        return jsonify({'error': 'Background job not found or expired.'}), 404
+    return jsonify(response)
 
 
 @api_bp.route('/sa', methods=['POST'])
