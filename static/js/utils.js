@@ -161,6 +161,71 @@ export async function safeJson(response) {
     }
 }
 
+export function waitForAbortableDelay(milliseconds, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(new DOMException('Aborted', 'AbortError'));
+            return;
+        }
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(new DOMException('Aborted', 'AbortError'));
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, milliseconds);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+export async function submitAndPollJob(
+    submitUrl, payload, { signal, onProgress, pollMilliseconds = 1500 } = {}
+) {
+    const submitResponse = await fetch(submitUrl, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload), signal
+    });
+    const submitted = await safeJson(submitResponse);
+    if (!submitResponse.ok || submitted.error || !submitted.job_id) {
+        throw new Error(submitted.error || 'Unable to start background job.');
+    }
+    const jobId = submitted.job_id;
+    onProgress?.({ status: submitted.status || 'queued', phase: 'Queued', percent: 0 }, jobId);
+    while (true) {
+        await waitForAbortableDelay(pollMilliseconds, signal);
+        const statusResponse = await fetch(`/job_status/${encodeURIComponent(jobId)}`, { signal });
+        const status = await safeJson(statusResponse);
+        if (!statusResponse.ok) throw new Error(status.error || 'Unable to read background job status.');
+        onProgress?.(status, jobId);
+        if (status.status === 'completed') return { jobId, result: status.result };
+        if (status.status === 'failed') throw new Error(status.error || 'Background job failed.');
+        if (status.status === 'cancelled') throw new DOMException(status.error || 'Cancelled', 'AbortError');
+    }
+}
+
+export async function cancelBackgroundJob(jobId, { waitForTerminal = false, pollMilliseconds = 250 } = {}) {
+    if (!jobId) return null;
+    try {
+        const response = await fetch(`/job_cancel/${encodeURIComponent(jobId)}`, { method: 'POST' });
+        if (!response.ok) {
+            const result = await safeJson(response);
+            throw new Error(result.error || 'Unable to cancel background job.');
+        }
+        if (!waitForTerminal) return null;
+        while (true) {
+            const statusResponse = await fetch(`/job_status/${encodeURIComponent(jobId)}`);
+            const status = await safeJson(statusResponse);
+            if (statusResponse.status === 404 || ['completed', 'failed', 'cancelled'].includes(status.status)) return status;
+            if (!statusResponse.ok) throw new Error(status.error || 'Unable to read background job status.');
+            await waitForAbortableDelay(pollMilliseconds);
+        }
+    } catch (error) {
+        console.warn('Unable to send background cancellation request:', error);
+        return null;
+    }
+}
+
 export function updateRangePlaceholder(typeValue, rangeInput) {
     if (!rangeInput) return;
     rangeInput.placeholder = rangePlaceholderForType(typeValue);

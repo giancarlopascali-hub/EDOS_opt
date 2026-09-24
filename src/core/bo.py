@@ -46,6 +46,11 @@ from src.core.feasibility import (
     candidate_feasibility_report,
 )
 
+
+class SurfaceCalculationCancelled(RuntimeError):
+    """Raised when a response-surface job is cancelled by the user."""
+
+
 def generate_feasible_initial_conditions(bounds_t, q, num_restarts, p_constraints, max_attempts=500):
     """
     Generates a tensor of shape (num_restarts, q, d) where all points satisfy
@@ -1204,12 +1209,24 @@ def run_bo_surface(
     fixed_values=None,
     resolution=25,
     device=torch.device('cpu'),
-    compute_device=torch.device('cpu')
+    compute_device=torch.device('cpu'),
+    cancel_event=None,
+    progress_callback=None,
 ):
     """
     Computes a 2D prediction grid (response surface) using the fitted GP surrogate
     for contour and 3D surface visualizations.
     """
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise SurfaceCalculationCancelled('Response-surface calculation cancelled by user.')
+
+    def report(phase, percent):
+        if progress_callback is not None:
+            progress_callback(phase, percent)
+
+    check_cancelled()
+    report('Preparing response-surface data', 10)
     df_clean = clean_dataframe(df, features_config, objectives_config)
     if df_clean.empty:
         raise ValueError('No valid data points left after filtering missing features/objectives.')
@@ -1340,6 +1357,8 @@ def run_bo_surface(
             eval_matrix[:, idx] = val
 
     eval_x = torch.tensor(eval_matrix, dtype=torch.float32).to(compute_device)
+    check_cancelled()
+    report('Building response-surface grid', 25)
 
     kernel_name = tweaks.get('kernel', 'matern52')
     def get_kernel(k_name):
@@ -1365,7 +1384,9 @@ def run_bo_surface(
 
     obj_dict = {o['name']: o for o in objectives_config}
 
-    def fit_and_predict_obj(obj_name):
+    def fit_and_predict_obj(obj_name, position, total):
+        check_cancelled()
+        report(f'Fitting surrogate for {obj_name}', 35 + int(45 * (position / max(total, 1))))
         prec = infer_decimal_precision(df_clean[obj_name])
         y_raw = pd.to_numeric(df_clean[obj_name], errors='coerce').values
         non_nan_mask = ~np.isnan(y_raw)
@@ -1376,9 +1397,18 @@ def run_bo_surface(
         m = build_single_model(tx_i, y_t)
         mll = ExactMarginalLogLikelihood(m.likelihood, m).to(compute_device)
         try:
-            fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 35}})
+            fit_gpytorch_mll(
+                mll,
+                optimizer_kwargs={
+                    "options": {"maxiter": 35},
+                    "callback": lambda *_: check_cancelled(),
+                },
+            )
+        except SurfaceCalculationCancelled:
+            raise
         except Exception:
             pass
+        check_cancelled()
         m.eval()
         with torch.no_grad():
             post = m.posterior(eval_x)
@@ -1386,14 +1416,22 @@ def run_bo_surface(
         pred_grid = np.round(pred.reshape(res, res), prec)
         return pred_grid
 
-    color_grid = fit_and_predict_obj(color_obj).tolist()
+    predicted_objectives = [color_obj]
+    if z_axis in obj_dict and z_axis != color_obj:
+        predicted_objectives.append(z_axis)
+
+    color_grid = fit_and_predict_obj(
+        color_obj, 0, len(predicted_objectives)
+    ).tolist()
 
     if z_axis in obj_dict:
         # z_axis is an objective — predict with GP
         if z_axis == color_obj:
             z_grid = color_grid
         else:
-            z_grid = fit_and_predict_obj(z_axis).tolist()
+            z_grid = fit_and_predict_obj(
+                z_axis, 1, len(predicted_objectives)
+            ).tolist()
     else:
         # z_axis is a numerical feature — use the actual feature values from the eval grid
         feat_idx_map = {f['name']: idx for idx, f in enumerate(features_config)}
@@ -1450,8 +1488,11 @@ def run_bo_surface(
                 "label": f"{nearest_val:g}"
             }
 
+    report('Classifying experiments for the selected slice', 85)
     experiments = []
     for i in range(len(df_clean)):
+        if i % 256 == 0:
+            check_cancelled()
         try:
             exp_x = float(x_col_raw[i]) if pd.notna(x_col_raw[i]) else None
             exp_y = float(y_col_raw[i]) if pd.notna(y_col_raw[i]) else None
@@ -1495,6 +1536,8 @@ def run_bo_surface(
         except Exception:
             pass
 
+    check_cancelled()
+    report('Finalizing response surface', 95)
     prec_x = infer_decimal_precision(df_clean[x_feat])
     prec_y = infer_decimal_precision(df_clean[y_feat])
 
