@@ -1,0 +1,81 @@
+name: Test and deploy EDOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edos-production
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      hf_sha: ${{ steps.publish.outputs.hf_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+      - name: Write deployment metadata
+        run: |
+          FOUNDATION=$(python -c "import json; print(json.load(open('alignment/foundation.json'))['commit'])")
+          python deployment/write_build_info.py \
+            --output build-info.json \
+            --application EDOS \
+            --application-commit "${GITHUB_SHA}" \
+            --foundation-commit "$FOUNDATION"
+      - name: Publish clean Space bundle
+        id: publish
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git clone https://realgcp:${HF_TOKEN}@huggingface.co/spaces/realgcp/EDOS-app hf_repo
+          (cd hf_repo && git rm -r --ignore-unmatch .)
+          rsync -a --delete \
+            --exclude='.git' --exclude='.github' --exclude='.gitignore' \
+            --exclude='tests' --exclude='conftest.py' --exclude='alignment' \
+            --exclude='deployment' --exclude='ARCHITECTURE.md' --exclude='hf_repo' \
+            ./ hf_repo/
+          cd hf_repo
+          git config user.email "action@github.com"
+          git config user.name "EDOS deployment"
+          git lfs install
+          git add -A
+          git commit -m "Deploy EDOS from GitHub ${GITHUB_SHA}" || true
+          git push origin main
+          echo "hf_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Notify downstream repositories
+        if: ${{ secrets.EDOS_FAMILY_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.EDOS_FAMILY_TOKEN }}
+        run: |
+          FOUNDATION=$(python -c "import json; print(json.load(open('alignment/foundation.json'))['commit'])")
+          for REPOSITORY in autoEDOS TransEDOS; do
+            curl --fail-with-body -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/giancarlopascali-hub/${REPOSITORY}/dispatches \
+              -d "{\"event_type\":\"edos-foundation-updated\",\"client_payload\":{\"edos_sha\":\"${FOUNDATION}\"}}"
+          done
+      - name: Verify live deployment
+        run: python deployment/verify_hf.py --space realgcp/EDOS-app --hf-commit "${{ steps.publish.outputs.hf_sha }}" --application-commit "${GITHUB_SHA}"

@@ -1,0 +1,24 @@
+{
+  "canonical_shared_files": [
+    "src/core/__init__.py",
+    "src/core/bo.py",
+    "src/core/doe.py",
+    "src/core/sa.py",
+    "src/core/constraints.py",
+    "src/core/feasibility.py",
+    "src/api/jobs.py",
+    "static/js/utils.js",
+    "static/js/modules/doe.js",
+    "static/js/modules/bo.js",
+    "static/js/modules/sa.js",
+    "static/js/modules/constraints.js",
+    "tests/test_api.py",
+    "tests/test_background_jobs.py",
+    "tests/test_constraints.py",
+    "tests/test_doe.py",
+    "tests/test_hosted_ui.py",
+    "tests/test_importance.py",
+    "tests/test_pof.py",
+    "tests/test_sa_jobs.py"
+  ]
+}

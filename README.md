@@ -11,6 +11,15 @@ pinned: false
 
 # EDOS
 
+EDOS is the canonical shared foundation for the independently maintained
+AutoEDOS and TransEDOS repositories. The published foundation revision and
+shared-file contract are recorded under `alignment/`.
+
+Every push to `main` must pass the full test suite before a clean bundle is
+deployed to [realgcp/EDOS-app](https://huggingface.co/spaces/realgcp/EDOS-app).
+The live application exposes `/health` and `/version` for deployment
+verification and source-revision traceability.
+
 
 **EDOS** (Experimental Design and Optimization System) is a powerful platform designed for researchers to perform **Design of Experiments (DoE)**, **Bayesian Optimization (BO)** and **Statistical Analysis (SA)** with ease.
 

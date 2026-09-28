@@ -36,4 +36,4 @@ ENV FLASK_APP=app.py
 ENV PORT=7860
 
 # Run the application with gunicorn for production reliability
-CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--timeout", "120", "app:app"]
+CMD ["gunicorn", "--workers", "1", "--threads", "8", "--bind", "0.0.0.0:7860", "--timeout", "120", "app:app"]
