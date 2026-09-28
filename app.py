@@ -6,6 +6,7 @@ or standalone PyInstaller builds, registers blueprints, and starts the local ser
 """
 
 import os
+import json
 import socket
 import sys
 import warnings
@@ -33,7 +34,7 @@ if not os.path.exists(os.path.join(TEMPLATE_DIR, 'index.html')):
 # Setup paths inside Python path for absolute imports inside src/
 sys.path.insert(0, BASE_DIR)
 
-from flask import Flask
+from flask import Flask, jsonify
 from src.api.routes import api_bp
 
 # Initialize the Flask App
@@ -45,6 +46,32 @@ app = Flask(
 
 # Register the routes blueprint
 app.register_blueprint(api_bp)
+
+
+def _deployment_info():
+    info = {
+        'application': 'EDOS',
+        'application_commit': 'development',
+        'edos_foundation_commit': 'development',
+        'deployed_at': None,
+    }
+    path = os.path.join(BASE_DIR, 'build-info.json')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            info.update(json.load(handle))
+    except (OSError, ValueError, TypeError):
+        pass
+    return info
+
+
+@app.get('/health')
+def health():
+    return jsonify({'status': 'ok', 'application': 'EDOS'})
+
+
+@app.get('/version')
+def version():
+    return jsonify(_deployment_info())
 
 # Ensure template/static directories exist when running in dev mode
 if not getattr(sys, 'frozen', False):

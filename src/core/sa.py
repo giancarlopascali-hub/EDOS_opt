@@ -1,9 +1,12 @@
 import numpy as np
+import os
 import pandas as pd
 import sklearn.linear_model as lm
 import sklearn.ensemble as ensemble
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.model_selection import ShuffleSplit
 from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import permutation_importance
 import shap
@@ -23,6 +26,47 @@ def _check_cancel(cancel_event):
 def _report_progress(callback, phase, percent):
     if callback is not None:
         callback(phase, int(percent))
+
+
+def _deterministic_sample_indices(target_values, max_samples):
+    """Select representative rows reproducibly across the target distribution."""
+    values = np.asarray(target_values, dtype=float).reshape(-1)
+    if len(values) <= max_samples:
+        return np.arange(len(values), dtype=int)
+    ordered = np.argsort(values, kind='stable')
+    positions = np.linspace(0, len(ordered) - 1, max_samples, dtype=int)
+    return np.sort(ordered[positions])
+
+
+def _cross_validated_r2(build_model, X_values, y_values):
+    """Return deterministic held-out R² mean/std; never substitute training fit."""
+    n_samples = len(y_values)
+    if n_samples < 6:
+        return None, None
+    test_count = max(2, int(np.ceil(n_samples * 0.2)))
+    if test_count >= n_samples:
+        return None, None
+    splitter = ShuffleSplit(n_splits=5, test_size=test_count, random_state=42)
+    scores = []
+    for train_idx, test_idx in splitter.split(X_values):
+        model = build_model()
+        model.fit(X_values[train_idx], y_values[train_idx])
+        score = model.score(X_values[test_idx], y_values[test_idx])
+        if np.isfinite(score):
+            scores.append(float(score))
+    if not scores:
+        return None, None
+    return float(np.mean(scores)), float(np.std(scores))
+
+
+def _deterministic_kernel_shap(explainer, values, nsamples):
+    """Run Kernel SHAP with an isolated reproducible NumPy random state."""
+    random_state = np.random.get_state()
+    np.random.seed(42)
+    try:
+        return explainer.shap_values(values, nsamples=nsamples, silent=True)
+    finally:
+        np.random.set_state(random_state)
 
 def robust_numeric_series(col_series):
     """Safely converts a series to numeric, attempting string-level cleaning if needed."""
@@ -131,7 +175,7 @@ def run_sa(
 
     original_rows = len(df_clean)
     shap_nsamples = 25 if original_rows > 1000 else 40
-    shap_background_cap = 100 if original_rows > 2000 else original_rows
+    shap_background_cap = min(20, original_rows)
 
     X_raw = df_clean[feat_names].copy()
     Y_raw = df_clean[obj_names].copy()
@@ -235,6 +279,8 @@ def run_sa(
         if n_samples < 5:
             results[obj] = {
                 'reliability': None,
+                'reliability_std': None,
+                'reliability_method': 'insufficient data for held-out validation',
                 'importance': {f_name: 0.0 for f_name in feat_names},
                 'shap_data': None,
                 'fit_flag': 'Poor'
@@ -253,21 +299,26 @@ def run_sa(
             elif model_name == 'mlp':
                 hidden_layers = str(params.get('mlp_layers', '100'))
                 layers = [int(x.strip()) for x in hidden_layers.split(',') if x.strip()]
-                return MLPRegressor(
+                base_model = MLPRegressor(
                     hidden_layer_sizes=tuple(layers),
-                    max_iter=int(params.get('mlp_iter', 500)),
+                    max_iter=min(1000, int(params.get('mlp_iter', 500))),
                     early_stopping=True,
-                    n_iter_no_change=10,
+                    n_iter_no_change=15,
+                    validation_fraction=0.15,
                     tol=1e-4,
-                    random_state=42
+                    random_state=42,
+                )
+                return make_pipeline(
+                    StandardScaler(),
+                    TransformedTargetRegressor(
+                        regressor=base_model,
+                        transformer=StandardScaler(),
+                    ),
                 )
             else:
                 return lm.LinearRegression()
 
         X_data = X_obj
-        if model_name == 'mlp':
-            scaler = StandardScaler()
-            X_data = pd.DataFrame(scaler.fit_transform(X_obj), columns=X_obj.columns)
 
         CHUNK_SIZE = 2500
         if n_samples > CHUNK_SIZE:
@@ -280,7 +331,13 @@ def run_sa(
 
             chunk_reliabilities = []
             chunk_importances = []
-            full_shap_matrix = np.zeros((n_samples, X_data.shape[1]))
+            full_shap_matrix = (
+                None if model_name == 'mlp'
+                else np.zeros((n_samples, X_data.shape[1]))
+            )
+            shap_row_indices = None
+            mlp_shap_blocks = []
+            mlp_shap_indices = []
 
             for k in range(K):
                 _check_cancel(cancel_event)
@@ -290,18 +347,12 @@ def run_sa(
                 c_model = build_model()
                 c_model.fit(X_chunk.values, y_chunk.values)
 
-                # Reliability
-                if model_name == 'random_forest' and getattr(c_model, 'oob_score_', None) is not None:
-                    c_rel = c_model.oob_score_
-                else:
-                    ss = ShuffleSplit(n_splits=min(3, len(y_chunk)), test_size=0.2, random_state=42)
-                    c_scores = []
-                    for tr_i, te_i in ss.split(X_chunk):
-                        m_cv = build_model()
-                        m_cv.fit(X_chunk.values[tr_i], y_chunk.values[tr_i])
-                        c_scores.append(m_cv.score(X_chunk.values[te_i], y_chunk.values[te_i]))
-                    c_rel = np.mean(c_scores) if c_scores else 0.0
-                chunk_reliabilities.append((len(c_idx), c_rel))
+                # Reliability is always held-out and deterministic.  This is
+                # deliberately stricter than the in-sample fit shown by TransBO.
+                c_rel, c_rel_std = _cross_validated_r2(
+                    build_model, X_chunk.values, y_chunk.values
+                )
+                chunk_reliabilities.append((len(c_idx), c_rel, c_rel_std))
 
                 # Importance
                 if model_name == 'linear':
@@ -319,54 +370,63 @@ def run_sa(
                         explainer = shap.TreeExplainer(c_model)
                         s_vals = explainer.shap_values(X_chunk.values, check_additivity=False)
                     elif model_name == 'mlp':
-                        background_values = X_chunk.values[:shap_background_cap]
-                        bg = shap.kmeans(background_values, min(15, len(background_values)))
-                        explainer = shap.KernelExplainer(c_model.predict, bg)
-                        eval_n = min(150, len(X_chunk))
-                        s_vals_sub = explainer.shap_values(
-                            X_chunk.values[:eval_n], nsamples=shap_nsamples
+                        bg_idx = _deterministic_sample_indices(
+                            y_chunk.values, min(20, len(X_chunk))
                         )
-                        if isinstance(s_vals_sub, list):
-                            s_vals_sub = s_vals_sub[0]
-                        s_vals = np.repeat(np.mean(s_vals_sub, axis=0, keepdims=True), len(X_chunk), axis=0)
-                        s_vals[:eval_n] = s_vals_sub
+                        eval_idx = _deterministic_sample_indices(
+                            y_chunk.values, min(150, len(X_chunk))
+                        )
+                        bg = X_chunk.values[bg_idx]
+                        explainer = shap.KernelExplainer(c_model.predict, bg)
+                        s_vals = _deterministic_kernel_shap(
+                            explainer, X_chunk.values[eval_idx], shap_nsamples
+                        )
                     elif model_name == 'linear':
                         explainer = shap.LinearExplainer(c_model, X_chunk.values)
                         s_vals = explainer.shap_values(X_chunk.values)
 
                     if isinstance(s_vals, list):
                         s_vals = s_vals[0]
-                    full_shap_matrix[c_idx] = s_vals
+                    if model_name == 'mlp':
+                        mlp_shap_blocks.append(np.asarray(s_vals))
+                        mlp_shap_indices.append(c_idx[eval_idx])
+                    else:
+                        full_shap_matrix[c_idx] = s_vals
                 except Exception as e_shap:
                     print(f"Chunk SHAP error: {e_shap}")
 
             # Joined reliability
-            total_n = sum(n_c for n_c, _ in chunk_reliabilities)
-            reliability = sum(n_c * r for n_c, r in chunk_reliabilities) / total_n
+            valid_reliabilities = [
+                (n_c, rel, std) for n_c, rel, std in chunk_reliabilities
+                if rel is not None and np.isfinite(rel)
+            ]
+            total_n = sum(n_c for n_c, _, _ in valid_reliabilities)
+            reliability = (
+                sum(n_c * rel for n_c, rel, _ in valid_reliabilities) / total_n
+                if total_n else None
+            )
+            reliability_std = (
+                sum(n_c * (std or 0.0) for n_c, _, std in valid_reliabilities) / total_n
+                if total_n else None
+            )
 
             # Joined importance
             weighted_imp = np.zeros(X_data.shape[1])
             for n_c, imp in chunk_importances:
                 weighted_imp += n_c * imp
-            importance = weighted_imp / total_n
+            importance = weighted_imp / n_samples
+
+            if model_name == 'mlp' and mlp_shap_blocks:
+                full_shap_matrix = np.vstack(mlp_shap_blocks)
+                shap_row_indices = np.concatenate(mlp_shap_indices)
 
         else:
             # Single pass on 100% of data
             model = build_model()
-            if model_name == 'random_forest' and getattr(model, 'oob_score', False):
-                model.fit(X_data.values, y_obj.values)
-                reliability = getattr(model, 'oob_score_', 0.0)
-            else:
-                ss = ShuffleSplit(n_splits=min(3, n_samples), test_size=0.2, random_state=42)
-                scores = []
-                for train_idx, test_idx in ss.split(X_data):
-                    X_train, X_test = X_data.iloc[train_idx], X_data.iloc[test_idx]
-                    y_train, y_test = y_obj.iloc[train_idx], y_obj.iloc[test_idx]
-                    cv_m = build_model()
-                    cv_m.fit(X_train.values, y_train.values)
-                    scores.append(cv_m.score(X_test.values, y_test.values))
-                reliability = np.mean(scores) if scores else 0.0
-                model.fit(X_data.values, y_obj.values)
+            reliability, reliability_std = _cross_validated_r2(
+                build_model, X_data.values, y_obj.values
+            )
+            model.fit(X_data.values, y_obj.values)
 
             if model_name == 'linear':
                 importance = np.abs(model.coef_)
@@ -377,22 +437,24 @@ def run_sa(
                 importance = model.feature_importances_
 
             full_shap_matrix = None
+            shap_row_indices = None
             try:
                 if model_name == 'random_forest':
                     explainer = shap.TreeExplainer(model)
                     s_vals = explainer.shap_values(X_data.values, check_additivity=False)
                 elif model_name == 'mlp':
-                    background_values = X_data.values[:shap_background_cap]
-                    bg = shap.kmeans(background_values, min(15, len(background_values)))
-                    explainer = shap.KernelExplainer(model.predict, bg)
-                    eval_n = min(150, len(X_data))
-                    s_vals_sub = explainer.shap_values(
-                        X_data.values[:eval_n], nsamples=shap_nsamples
+                    bg_idx = _deterministic_sample_indices(
+                        y_obj.values, min(20, len(X_data))
                     )
-                    if isinstance(s_vals_sub, list):
-                        s_vals_sub = s_vals_sub[0]
-                    s_vals = np.repeat(np.mean(s_vals_sub, axis=0, keepdims=True), len(X_data), axis=0)
-                    s_vals[:eval_n] = s_vals_sub
+                    eval_idx = _deterministic_sample_indices(
+                        y_obj.values, min(250, len(X_data))
+                    )
+                    bg = X_data.values[bg_idx]
+                    explainer = shap.KernelExplainer(model.predict, bg)
+                    s_vals = _deterministic_kernel_shap(
+                        explainer, X_data.values[eval_idx], shap_nsamples
+                    )
+                    shap_row_indices = eval_idx
                 elif model_name == 'linear':
                     explainer = shap.LinearExplainer(model, X_data.values)
                     s_vals = explainer.shap_values(X_data.values)
@@ -413,20 +475,54 @@ def run_sa(
 
         shap_data = None
         if full_shap_matrix is not None:
-            grouped_shap = {f: np.zeros(len(X_data)) for f in feat_names}
+            full_shap_matrix = np.asarray(full_shap_matrix, dtype=float)
+            if full_shap_matrix.ndim == 3 and full_shap_matrix.shape[-1] == 1:
+                full_shap_matrix = full_shap_matrix[..., 0]
+            if shap_row_indices is None:
+                shap_row_indices = np.arange(len(full_shap_matrix), dtype=int)
+            shap_row_indices = np.asarray(shap_row_indices, dtype=int)
+            finite_rows = np.all(np.isfinite(full_shap_matrix), axis=1)
+            full_shap_matrix = full_shap_matrix[finite_rows]
+            shap_row_indices = shap_row_indices[finite_rows]
+
+            grouped_shap = {
+                f: np.zeros(len(full_shap_matrix), dtype=float) for f in feat_names
+            }
             for f_name in feat_names:
                 rel_indices = [i for i, c in enumerate(encoded_feat_names) if c == f_name or f"{f_name}_" in c]
                 for idx in rel_indices:
                     grouped_shap[f_name] += full_shap_matrix[:, idx]
 
+            grouped_abs_values = [
+                np.abs(values) for values in grouped_shap.values()
+                if len(values)
+            ]
+            all_abs = (
+                np.concatenate(grouped_abs_values)
+                if grouped_abs_values else np.array([])
+            )
+            display_limit = (
+                float(np.quantile(all_abs, 0.99)) if len(all_abs) else 0.0
+            )
+            display_limit = max(display_limit, 1e-9)
+            clipped_count = int(np.sum(all_abs > display_limit))
+            sampled_raw = X_raw_obj.iloc[shap_row_indices]
+
             shap_data = {
                 'features': feat_names,
                 'shap_values': [grouped_shap[f].tolist() for f in feat_names],
-                'feature_values': [X_raw_obj[f].tolist() for f in feat_names]
+                'feature_values': [sampled_raw[f].tolist() for f in feat_names],
+                'sampled_rows': int(len(shap_row_indices)),
+                'total_rows': int(n_samples),
+                'sampling': 'deterministic_target_stratified',
+                'display_limit': display_limit,
+                'display_clipped_points': clipped_count,
             }
 
         results[obj] = {
             'reliability': None if (reliability is None or np.isnan(reliability)) else round(float(reliability), 3),
+            'reliability_std': None if (reliability_std is None or np.isnan(reliability_std)) else round(float(reliability_std), 3),
+            'reliability_method': '5x deterministic held-out validation',
             'importance': grouped_importance,
             'shap_data': shap_data,
             'fit_flag': 'Good' if (reliability is not None and reliability > 0.7) else ('Limited' if (reliability is not None and reliability >= 0.4) else 'Poor')
@@ -469,7 +565,8 @@ def run_sa(
         'original_rows': original_rows,
         'shap_background_rows': min(original_rows, shap_background_cap),
         'shap_nsamples': shap_nsamples,
-        'shap_approximated': bool(original_rows > 1000),
+        'shap_approximated': bool(model_name == 'mlp' and original_rows > 250),
+        'shap_sampling': 'deterministic_target_stratified',
     }
     _report_progress(progress_callback, 'Finalizing analysis', 100)
     return (
@@ -513,6 +610,16 @@ def estimate_sa(
         if df_clean[o].dtype == object or str(df_clean[o].dtype) in ['string', 'category']:
             df_clean[o] = df_clean[o].astype(str).astype('category').cat.codes
     Y = df_clean[obj_names].apply(pd.to_numeric, errors='coerce').astype(float) # Keep NaNs
+
+    # Keep interactive estimation bounded on hosted CPU deployments.  Sampling
+    # is deterministic and stratified by the first available objective.
+    if model_name == 'mlp':
+        estimator_cap = max(500, int(os.environ.get('SA_ESTIMATOR_MAX_ROWS', '5000')))
+        if len(X_train) > estimator_cap:
+            stratify_values = Y.bfill(axis=1).iloc[:, 0].fillna(0).values
+            keep = _deterministic_sample_indices(stratify_values, estimator_cap)
+            X_train = X_train.iloc[keep].reset_index(drop=True)
+            Y = Y.iloc[keep].reset_index(drop=True)
 
     # Encode the Query Point
     input_data_raw = pd.DataFrame([input_values], columns=feat_names)
@@ -563,13 +670,17 @@ def estimate_sa(
         elif model_name == 'mlp':
             hidden_layers = str(params.get('mlp_layers', '100'))
             layers = [int(x.strip()) for x in hidden_layers.split(',') if x.strip()]
-            model  = MLPRegressor(
-                hidden_layer_sizes=tuple(layers),
-                max_iter=int(params.get('mlp_iter', 500)),
-                early_stopping=True,
-                n_iter_no_change=10,
-                tol=1e-4,
-                random_state=42
+            model = TransformedTargetRegressor(
+                regressor=MLPRegressor(
+                    hidden_layer_sizes=tuple(layers),
+                    max_iter=min(1000, int(params.get('mlp_iter', 500))),
+                    early_stopping=True,
+                    n_iter_no_change=15,
+                    validation_fraction=0.15,
+                    tol=1e-4,
+                    random_state=42,
+                ),
+                transformer=StandardScaler(),
             )
             model.fit(X_tr_obj, y_tr_obj)
             pred = model.predict(input_data)[0]
