@@ -6,6 +6,7 @@ or standalone PyInstaller builds, registers blueprints, and starts the local ser
 """
 
 import os
+import socket
 import sys
 import warnings
 
@@ -60,7 +61,19 @@ if __name__ == '__main__':
     if not getattr(sys, 'frozen', False):
         default_port = int(os.environ.get("PORT", 7860))
 
-    port = int(os.environ.get("PORT", default_port))
+    def _available_local_port(preferred_port):
+        """Use the preferred local port unless another local app owns it."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(('127.0.0.1', preferred_port))
+                return preferred_port
+            except OSError:
+                probe.bind(('127.0.0.1', 0))
+                return probe.getsockname()[1]
+
+    requested_port = int(os.environ.get("PORT", default_port))
+    port = requested_port if os.environ.get("PORT") else _available_local_port(requested_port)
     url  = f"http://127.0.0.1:{port}"
 
     print(f"\n" + "=" * 40)
