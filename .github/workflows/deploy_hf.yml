@@ -29,6 +29,8 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
+    env:
+      EDOS_FAMILY_TOKEN: ${{ secrets.EDOS_FAMILY_TOKEN }}
     outputs:
       hf_sha: ${{ steps.publish.outputs.hf_sha }}
     steps:
@@ -65,9 +67,9 @@ jobs:
           git push origin main
           echo "hf_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Notify downstream repositories
-        if: ${{ secrets.EDOS_FAMILY_TOKEN != '' }}
+        if: ${{ env.EDOS_FAMILY_TOKEN != '' }}
         env:
-          GH_TOKEN: ${{ secrets.EDOS_FAMILY_TOKEN }}
+          GH_TOKEN: ${{ env.EDOS_FAMILY_TOKEN }}
         run: |
           FOUNDATION=$(python -c "import json; print(json.load(open('alignment/foundation.json'))['commit'])")
           for REPOSITORY in autoEDOS TransEDOS; do
