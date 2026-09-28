@@ -1,8 +1,12 @@
 import pathlib
+import shutil
 import subprocess
 import unittest
 
+NODE_AVAILABLE = shutil.which('node') is not None
 
+
+@unittest.skipUnless(NODE_AVAILABLE, 'Node.js is required for JavaScript utility tests')
 class ImportanceRebalancingTests(unittest.TestCase):
     def test_included_importances_sum_to_exactly_100(self):
         utils_uri = (pathlib.Path(__file__).parents[1] / 'static/js/utils.js').resolve().as_uri()
