@@ -6,6 +6,14 @@ from app import app
 
 
 class HostedUiTests(unittest.TestCase):
+    def test_exploration_controls_start_disabled_for_default_ei(self):
+        with app.test_client() as client:
+            response = client.get('/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'exploration-control control-disabled', response.data)
+        self.assertRegex(response.data, rb'id="style-slider"[^>]*disabled')
+        self.assertRegex(response.data, rb'id="style-number"[^>]*disabled')
+
     def test_shutdown_button_is_visible_for_local_desktop(self):
         with patch.dict(os.environ, {}, clear=True), app.test_client() as client:
             response = client.get('/')

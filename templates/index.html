@@ -364,11 +364,11 @@
                                 <option value="rbf">RBF (Gaussian)</option>
                             </select>
                         </div>
-                        <div class="tweak-item full-width" style="display: flex; flex-direction: column;">
+                        <div class="tweak-item full-width exploration-control control-disabled" aria-disabled="true" style="display: flex; flex-direction: column; opacity: 0.45; transition: opacity 0.2s ease;">
                             <label>Exploration/Exploitation</label>
                             <div style="display: flex; align-items: center; gap: 10px;">
-                                <input type="range" id="style-slider" min="0" max="1" step="0.01" value="0.5" style="flex: 1;">
-                                <input type="number" id="style-number" min="0" max="1" step="0.01" value="0.5" style="width: 80px;">
+                                <input type="range" id="style-slider" min="0" max="1" step="0.01" value="0.5" style="flex: 1;" disabled>
+                                <input type="number" id="style-number" min="0" max="1" step="0.01" value="0.5" style="width: 80px;" disabled>
                             </div>
                             <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px; padding-right: 90px;">
                                 <span>Exploitation (0)</span>

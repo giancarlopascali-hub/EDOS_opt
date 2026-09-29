@@ -51,6 +51,25 @@ class SurfaceCalculationCancelled(RuntimeError):
     """Raised when a response-surface job is cancelled by the user."""
 
 
+STANDARD_BO_MAX_BETA = 10.0
+
+
+def validate_exploration(value):
+    """Return a finite exploration setting constrained to the public 0-1 scale."""
+    try:
+        exploration = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Exploration must be a number between 0 and 1.") from exc
+    if not np.isfinite(exploration) or not 0.0 <= exploration <= 1.0:
+        raise ValueError("Exploration must be a number between 0 and 1.")
+    return exploration
+
+
+def exploration_to_beta(exploration, max_beta=STANDARD_BO_MAX_BETA):
+    """Map 0 to pure exploitation and 1 to the configured maximum exploration."""
+    return validate_exploration(exploration) * float(max_beta)
+
+
 def generate_feasible_initial_conditions(bounds_t, q, num_restarts, p_constraints, max_attempts=500):
     """
     Generates a tensor of shape (num_restarts, q, d) where all points satisfy
@@ -261,7 +280,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
     avoid_reval = tweaks.get('avoid_reval', True)
     # acq_type is ignored in multi-objective mode (which always uses EHVI or scalarized posterior transform)
     acq_type    = tweaks.get('acq_type', 'EI')
-    exploration = float(tweaks.get('exploration', 0.5))
+    exploration = validate_exploration(tweaks.get('exploration', 0.5))
 
     # Hoist constraint extraction so variables are always in scope (needed on cold start too)
     constraints_cfg  = tweaks.get('constraints', {})
@@ -457,7 +476,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 ).to(OPT_DEVICE)
                 acq_is_logarithmic = True
             elif acq_type == 'LCB':
-                beta     = (1.0 - exploration) * 10.0 + 0.1
+                beta     = exploration_to_beta(exploration)
                 acq_func = qUpperConfidenceBound(model, beta=beta, sampler=sampler).to(OPT_DEVICE)
             else:
                 acq_func = qLogExpectedImprovement(

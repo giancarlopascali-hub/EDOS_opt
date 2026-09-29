@@ -102,6 +102,29 @@ export function renderBOSetup() {
 }
 
 
+export function updateBOExplorationControlAvailability() {
+    const acqSelect = document.getElementById('acq-type-select');
+    const slider = document.getElementById('style-slider');
+    const number = document.getElementById('style-number');
+    if (!acqSelect || !slider || !number) return;
+
+    const activeObjectives = document.querySelectorAll('#bo-objectives-list .bo-o-include:checked').length;
+    const isApplicable = activeObjectives === 1 && acqSelect.value === 'LCB';
+    const section = slider.closest('.exploration-control') || slider.closest('.tweak-item');
+
+    slider.disabled = !isApplicable;
+    number.disabled = !isApplicable;
+    section?.classList.toggle('control-disabled', !isApplicable);
+    section?.setAttribute('aria-disabled', String(!isApplicable));
+    if (section) {
+        section.style.opacity = isApplicable ? '1' : '0.45';
+        section.title = isApplicable
+            ? ''
+            : 'Exploration is available only for single-objective confidence-bound optimization.';
+    }
+}
+
+
 export function updateAcqSelectForMultiObj() {
     const includedObjs = Array.from(document.querySelectorAll('#bo-objectives-list .bo-o-include:checked'));
     const activeObjs   = includedObjs.length;
@@ -133,6 +156,12 @@ export function updateAcqSelectForMultiObj() {
             if (note) note.remove();
         }
     }
+
+    if (!acqSelect.dataset.explorationListenerAttached) {
+        acqSelect.dataset.explorationListenerAttached = 'true';
+        acqSelect.addEventListener('change', updateBOExplorationControlAvailability);
+    }
+    updateBOExplorationControlAvailability();
 }
 
 export async function runBO() {

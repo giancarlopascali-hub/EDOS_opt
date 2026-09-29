@@ -16,6 +16,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import app as flask_app
+from src.core.bo import exploration_to_beta, validate_exploration
 
 
 # ==============================================================================
@@ -52,6 +53,20 @@ def sample_csv_data():
         b"5,12,150,0.8\n"
         b"9,18,190,0.3\n"
     )
+
+
+@pytest.mark.parametrize(
+    ('exploration', 'expected_beta'),
+    [(0.0, 0.0), (0.5, 5.0), (1.0, 10.0)],
+)
+def test_exploration_maps_monotonically_to_standard_bo_beta(exploration, expected_beta):
+    assert exploration_to_beta(exploration) == pytest.approx(expected_beta)
+
+
+@pytest.mark.parametrize('exploration', [-0.01, 1.01, float('nan'), float('inf'), 'invalid'])
+def test_exploration_rejects_values_outside_public_scale(exploration):
+    with pytest.raises(ValueError, match='between 0 and 1'):
+        validate_exploration(exploration)
 
 
 # ==============================================================================
@@ -186,7 +201,6 @@ class TestBoSurfaceEndpoint:
         assert len(result['y']) == 10
         assert len(result['z']) == 10
         assert len(result['experiments']) == 5
-
 
 
 
