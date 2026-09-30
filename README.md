@@ -48,7 +48,7 @@ verification and source-revision traceability.
 ## Technical Stack
 
 
-- **Backend**: Python (Flask, BoTorch, GPyTorch, Scikit-Learn, pyDOE2)
+- **Backend**: Python (Flask, BoTorch, GPyTorch, Scikit-Learn, PyDOE)
 - **Frontend**: HTML5, Vanilla CSS3, JavaScript (ES6+)
 - **Packaging**: PyInstaller
 

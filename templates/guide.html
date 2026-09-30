@@ -91,9 +91,9 @@
             </ol>
             <table class="guide-table"><thead><tr><th>Design</th><th>Best suited to</th></tr></thead><tbody>
                 <tr><td><b>Box-Behnken</b></td><td>Response-surface studies with three or more factors; includes centre-point replicates.</td></tr>
-                <tr><td><b>Central Composite</b></td><td>Quadratic response-surface modelling and curvature checks; includes centre-point replicates.</td></tr>
-                <tr><td><b>Fractional Factorial</b></td><td>Efficient screening of factor effects. With up to four factors, EDOS uses the complete two-level set.</td></tr>
-                <tr><td><b>Definitive Screening</b></td><td>Early-stage screening when many factors may matter.</td></tr>
+                <tr><td><b>Central Composite</b></td><td>Face-centred quadratic response-surface modelling and curvature checks within the entered factor bounds; includes centre-point replicates.</td></tr>
+                <tr><td><b>Fractional Factorial</b></td><td>Efficient two-level screening at selectable Resolution III, IV, or V (or better).</td></tr>
+                <tr><td><b>Definitive Screening</b></td><td>Three-level early-stage screening that estimates main effects independently of quadratic effects; two-level categorical factors are supported.</td></tr>
                 <tr><td><b>Latin Hypercube Sampling (LHS)</b></td><td>Space-filling coverage with an exact user-selected number of runs.</td></tr>
                 <tr><td><b>D-Optimal</b></td><td>A custom-sized, model-aware design. Select Linear, Interaction (2FI), or Quadratic order; use at least the displayed recommended minimum run count.</td></tr>
             </tbody></table>
@@ -101,10 +101,10 @@
             <ul>
                 <li><b>Orthogonality</b> shows how independently factors vary; higher is generally better.</li>
                 <li><b>D-Efficiency</b> indicates how efficiently the design estimates its intended model; higher is generally better.</li>
-                <li><b>Resolution</b> indicates which effects may be separated without confounding. LHS is labelled space-filling and D-Optimal is labelled model-optimal rather than assigned a classical resolution.</li>
+                <li><b>Resolution</b> is reported for fractional factorial designs. It is shown as N/A for designs where classical fractional-factorial resolution does not apply.</li>
                 <li><b>Curvature</b> indicates whether the layout can represent nonlinear responses. Centre-point replicates are placed last and highlighted; they help estimate pure experimental error and lack of fit.</li>
             </ul>
-            <p>If EDOS shows a low-quality or oversampling warning, increase the run count, choose a different design, or revisit restrictive constraints. Exact counts above a structured design's natural size are supplemented with space-filling points.</p>
+            <p>For Box-Behnken, Central Composite, Fractional Factorial, and Definitive Screening designs, a Max count below the natural size produces a quality-optimized reduced subset and a warning. A larger Max count leaves the natural design unchanged. An Exact count above the natural size adds clearly flagged repeat runs at the end. LHS and D-Optimal always use an exact count. Constraints are supported by D-Optimal, where infeasible candidates are removed before selection.</p>
         </section>
 
         <section class="guide-section" id="bo">

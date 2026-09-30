@@ -69,11 +69,13 @@ function setExactRunsMode(isExact, isBlocked = false) {
         if (isBlocked) {
             switchMaxBtn.disabled   = true;
             switchExactBtn.disabled = true;
+            switchMaxBtn.style.display = 'none';
             switchContainer.classList.add('disabled');
             switchContainer.title   = "LHS and D-Optimal require an exact run count";
         } else {
             switchMaxBtn.disabled   = false;
             switchExactBtn.disabled = false;
+            switchMaxBtn.style.display = '';
             switchContainer.classList.remove('disabled');
             switchContainer.title   = "Switch between Max and Exact experiment count";
         }
@@ -104,14 +106,29 @@ function updateDoptMinNHint() {
     if (!hintEl) return;
     if (!isDopt) { hintEl.style.display = 'none'; return; }
 
-    const k     = document.querySelectorAll('#doe-features-list tr').length;
+    const featureRows = Array.from(document.querySelectorAll('#doe-features-list tr'));
+    const k     = featureRows.length;
     const order = document.getElementById('doe-dopt-order-select')?.value ?? 'quadratic';
-    let minN;
-    if      (order === 'linear')       minN = k + 1;
-    else if (order === 'interaction')  minN = k + Math.floor(k * (k - 1) / 2) + 1;
-    else                               minN = Math.floor((k + 1) * (k + 2) / 2);  // quadratic
+    const groupSizes = featureRows.map(row => {
+        const type = row.querySelector('.doe-f-type')?.value;
+        if (type !== 'categorical') return 1;
+        const levels = (row.querySelector('.doe-f-range')?.value || '')
+            .split(',').map(value => value.trim()).filter(Boolean).length;
+        return Math.max(1, levels - 1);
+    });
+    let minN = 1 + groupSizes.reduce((sum, size) => sum + size, 0);
+    if (order === 'interaction' || order === 'quadratic') {
+        for (let i = 0; i < groupSizes.length; i++) {
+            for (let j = i + 1; j < groupSizes.length; j++) {
+                minN += groupSizes[i] * groupSizes[j];
+            }
+        }
+    }
+    if (order === 'quadratic') {
+        minN += featureRows.filter(row => row.querySelector('.doe-f-type')?.value !== 'categorical').length;
+    }
 
-    hintEl.textContent   = `Min recommended: ${minN} runs for ${k} factor${k !== 1 ? 's' : ''}`;
+    hintEl.textContent   = `Minimum required: ${minN} runs for ${k} factor${k !== 1 ? 's' : ''}`;
     hintEl.style.display = 'block';
 }
 
@@ -148,6 +165,8 @@ function initDoEListeners() {
 
             const orderItem = document.getElementById('doe-dopt-order-item');
             if (orderItem) orderItem.style.display = isDopt ? '' : 'none';
+            const resolutionItem = document.getElementById('doe-fracfact-resolution-item');
+            if (resolutionItem) resolutionItem.style.display = e.target.value === 'fracfact' ? '' : 'none';
 
             updateDoptMinNHint();
         });
@@ -157,6 +176,16 @@ function initDoEListeners() {
     const orderSelect = document.getElementById('doe-dopt-order-select');
     if (orderSelect) {
         orderSelect.addEventListener('change', updateDoptMinNHint);
+    }
+
+    if (modelSelect) {
+        syncToggleToModel(modelSelect.value);
+        const isDopt = modelSelect.value === 'doptimal';
+        const orderItem = document.getElementById('doe-dopt-order-item');
+        if (orderItem) orderItem.style.display = isDopt ? '' : 'none';
+        const resolutionItem = document.getElementById('doe-fracfact-resolution-item');
+        if (resolutionItem) resolutionItem.style.display = modelSelect.value === 'fracfact' ? '' : 'none';
+        updateDoptMinNHint();
     }
 }
 
@@ -204,6 +233,7 @@ export async function runDoE() {
         max_runs:         document.getElementById('doe-max-runs').value,
         use_exact_runs:   useExact,
         dopt_model_order: document.getElementById('doe-dopt-order-select')?.value ?? 'quadratic',
+        fracfact_resolution: parseInt(document.getElementById('doe-fracfact-resolution-select')?.value ?? '4', 10),
         constraints: {
             numerical:  numericalConstraints,
             disallowed: disallowedCombinations
@@ -269,8 +299,8 @@ export function renderDoEResults(metrics) {
             warningBanner.classList.remove('hidden');
         }
 
-        // Oversampling warning (amber) – only for structured models in Exact mode
-        if (metrics && metrics.oversampling_warning) {
+        // Reduced structured-design warning (amber)
+        if (metrics && metrics.reduction_warning) {
             warningBanner.innerHTML += `
                 <div style="background:#fffbeb; border:1px solid #fde68a; color:#92400e;
                             padding:1rem; border-radius:12px; margin-bottom:1rem;
@@ -278,10 +308,26 @@ export function renderDoEResults(metrics) {
                             align-items:flex-start; text-align:left;">
                     <span style="font-size:1.25rem;">⚠️</span>
                     <div>
-                        <strong>Oversampling detected:</strong>
-                        <p style="margin:0.25rem 0 0 0;">The requested number of experiments
-                        exceeds the natural size of this design. Extra runs have been augmented
-                        using space-filling sampling to provide maximal coverage without duplicates.</p>
+                        <strong>Reduced classical design:</strong>
+                        <p style="margin:0.25rem 0 0 0;">${metrics.design_warning}</p>
+                    </div>
+                </div>`;
+            warningBanner.classList.remove('hidden');
+        }
+
+        // Exact-N above the natural size is fulfilled with clearly identified repeats.
+        if (metrics && metrics.added_replicates > 0) {
+            warningBanner.innerHTML += `
+                <div style="background:#fffbeb; border:1px solid #fde68a; color:#92400e;
+                            padding:1rem; border-radius:12px; margin-bottom:1rem;
+                            font-size:0.9rem; line-height:1.5; display:flex; gap:0.75rem;
+                            align-items:flex-start; text-align:left;">
+                    <span style="font-size:1.25rem;">⚠️</span>
+                    <div>
+                        <strong>Repeat experiments added (${metrics.added_replicates} runs):</strong>
+                        <p style="margin:0.25rem 0 0 0;">The exact count is above the natural
+                        ${metrics.natural_runs}-run design. The added repeat runs are placed last
+                        and included in the reported quality calculations.</p>
                     </div>
                 </div>`;
             warningBanner.classList.remove('hidden');
@@ -309,20 +355,20 @@ export function renderDoEResults(metrics) {
 
     if (metrics && typeof metrics === 'object') {
         const getFlag = (val, type) => {
+            const isNA = (typeof val === 'string' && val.startsWith('N/A'));
+            if (isNA) return { text: 'N/A', class: 'flag-limited' };
             if (type === 'ortho') {
-                if (val === 'N/A') return { text: 'N/A', class: 'flag-limited' };
                 if (val >= 90) return { text: 'Good',    class: 'flag-good' };
                 if (val >= 70) return { text: 'Limited', class: 'flag-limited' };
                 return           { text: 'Poor',    class: 'flag-poor' };
             }
             if (type === 'eff') {
-                if (val === 'N/A') return { text: 'N/A', class: 'flag-limited' };
                 if (val >= 80) return { text: 'Good',    class: 'flag-good' };
                 if (val >= 50) return { text: 'Limited', class: 'flag-limited' };
                 return           { text: 'Poor',    class: 'flag-poor' };
             }
             if (type === 'res') {
-                if (val === 'D-Optimal')       return { text: 'Model-opt.', class: 'flag-good' };
+                if (val === 'Full factorial')  return { text: 'Good',       class: 'flag-good' };
                 if (val.includes('V'))         return { text: 'Good',       class: 'flag-good' };
                 if (val.includes('IV'))        return { text: 'Limited',    class: 'flag-limited' };
                 return                                { text: 'Screening',  class: 'flag-poor' };
@@ -339,6 +385,7 @@ export function renderDoEResults(metrics) {
         const effFlag   = getFlag(metrics.efficiency,    'eff');
         const resFlag   = getFlag(metrics.resolution,    'res');
         const curveFlag = getFlag(metrics.curvature,     'curve');
+        const formatPercent = value => value === 'N/A' ? 'N/A' : `${value}%`;
 
         let centerCard = '';
         if (metrics.center_replicates !== undefined && metrics.center_replicates > 0) {
@@ -352,13 +399,18 @@ export function renderDoEResults(metrics) {
 
         dashboard.innerHTML = `
             <div class="quality-card">
+                <span class="metric-label">Design Status</span>
+                <span class="metric-value">${metrics.design_status || 'Natural'}</span>
+                <span class="quality-flag ${metrics.design_status === 'Natural' ? 'flag-good' : 'flag-limited'}">${metrics.runs} runs</span>
+            </div>
+            <div class="quality-card">
                 <span class="metric-label">Orthogonality</span>
-                <span class="metric-value">${metrics.orthogonality}%</span>
+                <span class="metric-value">${formatPercent(metrics.orthogonality)}</span>
                 <span class="quality-flag ${orthoFlag.class}">${orthoFlag.text}</span>
             </div>
             <div class="quality-card">
                 <span class="metric-label">D-Efficiency</span>
-                <span class="metric-value">${metrics.efficiency}%</span>
+                <span class="metric-value">${formatPercent(metrics.efficiency)}</span>
                 <span class="quality-flag ${effFlag.class}">${effFlag.text}</span>
             </div>
             <div class="quality-card">
@@ -383,16 +435,17 @@ export function renderDoEResults(metrics) {
 
     head.innerHTML = '<tr>' + feats.map(f => `<th>${f}</th>`).join('') + objHeaders + '</tr>';
 
+    const trailingReplicateRows = (metrics?.center_replicates || 0) + (metrics?.added_replicates || 0);
     body.innerHTML = window.suggestionsData.map((row, idx) => {
         const isReplicate = (
-            metrics && metrics.center_replicates > 0 &&
-            idx >= window.suggestionsData.length - metrics.center_replicates
+            trailingReplicateRows > 0 &&
+            idx >= window.suggestionsData.length - trailingReplicateRows
         );
         const rowStyle = isReplicate
             ? 'background: rgba(251, 191, 36, 0.08); border-left: 4px solid #f59e0b;'
             : '';
         const rowTitle = isReplicate
-            ? ' title="Center-point replicate run (for pure error estimation)"'
+            ? ' title="Repeat run (center-point or exact-count replicate)"'
             : '';
 
         const featCells = feats.map(f =>

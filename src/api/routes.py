@@ -315,7 +315,7 @@ def optimize():
 
 @api_bp.route('/doe', methods=['POST'])
 def run_doe():
-    """Generates a Design of Experiments (DoE) table using pyDOE2."""
+    """Generate a validated Design of Experiments (DoE) table."""
     try:
         req_data       = request.get_json()
         features_config = req_data.get('features', [])

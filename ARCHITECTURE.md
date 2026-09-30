@@ -6,7 +6,7 @@ This document describes the structure of the **Experimental Design and Optimizat
 
 ## Architecture Overview
 
-EDOS is built as a **Single Page Application (SPA)** with a **Flask Python backend** and a **Vanilla HTML5/CSS3/JavaScript frontend**. The backend serves both as the web server and the heavy-computation engine (using PyTorch, BoTorch, GPyTorch, Scikit-Learn, and pyDOE2).
+EDOS is built as a **Single Page Application (SPA)** with a **Flask Python backend** and a **Vanilla HTML5/CSS3/JavaScript frontend**. The backend serves both as the web server and the heavy-computation engine (using PyTorch, BoTorch, GPyTorch, Scikit-Learn, and PyDOE).
 
 The repository is organized as follows:
 
@@ -57,7 +57,7 @@ graph TD
     *   **Role**: Entry point for starting the application.
     *   **Details**: Configures the Flask application, sets up static and template resource directories, and registers the API blueprints. It is built to support both developer mode (running on port `7860` or via `$PORT` environment variables on spaces/deployments) and standalone frozen executables created by PyInstaller (by resolving the temporary directory `sys._MEIPASS` and auto-opening the default browser on port `5000`).
 *   **`requirements.txt`**:
-    *   Lists all necessary Python dependencies (Flask, torch, botorch, gpytorch, scikit-learn, pyDOE2, pandas, numpy).
+    *   Lists all necessary Python dependencies (Flask, torch, botorch, gpytorch, scikit-learn, PyDOE, pandas, numpy).
 *   **`Dockerfile`**:
     *   Used to containerize the app for cloud deployments, such as Hugging Face Spaces (runs on port `7860`).
 
