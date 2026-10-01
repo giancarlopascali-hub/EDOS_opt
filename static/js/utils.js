@@ -12,6 +12,79 @@ export function safeAddListener(id, event, callback) {
     el.addEventListener(event, callback);
 }
 
+export function uniqueCategoricalChoices(values) {
+    const seen = new Set();
+    const choices = [];
+    (values || []).forEach(value => {
+        if (value === null || value === undefined || String(value) === '') return;
+        const text = String(value);
+        if (!seen.has(text)) {
+            seen.add(text);
+            choices.push(text);
+        }
+    });
+    return choices;
+}
+
+export function formatCategoricalChoices(values) {
+    return uniqueCategoricalChoices(values).map(value => {
+        return /[",\r\n]/.test(value) || /^\s|\s$/.test(value)
+            ? `"${value.replace(/"/g, '""')}"`
+            : value;
+    }).join(', ');
+}
+
+export function parseCategoricalChoices(value) {
+    if (Array.isArray(value)) return uniqueCategoricalChoices(value);
+    const text = String(value ?? '');
+    const parsed = [];
+    let field = '';
+    let quoted = false;
+    let fieldWasQuoted = false;
+
+    const finishField = () => {
+        const normalized = fieldWasQuoted ? field : field.trim();
+        if (normalized !== '') parsed.push(normalized);
+        field = '';
+        fieldWasQuoted = false;
+    };
+
+    for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        if (quoted) {
+            if (char === '"') {
+                if (text[index + 1] === '"') {
+                    field += '"';
+                    index += 1;
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field += char;
+            }
+        } else if (char === '"' && field.trim() === '') {
+            field = '';
+            quoted = true;
+            fieldWasQuoted = true;
+        } else if (char === ',') {
+            finishField();
+        } else {
+            field += char;
+        }
+    }
+    if (quoted) throw new Error('Categorical values contain an unclosed quote.');
+    finishField();
+    return uniqueCategoricalChoices(parsed);
+}
+
+export function escapeHtmlAttribute(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 export function exportData(data, columns) {
     // Build CSV entirely client-side — no server round-trip needed
     const escape = (v) => {

@@ -1,9 +1,13 @@
 import math
 import unittest
 
+import pandas as pd
+
 from src.core.constraints import (
     check_objective_constraints,
+    encode_categorical_series,
     eval_numerical_expression,
+    get_categorical_choices,
     validate_feature_constraints,
     validate_feature_ranges,
     validate_objective_constraints,
@@ -42,6 +46,37 @@ class ConstraintTests(unittest.TestCase):
         ])
         with self.assertRaises(ValueError):
             validate_feature_ranges([{'name': 'A', 'type': 'continuous', 'range': '0, 1'}])
+
+    def test_categorical_choices_preserve_embedded_commas(self):
+        feature = {
+            'name': 'Solvent',
+            'type': 'categorical',
+            'range': '"1,4-Dioxane", THF',
+            'choices': ['1,4-Dioxane', 'THF'],
+        }
+        encoded, choices = encode_categorical_series(
+            pd.Series(['1,4-Dioxane', 'THF']), feature
+        )
+        self.assertEqual(choices, ['1,4-Dioxane', 'THF'])
+        self.assertEqual(encoded.tolist(), [0, 1])
+        self.assertEqual(
+            get_categorical_choices({
+                'name': 'Solvent',
+                'type': 'categorical',
+                'range': '"1,4-Dioxane", THF',
+            }),
+            ['1,4-Dioxane', 'THF'],
+        )
+
+    def test_unknown_categorical_values_do_not_fall_back_to_first_choice(self):
+        feature = {
+            'name': 'Solvent',
+            'type': 'categorical',
+            'range': 'THF',
+            'choices': ['THF'],
+        }
+        with self.assertRaisesRegex(ValueError, '1,4-Dioxane'):
+            encode_categorical_series(pd.Series(['1,4-Dioxane']), feature)
 
     def test_objective_constraints_are_strictly_validated(self):
         objectives = [{'name': 'Yield'}, {'name': 'Impurity'}]

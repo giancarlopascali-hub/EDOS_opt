@@ -1,5 +1,5 @@
 import './state.js';
-import { safeAddListener, exportData, detectParetoIndices, rebalanceRemaining, rebalanceObjectiveConfigs, updateRangePlaceholder } from './utils.js';
+import { safeAddListener, exportData, detectParetoIndices, rebalanceRemaining, rebalanceObjectiveConfigs, updateRangePlaceholder, formatCategoricalChoices, uniqueCategoricalChoices } from './utils.js';
 import { runDoE, renderDoEResults, rebalanceDoEDOM, attachDeleteEvents } from './modules/doe.js';
 import { renderBOSetup, runBO, runBOEstimate, renderTrendPlot, renderParetoPlot, updateAcqSelectForMultiObj } from './modules/bo.js';
 import { renderSASetup, runSA, runEstimate, exportSAReport, abortSA } from './modules/sa.js';
@@ -268,9 +268,10 @@ async function handleFiles(files) {
                 const vals  = window.currentData.map(r => r[idx]).filter(v => v != null && v !== '');
                 const isNum = detectColumnIsNumeric(vals);
                 const { min = 0, max = 1 } = isNum ? computeColumnNumericRange(vals) : {};
-                const range = isNum ? `[${min}, ${max}]` : [...new Set(vals)].join(', ');
+                const choices = isNum ? undefined : uniqueCategoricalChoices(vals);
+                const range = isNum ? `[${min}, ${max}]` : formatCategoricalChoices(choices);
 
-                window.boFeatureConfigs[col] = { type: isNum ? 'continuous' : 'categorical', range, included: true };
+                window.boFeatureConfigs[col] = { type: isNum ? 'continuous' : 'categorical', range, choices, included: true };
                 window.saFeatureConfigs[col] = { type: isNum ? 'continuous' : 'categorical', included: true };
             }
         });
@@ -334,9 +335,10 @@ window.toggleColumnRole = (colName) => {
         const vals  = window.currentData.map(r => r[idx]).filter(v => v != null && v !== '');
         const isNum = detectColumnIsNumeric(vals);
         const { min = 0, max = 1 } = isNum ? computeColumnNumericRange(vals) : {};
-        const range = isNum ? `[${min}, ${max}]` : [...new Set(vals)].join(', ');
+        const choices = isNum ? undefined : uniqueCategoricalChoices(vals);
+        const range = isNum ? `[${min}, ${max}]` : formatCategoricalChoices(choices);
 
-        if (!window.boFeatureConfigs[colName]) window.boFeatureConfigs[colName] = { type: isNum ? 'continuous' : 'categorical', range, included: true };
+        if (!window.boFeatureConfigs[colName]) window.boFeatureConfigs[colName] = { type: isNum ? 'continuous' : 'categorical', range, choices, included: true };
         if (!window.saFeatureConfigs[colName]) window.saFeatureConfigs[colName] = { type: isNum ? 'continuous' : 'categorical', included: true };
     } else {
         delete window.boFeatureConfigs[colName];
@@ -531,7 +533,7 @@ function initButtons() {
 
         window.currentDoEFeatures.forEach(f => {
             if (window.currentColumns.includes(f.name)) {
-                window.boFeatureConfigs[f.name] = { type: f.type, range: f.range, included: true };
+                window.boFeatureConfigs[f.name] = { type: f.type, range: f.range, choices: f.choices, included: true };
                 window.saFeatureConfigs[f.name] = { type: f.type, included: true };
             }
         });

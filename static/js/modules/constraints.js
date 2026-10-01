@@ -1,3 +1,5 @@
+import { parseCategoricalChoices } from '../utils.js';
+
 function escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -25,7 +27,7 @@ export function getCategoricalFeatures(modulePrefix) {
                 const name = tr.querySelector('.doe-f-name')?.value;
                 const type = tr.querySelector('.doe-f-type')?.value;
                 const range = tr.querySelector('.doe-f-range')?.value || "";
-                const choices = range.split(',').map(c => c.trim()).filter(c => c);
+                const choices = parseCategoricalChoices(range);
                 return { name, type, choices };
             })
             .filter(f => f.name && f.type === 'categorical');
@@ -33,8 +35,10 @@ export function getCategoricalFeatures(modulePrefix) {
         return window.currentColumns
             .filter(col => window.columnRoles[col] === 'feature' && window.boFeatureConfigs[col] && window.boFeatureConfigs[col].type === 'categorical')
             .map(col => {
-                const range = window.boFeatureConfigs[col].range || "";
-                const choices = range.split(',').map(c => c.trim()).filter(c => c);
+                const config = window.boFeatureConfigs[col];
+                const choices = Array.isArray(config.choices)
+                    ? config.choices
+                    : parseCategoricalChoices(config.range || "");
                 return { name: col, choices };
             });
     }

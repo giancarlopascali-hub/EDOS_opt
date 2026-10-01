@@ -40,7 +40,12 @@ from botorch.optim import optimize_acqf, optimize_acqf_discrete
 from botorch.utils.sampling import draw_sobol_samples
 from botorch.sampling.normal import SobolQMCNormalSampler
 
-from src.core.constraints import check_constraints, check_objective_constraints
+from src.core.constraints import (
+    check_constraints,
+    check_objective_constraints,
+    encode_categorical_series,
+    get_categorical_choices,
+)
 from src.core.feasibility import (
     ProbabilityOfFeasibilityAcquisition,
     candidate_feasibility_report,
@@ -224,9 +229,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
             feature_levels.append(values)
 
         elif f['type'] == 'categorical':
-            choices = [str(x).strip() for x in f_range.split(',')]
-            mapping = {choice: idx for idx, choice in enumerate(choices)}
-            encoded = df_clean[name].astype(str).map(mapping).fillna(0).values
+            encoded, choices = encode_categorical_series(df_clean[name], f)
             train_x_list.append(encoded)
             low, high = 0, len(choices) - 1
             if low == high:
@@ -301,7 +304,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 for idx_f, f in enumerate(features_config):
                     v = pt[idx_f].item()
                     if f['type'] == 'categorical':
-                        choices = [x.strip() for x in f['range'].split(',')]
+                        choices = get_categorical_choices(f)
                         v = choices[max(0, min(len(choices) - 1, int(round(v))))]
                     elif f['type'] in ('discrete', 'regular'):
                         matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
@@ -564,7 +567,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                     for col_idx, f in enumerate(features_config):
                         val = cand[col_idx]
                         if f['type'] == 'categorical':
-                            choices = [x.strip() for x in f['range'].split(',')]
+                            choices = get_categorical_choices(f)
                             choice_idx = max(0, min(len(choices) - 1, int(round(val))))
                             val = choices[choice_idx]
                         elif f['type'] == 'discrete':
@@ -762,7 +765,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                 val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
 
             elif f['type'] == 'categorical':
-                choices = [x.strip() for x in f['range'].split(',')]
+                choices = get_categorical_choices(f)
                 idx_choice = max(0, min(len(choices) - 1, int(round(val))))
                 val     = choices[idx_choice]
 
@@ -808,7 +811,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
                             cur_idx   = d_vals.index(suggestion[f['name']])
                             t_cand[idx] = d_vals[(cur_idx + attempts) % len(d_vals)]
                     elif f['type'] == 'categorical':
-                        choices = [x.strip() for x in f['range'].split(',')]
+                        choices = get_categorical_choices(f)
                         if len(choices) > 1:
                             cur_idx   = choices.index(suggestion[f['name']])
                             t_cand[idx] = float((cur_idx + attempts) % len(choices))
@@ -978,7 +981,7 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
             for feature in features_config:
                 value = suggestion[feature['name']]
                 if feature['type'] == 'categorical':
-                    choices = [x.strip() for x in feature['range'].split(',')]
+                    choices = get_categorical_choices(feature)
                     value = choices.index(str(value))
                 encoded.append(float(value))
             encoded_suggestions.append(encoded)
@@ -1048,9 +1051,7 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
             bounds.append([low, high])
 
         elif f['type'] == 'categorical':
-            choices = [str(x).strip() for x in f_range.split(',')]
-            mapping = {choices[c_idx]: c_idx for c_idx in range(len(choices))}
-            encoded = df_clean[name].astype(str).map(mapping).fillna(0).values
+            encoded, choices = encode_categorical_series(df_clean[name], f)
             train_x_list.append(encoded)
             low, high = 0, len(choices) - 1
             if low == high: high = low + 0.1
@@ -1126,8 +1127,10 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
     for idx, f in enumerate(features_config):
         val = input_values[f['name']]
         if f['type'] == 'categorical':
-            choices = [str(x).strip() for x in f['range'].split(',')]
-            val     = choices.index(str(val)) if str(val) in choices else 0
+            choices = get_categorical_choices(f)
+            if str(val) not in choices:
+                raise ValueError(f"Feature '{f['name']}' has unknown categorical value {val!r}.")
+            val = choices.index(str(val))
         input_point_list.append(float(val))
 
     test_x = torch.tensor([input_point_list], dtype=torch.float32).to(compute_device)
@@ -1323,9 +1326,7 @@ def run_bo_surface(
             feat_ranges[name] = (low, high, f['type'], values)
 
         elif f['type'] == 'categorical':
-            choices = [str(x).strip() for x in f_range.split(',')]
-            mapping = {choice: c_idx for c_idx, choice in enumerate(choices)}
-            encoded = df_clean[name].astype(str).map(mapping).fillna(0).values
+            encoded, choices = encode_categorical_series(df_clean[name], f)
             train_x_list.append(encoded)
             low, high = 0, len(choices) - 1
             if low == high:

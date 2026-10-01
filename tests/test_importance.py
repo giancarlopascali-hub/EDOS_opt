@@ -29,6 +29,26 @@ if (total !== 1000) throw new Error(`Expected 1000 tenths, received ${{total}}`)
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_categorical_choice_csv_round_trip_preserves_embedded_commas(self):
+        utils_uri = (pathlib.Path(__file__).parents[1] / 'static/js/utils.js').resolve().as_uri()
+        script = f"""
+globalThis.window = {{}};
+const mod = await import('{utils_uri}');
+const formatted = mod.formatCategoricalChoices(['1,4-Dioxane', 'THF']);
+if (formatted !== '"1,4-Dioxane", THF') throw new Error(`Unexpected format: ${{formatted}}`);
+const parsed = mod.parseCategoricalChoices(formatted);
+if (JSON.stringify(parsed) !== JSON.stringify(['1,4-Dioxane', 'THF'])) {{
+    throw new Error(`Unexpected parse result: ${{JSON.stringify(parsed)}}`);
+}}
+"""
+        completed = subprocess.run(
+            ['node', '--input-type=module', '--eval', script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

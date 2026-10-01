@@ -6,7 +6,9 @@ import {
     safeJson,
     rangePlaceholderForType,
     submitAndPollJob,
-    cancelBackgroundJob
+    cancelBackgroundJob,
+    escapeHtmlAttribute,
+    parseCategoricalChoices
 } from '../utils.js';
 import { updateAllConstraintsDropdowns } from './constraints.js';
 
@@ -18,6 +20,12 @@ import { updateAllConstraintsDropdowns } from './constraints.js';
  */
 function collectBOObjectiveConstraints() {
     return window.collectObjectiveConstraints?.('bo') || [];
+}
+
+function buildBOFeaturePayload(name, type, range) {
+    const feature = { name, type, range };
+    if (type === 'categorical') feature.choices = parseCategoricalChoices(range);
+    return feature;
 }
 
 // Returns the appropriate range-input placeholder for a given feature type.
@@ -47,7 +55,7 @@ export function renderBOSetup() {
                 <option value="discrete"   ${cfg.type === 'discrete'   ? 'selected' : ''}>discrete</option>
                 <option value="categorical"${cfg.type === 'categorical'? 'selected' : ''}>categorical</option>
             </select></td>
-            <td><input type="text" class="bo-f-range" data-col="${col}" value="${cfg.range}" placeholder="${ph}" onchange="window.syncBOFeatureConfig('${col}', 'range')"></td>
+            <td><input type="text" class="bo-f-range" data-col="${col}" value="${escapeHtmlAttribute(cfg.range)}" placeholder="${ph}" onchange="window.syncBOFeatureConfig('${col}', 'range')"></td>
             <td><input type="checkbox" class="bo-f-include" data-col="${col}" ${cfg.included ? 'checked' : ''} onchange="window.syncBOFeatureConfig('${col}', 'include')"></td>
         </tr>`;
     });
@@ -177,11 +185,11 @@ export async function runBO() {
 
     const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
         .filter(tr => tr.querySelector('.bo-f-include').checked)
-        .map(tr => ({
-            name:  tr.querySelector('.bo-f-type').dataset.col,
-            type:  tr.querySelector('.bo-f-type').value,
-            range: tr.querySelector('.bo-f-range').value
-        }));
+        .map(tr => buildBOFeaturePayload(
+            tr.querySelector('.bo-f-type').dataset.col,
+            tr.querySelector('.bo-f-type').value,
+            tr.querySelector('.bo-f-range').value
+        ));
 
     const objectives = Array.from(document.querySelectorAll('#bo-objectives-list tr'))
         .filter(tr => tr.querySelector('.bo-o-include').checked)
@@ -427,15 +435,15 @@ export function renderBOEstimator() {
 
     const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
         .filter(tr => tr.querySelector('.bo-f-include').checked)
-        .map(tr => ({
-            name:  tr.querySelector('.bo-f-type').dataset.col,
-            type:  tr.querySelector('.bo-f-type').value,
-            range: tr.querySelector('.bo-f-range').value
-        }));
+        .map(tr => buildBOFeaturePayload(
+            tr.querySelector('.bo-f-type').dataset.col,
+            tr.querySelector('.bo-f-type').value,
+            tr.querySelector('.bo-f-range').value
+        ));
 
     estDiv.innerHTML = features.map(f => {
         if (f.type === 'categorical') {
-            const choices = f.range.split(',').map(c => c.trim());
+            const choices = f.choices || parseCategoricalChoices(f.range);
             const options = choices.map(v => `<option value="${v}">${v}</option>`).join('');
             return `<div class="tweak-item">
                 <label>${f.name}</label>
@@ -456,11 +464,11 @@ export async function runBOEstimate() {
 
     const features = Array.from(document.querySelectorAll('#bo-features-list tr'))
         .filter(tr => tr.querySelector('.bo-f-include').checked)
-        .map(tr => ({
-            name:  tr.querySelector('.bo-f-type').dataset.col,
-            type:  tr.querySelector('.bo-f-type').value,
-            range: tr.querySelector('.bo-f-range').value
-        }));
+        .map(tr => buildBOFeaturePayload(
+            tr.querySelector('.bo-f-type').dataset.col,
+            tr.querySelector('.bo-f-type').value,
+            tr.querySelector('.bo-f-range').value
+        ));
 
     const objectives = Array.from(document.querySelectorAll('#bo-objectives-list tr'))
         .filter(tr => tr.querySelector('.bo-o-include').checked)
@@ -976,11 +984,7 @@ async function updateContourPlot() {
         .filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true))
         .map(c => {
             const cfg = window.boFeatureConfigs[c] || {};
-            return {
-                name: c,
-                type: cfg.type || 'continuous',
-                range: cfg.range || ''
-            };
+            return buildBOFeaturePayload(c, cfg.type || 'continuous', cfg.range || '');
         });
 
     const objectives = window.currentColumns
@@ -1119,11 +1123,7 @@ async function updateSurfacePlot() {
         .filter(c => window.columnRoles[c] === 'feature' && (window.boFeatureConfigs[c] ? window.boFeatureConfigs[c].included : true))
         .map(c => {
             const cfg = window.boFeatureConfigs[c] || {};
-            return {
-                name: c,
-                type: cfg.type || 'continuous',
-                range: cfg.range || ''
-            };
+            return buildBOFeaturePayload(c, cfg.type || 'continuous', cfg.range || '');
         });
 
     const objectives = window.currentColumns
@@ -1418,7 +1418,12 @@ window.syncBOFeatureConfig = (col, field) => {
         window.boFeatureConfigs[col].type = tr.querySelector('.bo-f-type').value;
         window.updateRangePlaceholder?.(window.boFeatureConfigs[col].type, tr.querySelector('.bo-f-range'));
     }
-    if (field === 'range'   || !field) window.boFeatureConfigs[col].range    = tr.querySelector('.bo-f-range').value;
+    if (field === 'range' || !field) {
+        window.boFeatureConfigs[col].range = tr.querySelector('.bo-f-range').value;
+        if (window.boFeatureConfigs[col].type === 'categorical') {
+            window.boFeatureConfigs[col].choices = parseCategoricalChoices(window.boFeatureConfigs[col].range);
+        }
+    }
     if (field === 'include' || !field) window.boFeatureConfigs[col].included = tr.querySelector('.bo-f-include').checked;
     updateAllConstraintsDropdowns('bo');
 };

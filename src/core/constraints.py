@@ -6,6 +6,7 @@ validated here as well so every API path applies identical semantics.
 """
 
 import ast
+import csv
 import math
 import operator
 import re
@@ -37,6 +38,52 @@ _SAFE_CMPS = {
     ast.Eq: operator.eq,
     ast.NotEq: operator.ne,
 }
+
+
+def get_categorical_choices(feature):
+    """Return categorical levels without treating commas inside a level as separators."""
+    name = feature.get('name', 'Unnamed feature')
+    supplied = feature.get('choices')
+
+    if supplied is not None:
+        if not isinstance(supplied, (list, tuple)):
+            raise ValueError(f"Feature '{name}' categorical choices must be a list.")
+        raw_choices = [str(value) for value in supplied if value is not None and str(value) != '']
+    else:
+        range_value = str(feature.get('range', '') or '')
+        try:
+            raw_choices = next(csv.reader([range_value], skipinitialspace=True), [])
+        except csv.Error as exc:
+            raise ValueError(f"Feature '{name}' has invalid categorical values.") from exc
+        raw_choices = [value.strip() for value in raw_choices if value.strip()]
+
+    choices = []
+    seen = set()
+    for value in raw_choices:
+        if value not in seen:
+            seen.add(value)
+            choices.append(value)
+    if not choices:
+        raise ValueError(f"Feature '{name}' requires one or more categories.")
+    return choices
+
+
+def encode_categorical_series(series, feature):
+    """Encode a categorical Series and reject levels missing from the declared choices."""
+    choices = get_categorical_choices(feature)
+    mapping = {choice: idx for idx, choice in enumerate(choices)}
+    values = series.astype(str)
+    encoded = values.map(mapping)
+    if encoded.isna().any():
+        unknown = list(dict.fromkeys(values[encoded.isna()].tolist()))
+        preview = ', '.join(repr(value) for value in unknown[:5])
+        if len(unknown) > 5:
+            preview += ', ...'
+        raise ValueError(
+            f"Feature '{feature.get('name', 'Unnamed feature')}' contains categorical "
+            f"value(s) missing from its choices: {preview}."
+        )
+    return encoded.to_numpy(), choices
 
 
 def _parse_expression(expression):
@@ -261,9 +308,7 @@ def validate_feature_ranges(features_config):
             if not all(math.isfinite(value) for value in values):
                 raise ValueError(f"Feature '{name}' values must be finite.")
         elif feature_type == 'categorical':
-            categories = [part.strip() for part in range_value.split(',') if part.strip()]
-            if not categories:
-                raise ValueError(f"Feature '{name}' requires one or more categories.")
+            get_categorical_choices(feature)
         else:
             raise ValueError(f"Feature '{name}' has unknown type '{feature_type}'.")
 
