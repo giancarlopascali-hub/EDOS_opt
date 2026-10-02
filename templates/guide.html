@@ -93,18 +93,21 @@
                 <tr><td><b>Box-Behnken</b></td><td>Response-surface studies with three or more factors; includes centre-point replicates.</td></tr>
                 <tr><td><b>Central Composite</b></td><td>Face-centred quadratic response-surface modelling and curvature checks within the entered factor bounds; includes centre-point replicates.</td></tr>
                 <tr><td><b>Fractional Factorial</b></td><td>Efficient two-level screening at selectable Resolution III, IV, or V (or better).</td></tr>
+                <tr><td><b>Full Factorial</b></td><td>Every combination of the declared categorical, discrete, and regular levels; continuous factors use their lower and upper bounds. Supports mixed level counts. The natural run count is the product of the factor level counts.</td></tr>
                 <tr><td><b>Definitive Screening</b></td><td>Three-level early-stage screening that estimates main effects independently of quadratic effects; two-level categorical factors are supported.</td></tr>
                 <tr><td><b>Latin Hypercube Sampling (LHS)</b></td><td>Space-filling coverage with an exact user-selected number of runs.</td></tr>
-                <tr><td><b>D-Optimal</b></td><td>A custom-sized, model-aware design. Select Linear, Interaction (2FI), or Quadratic order; use at least the displayed recommended minimum run count.</td></tr>
+                <tr><td><b>D-Optimal</b></td><td>A custom-sized, model-aware design. Select Linear, Interaction (2FI), or Quadratic order. The displayed run count is guidance: smaller designs are allowed, with a warning and zero D-efficiency when not all selected effects can be estimated.</td></tr>
             </tbody></table>
             <h3>Read the generated design</h3>
             <ul>
                 <li><b>Orthogonality</b> shows how independently factors vary; higher is generally better.</li>
                 <li><b>D-Efficiency</b> indicates how efficiently the design estimates its intended model; higher is generally better.</li>
-                <li><b>Resolution</b> is reported for fractional factorial designs. It is shown as N/A for designs where classical fractional-factorial resolution does not apply.</li>
-                <li><b>Curvature</b> indicates whether the layout can represent nonlinear responses. Centre-point replicates are placed last and highlighted; they help estimate pure experimental error and lack of fit.</li>
+                <li><b>Resolution</b> reports Full factorial for a complete factorial grid, or the resolution of a complete fractional factorial design. Reduced designs show N/A because the original resolution is not guaranteed.</li>
+                <li><b>Curvature</b> indicates whether the layout can represent nonlinear numerical responses. The first centre point is unique; subsequent repeats are highlighted and help estimate pure experimental error and lack of fit.</li>
             </ul>
-            <p>For Box-Behnken, Central Composite, Fractional Factorial, and Definitive Screening designs, a Max count below the natural size produces a quality-optimized reduced subset and a warning. A larger Max count leaves the natural design unchanged. An Exact count above the natural size adds clearly flagged repeat runs at the end. LHS and D-Optimal always use an exact count. Constraints are supported by D-Optimal, where infeasible candidates are removed before selection.</p>
+            <p>For all classical designs, including Full Factorial, a Max or Exact count below the natural size returns the requested number of runs and a reduction warning, even when too few runs remain to estimate all intended effects. Unique conditions take priority: repeats enter the table only after all unique conditions in the design are exhausted. A larger Max leaves the natural design unchanged; a larger Exact adds flagged repeats at the end. Quality metrics use the entire returned table, including repeats.</p>
+            <p>LHS and D-Optimal always use an exact count. They exhaust unique feasible combinations before repeating when the search space is finite. LHS retains N/A quality metrics. Constraints are supported by D-Optimal, where infeasible candidates are removed before selection.</p>
+            <p>Full Factorial quality calculations assess main effects, two-factor interactions, and numerical quadratic terms for factors with at least three declared levels. Continuous bounds alone cannot assess curvature. Very large grids use a sampled candidate pool for reduced designs, disclosed in the warning; requesting more than 100,000 complete factorial runs requires fewer levels or a reduced count.</p>
         </section>
 
         <section class="guide-section" id="bo">

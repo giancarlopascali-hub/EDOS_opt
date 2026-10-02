@@ -6,6 +6,8 @@ Tests verify that the generate_doe() function returns valid tables
 with the correct structure and design quality metrics.
 """
 
+import itertools
+import numpy as np
 import pytest
 from src.core.doe import generate_doe
 
@@ -450,9 +452,9 @@ class TestRunCountModes:
         assert metrics['design_status'] == 'Reduced'
         assert metrics['reduction_warning'] is True
         assert metrics['design_warning']
-        assert metrics['rank'] < metrics['parameters']
-        assert metrics['efficiency'] == 0
-        assert table[-3:] == [table[-1]] * 3
+        assert len({tuple(row.values()) for row in table}) == 10
+        assert metrics['rank'] == metrics['parameters']
+        assert metrics['efficiency'] > 0
 
     def test_max_above_natural_does_not_add_runs(self, three_cont_features):
         table, metrics = generate_doe(three_cont_features, {
@@ -488,3 +490,164 @@ class TestDOptimalMixedFactors:
         assert len({row['Temperature'] for row in table}) > 1
         assert len({row['Pressure'] for row in table}) > 1
         assert metrics['rank'] == metrics['parameters']
+
+
+class TestFullFactorial:
+    def test_all_mixed_level_combinations_and_feature_order(self):
+        features = [
+            {'name': 'Solvent', 'type': 'categorical', 'range': 'Water, Ethanol, DMSO'},
+            {'name': 'Dose', 'type': 'discrete', 'range': '1, 2, 10'},
+            {'name': 'Temperature', 'type': 'continuous', 'range': '[20, 80]'},
+            {'name': 'Flow', 'type': 'regular', 'range': '[0, 1, 4]'},
+        ]
+        table, metrics = generate_doe(features, {'model': 'fullfact', 'max_runs': 100})
+        expected = set(itertools.product(['Water', 'Ethanol', 'DMSO'], [1, 2, 10], [20, 80], np.linspace(0, 1, 4)))
+        assert set(tuple(row.values()) for row in table) == expected
+        assert list(table[0]) == ['Solvent', 'Dose', 'Temperature', 'Flow']
+        assert len(table) == metrics['natural_runs'] == 72
+        assert metrics['resolution'] == 'Full factorial'
+        assert metrics['curvature'] == 'Partial'
+        assert metrics['rank'] == metrics['parameters']
+
+    def test_categorical_only_including_quoted_and_repeated_labels(self):
+        features = [
+            {'name': 'Solvent', 'type': 'categorical', 'range': '"1,4-Dioxane", THF, Water, THF'},
+            {'name': 'Catalyst', 'type': 'categorical', 'range': 'A, B, C, D'},
+        ]
+        table, metrics = generate_doe(features, {'model': 'fullfact'})
+        assert len(table) == 12
+        assert {row['Solvent'] for row in table} == {'1,4-Dioxane', 'THF', 'Water'}
+        assert metrics['curvature'] == 'N/A'
+        assert metrics['rank'] == metrics['parameters'] == 12
+
+    def test_two_level_metrics(self, three_cont_features):
+        _, metrics = generate_doe(three_cont_features, {'model': 'fullfact'})
+        assert metrics['orthogonality'] == metrics['efficiency'] == 100
+        assert metrics['rank'] == metrics['parameters'] == 7
+        assert metrics['curvature'].startswith('None')
+
+    def test_numeric_three_level_curvature(self):
+        features = [{'name': name, 'type': 'discrete', 'range': '0, 1, 2'} for name in ['A', 'B']]
+        _, metrics = generate_doe(features, {'model': 'fullfact'})
+        assert metrics['curvature'] == 'Excellent'
+        assert metrics['rank'] == metrics['parameters'] == 6
+
+    def test_constraints_direct_user_to_doptimal(self, three_cont_features):
+        with pytest.raises(ValueError, match='D-Optimal designs only'):
+            generate_doe(three_cont_features, {'model': 'fullfact', 'constraints': {'numerical': ['A < 5']}})
+
+    def test_large_reduced_grid_reports_true_natural_size(self):
+        features = [{'name': f'X{i}', 'type': 'categorical', 'range': 'A, B, C'} for i in range(9)]
+        table, metrics = generate_doe(features, {'model': 'fullfact', 'max_runs': 5})
+        assert len(table) == 5
+        assert metrics['natural_runs'] == 3 ** 9
+        assert 'sampled candidate pool' in metrics['design_warning']
+
+
+CLASSICAL_MODELS = ['bbdesign', 'ccdesign', 'fracfact', 'def_screening', 'fullfact']
+
+
+@pytest.mark.parametrize('model', CLASSICAL_MODELS)
+@pytest.mark.parametrize('exact', [False, True])
+@pytest.mark.parametrize('runs', [1, 5])
+def test_small_classical_budgets_are_unique_and_warn(model, exact, runs, three_cont_features):
+    table, metrics = generate_doe(three_cont_features, {'model': model, 'max_runs': runs, 'use_exact_runs': exact})
+    assert len(table) == len({tuple(row.values()) for row in table}) == runs
+    assert metrics['design_status'] == 'Reduced'
+    assert metrics['reduction_warning']
+    assert metrics['repeat_runs'] == 0
+    if metrics['rank'] < metrics['parameters']:
+        assert metrics['efficiency'] == 0
+        assert 'not all intended effects' in metrics['design_warning']
+    if model in {'fullfact', 'fracfact'}:
+        assert metrics['resolution'].startswith('N/A')
+
+
+@pytest.mark.parametrize('model', CLASSICAL_MODELS)
+def test_classical_counts_around_natural_size(model, three_cont_features):
+    natural, original = generate_doe(three_cont_features, {'model': model, 'max_runs': 100})
+    unique_count = len({tuple(row.values()) for row in natural})
+    for exact in [False, True]:
+        for count in [unique_count, len(natural) - 1, len(natural), len(natural) + 4]:
+            table, metrics = generate_doe(three_cont_features, {'model': model, 'max_runs': count, 'use_exact_runs': exact})
+            assert len(table) == (count if exact else min(count, len(natural)))
+            keys = [tuple(row.values()) for row in table]
+            first_repeat = next((i for i, row in enumerate(keys) if row in keys[:i]), len(keys))
+            assert first_repeat == min(len(table), unique_count)
+            assert set(keys[first_repeat:]).issubset(keys[:first_repeat])
+            assert metrics['repeat_runs'] == len(keys) - first_repeat
+            assert metrics['added_replicates'] == (max(0, count - len(natural)) if exact else 0)
+
+
+@pytest.mark.parametrize('order', ['linear', 'interaction', 'quadratic'])
+@pytest.mark.parametrize('runs', [1, 2, 3])
+def test_doptimal_accepts_undersized_budgets(order, runs, three_cont_features):
+    table, metrics = generate_doe(three_cont_features, {'model': 'doptimal', 'dopt_model_order': order, 'max_runs': runs})
+    assert len(table) == len({tuple(row.values()) for row in table}) == runs
+    assert metrics['rank'] == runs
+    assert metrics['rank'] < metrics['parameters']
+    assert metrics['efficiency'] == 0
+    assert 'not all intended effects' in metrics['design_warning']
+
+
+@pytest.mark.parametrize('model', ['lhs', 'doptimal'])
+@pytest.mark.parametrize('runs', [1, 5, 6, 10])
+def test_exact_designs_exhaust_finite_space_before_repeats(model, runs):
+    features = [
+        {'name': 'Dose', 'type': 'discrete', 'range': '1, 2, 10'},
+        {'name': 'Catalyst', 'type': 'categorical', 'range': 'A, B'},
+    ]
+    table, metrics = generate_doe(features, {'model': model, 'max_runs': runs})
+    keys = [tuple(row.values()) for row in table]
+    unique_count = min(runs, 6)
+    assert len(table) == runs
+    assert len(set(keys[:unique_count])) == unique_count
+    assert set(keys[unique_count:]).issubset(keys[:unique_count])
+    assert metrics['added_replicates'] == max(0, runs - 6)
+    assert metrics['oversampling_warning'] == (runs > 6)
+
+
+def test_doptimal_exhausts_feasible_combinations_only():
+    features = [{'name': name, 'type': 'categorical', 'range': 'A, B, C'} for name in ['X', 'Y']]
+    constraints = {'disallowed': [[{'feature': 'X', 'value': 'A'}]]}
+    table, metrics = generate_doe(features, {'model': 'doptimal', 'max_runs': 8, 'constraints': constraints})
+    assert all(row['X'] != 'A' for row in table)
+    assert len({tuple(row.values()) for row in table[:6]}) == 6
+    assert table[6:] == table[:2]
+    assert metrics['added_replicates'] == 2
+
+
+def test_doptimal_continuous_grid_is_not_treated_as_exhausted(two_cont_features):
+    table, metrics = generate_doe(two_cont_features, {'model': 'doptimal', 'dopt_model_order': 'linear', 'max_runs': 60})
+    assert len({tuple(row.values()) for row in table}) == 60
+    assert metrics['repeat_runs'] == 0
+
+
+def test_lhs_single_continuous_run(two_cont_features):
+    table, metrics = generate_doe(two_cont_features, {'model': 'lhs', 'max_runs': 1})
+    assert len(table) == 1
+    assert metrics['efficiency'] == 'N/A'
+
+
+def test_doptimal_can_find_feasible_points_between_grid_levels(two_cont_features):
+    table, _ = generate_doe(two_cont_features, {
+        'model': 'doptimal', 'max_runs': 3,
+        'constraints': {'numerical': ['X > 0.02', 'X < 0.06']},
+    })
+    assert len({tuple(row.values()) for row in table}) == 3
+    assert all(0.02 < row['X'] < 0.06 for row in table)
+
+
+def test_doptimal_empty_finite_space_is_not_repeated():
+    features = [{'name': name, 'type': 'discrete', 'range': '0, 1'} for name in ['X', 'Y']]
+    with pytest.raises(ValueError, match='No candidate design points'):
+        generate_doe(features, {'model': 'doptimal', 'max_runs': 2, 'constraints': {'numerical': ['X > 2']}})
+
+
+def test_metrics_include_the_returned_repeat_rows(three_cont_features):
+    _, natural = generate_doe(three_cont_features, {'model': 'fullfact', 'max_runs': 8})
+    _, repeated = generate_doe(three_cont_features, {'model': 'fullfact', 'max_runs': 9, 'use_exact_runs': True})
+    _, balanced = generate_doe(three_cont_features, {'model': 'fullfact', 'max_runs': 16, 'use_exact_runs': True})
+    assert natural['efficiency'] == balanced['efficiency'] == 100
+    assert repeated['efficiency'] < natural['efficiency']
+    assert repeated['orthogonality'] < natural['orthogonality']

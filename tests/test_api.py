@@ -131,6 +131,27 @@ class TestUploadEndpoint:
 class TestDoeEndpoint:
     """Tests for the DoE generation endpoint."""
 
+    @pytest.mark.parametrize('model,runs', [('fullfact', 3), ('fullfact', 8), ('doptimal', 1), ('doptimal', 8)])
+    def test_mixed_level_run_counts_and_warning_payload(self, client, model, runs):
+        response = client.post('/doe', json={
+            'features': [
+                {'name': 'Solvent', 'type': 'categorical', 'range': 'Water, Ethanol, DMSO'},
+                {'name': 'Dose', 'type': 'discrete', 'range': '1, 2'},
+            ],
+            'tweaks': {'model': model, 'max_runs': runs, 'use_exact_runs': True},
+        })
+        assert response.status_code == 200
+        result = response.get_json()
+        assert 'error' not in result
+        assert len(result['suggestions']) == runs
+        assert result['metrics']['design_warning']
+        assert result['metrics']['added_replicates'] == max(0, runs - 6)
+        assert {'orthogonality', 'efficiency', 'resolution', 'curvature'} <= result['metrics'].keys()
+
+    def test_full_factorial_is_exposed_in_selector(self, client):
+        response = client.get('/')
+        assert b'<option value="fullfact">Full Factorial</option>' in response.data
+
     def test_doe_returns_suggestions_and_metrics(self, client, sample_doe_payload):
         """POST /doe with a valid payload should return 'suggestions' and 'metrics'."""
         resp = client.post(
@@ -201,6 +222,5 @@ class TestBoSurfaceEndpoint:
         assert len(result['y']) == 10
         assert len(result['z']) == 10
         assert len(result['experiments']) == 5
-
 
 

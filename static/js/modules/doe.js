@@ -1,4 +1,4 @@
-import { exportData, rebalanceRemaining } from '../utils.js';
+import { exportData, rebalanceRemaining, parseCategoricalChoices } from '../utils.js';
 import { updateAllConstraintsDropdowns } from './constraints.js';
 
 export function rebalanceDoEDOM() {
@@ -112,9 +112,10 @@ function updateDoptMinNHint() {
     const groupSizes = featureRows.map(row => {
         const type = row.querySelector('.doe-f-type')?.value;
         if (type !== 'categorical') return 1;
-        const levels = (row.querySelector('.doe-f-range')?.value || '')
-            .split(',').map(value => value.trim()).filter(Boolean).length;
-        return Math.max(1, levels - 1);
+        let levels;
+        try { levels = parseCategoricalChoices(row.querySelector('.doe-f-range')?.value || '').length; }
+        catch { levels = 0; }
+        return Math.max(0, levels - 1);
     });
     let minN = 1 + groupSizes.reduce((sum, size) => sum + size, 0);
     if (order === 'interaction' || order === 'quadratic') {
@@ -128,7 +129,7 @@ function updateDoptMinNHint() {
         minN += featureRows.filter(row => row.querySelector('.doe-f-type')?.value !== 'categorical').length;
     }
 
-    hintEl.textContent   = `Minimum required: ${minN} runs for ${k} factor${k !== 1 ? 's' : ''}`;
+    hintEl.textContent   = `At least ${minN} runs to estimate all selected terms for ${k} factor${k !== 1 ? 's' : ''}. Fewer runs are allowed with a quality warning; sufficient factor levels are also needed.`;
     hintEl.style.display = 'block';
 }
 
@@ -291,9 +292,11 @@ export function renderDoEResults(metrics) {
                             align-items:flex-start; text-align:left;">
                     <span style="font-size:1.25rem;">⚠️</span>
                     <div>
-                        <strong>Low design quality or calculation errors detected:</strong>
+                        <strong>Limited design quality:</strong>
                         <p style="margin:0.25rem 0 0 0;">It is suggested to increase the
                         "Max / Exact number of experiments" or modify/remove constraints.</p>
+                        ${metrics.design_warning && !metrics.reduction_warning && !metrics.added_replicates
+                            ? `<p style="margin:0.25rem 0 0 0;">${metrics.design_warning}</p>` : ''}
                     </div>
                 </div>`;
             warningBanner.classList.remove('hidden');
@@ -325,9 +328,8 @@ export function renderDoEResults(metrics) {
                     <span style="font-size:1.25rem;">⚠️</span>
                     <div>
                         <strong>Repeat experiments added (${metrics.added_replicates} runs):</strong>
-                        <p style="margin:0.25rem 0 0 0;">The exact count is above the natural
-                        ${metrics.natural_runs}-run design. The added repeat runs are placed last
-                        and included in the reported quality calculations.</p>
+                        <p style="margin:0.25rem 0 0 0;">${metrics.design_warning}
+                        Repeats follow all unique combinations and are included in the reported quality calculations.</p>
                     </div>
                 </div>`;
             warningBanner.classList.remove('hidden');
@@ -342,11 +344,10 @@ export function renderDoEResults(metrics) {
                             align-items:flex-start; text-align:left;">
                     <span style="font-size:1.25rem;">ℹ️</span>
                     <div>
-                        <strong>Center-point replicates included (${metrics.center_replicates} runs):</strong>
-                        <p style="margin:0.25rem 0 0 0;">This design includes ${metrics.center_replicates} repeated experiment(s) at the
-                        center point of the design space. These are placed <em>last</em> in the table
-                        and highlighted with an amber indicator. They are statistically necessary for estimating
-                        pure experimental error and testing model lack-of-fit in Response Surface Methodology (RSM).</p>
+                        <strong>Center points included (${metrics.center_replicates} runs):</strong>
+                        <p style="margin:0.25rem 0 0 0;">The first center point is a unique condition.
+                        Further center-point runs are repeats and follow all unique conditions, highlighted in amber.
+                        Repeated measurements help estimate pure experimental error and test model lack-of-fit.</p>
                     </div>
                 </div>`;
             warningBanner.classList.remove('hidden');
@@ -391,7 +392,7 @@ export function renderDoEResults(metrics) {
         if (metrics.center_replicates !== undefined && metrics.center_replicates > 0) {
             centerCard = `
             <div class="quality-card">
-                <span class="metric-label">Center Replicates</span>
+                <span class="metric-label">Center Points</span>
                 <span class="metric-value">${metrics.center_replicates}</span>
                 <span class="quality-flag flag-limited" title="Classical RSM pure-error replicates at center point (placed last in table)">Placed Last</span>
             </div>`;
@@ -428,24 +429,26 @@ export function renderDoEResults(metrics) {
         dashboard.classList.remove('hidden');
     }
 
-    const feats = Object.keys(window.suggestionsData[0]);
+    const returnedFeatures = Object.keys(window.suggestionsData[0]);
+    const configuredFeatures = (window.currentDoEFeatures || []).map(feature => feature.name);
+    const feats = [...configuredFeatures.filter(name => returnedFeatures.includes(name)),
+        ...returnedFeatures.filter(name => !configuredFeatures.includes(name))];
     const objHeaders = window.currentDoEObjectives.length > 0
         ? window.currentDoEObjectives.map(o => `<th>${o.name}</th>`).join('')
         : '<th>Target(s)</th>';
 
     head.innerHTML = '<tr>' + feats.map(f => `<th>${f}</th>`).join('') + objHeaders + '</tr>';
 
-    const trailingReplicateRows = (metrics?.center_replicates || 0) + (metrics?.added_replicates || 0);
-    body.innerHTML = window.suggestionsData.map((row, idx) => {
-        const isReplicate = (
-            trailingReplicateRows > 0 &&
-            idx >= window.suggestionsData.length - trailingReplicateRows
-        );
+    const seenConditions = new Set();
+    body.innerHTML = window.suggestionsData.map(row => {
+        const condition = JSON.stringify(feats.map(feature => row[feature]));
+        const isReplicate = seenConditions.has(condition);
+        seenConditions.add(condition);
         const rowStyle = isReplicate
             ? 'background: rgba(251, 191, 36, 0.08); border-left: 4px solid #f59e0b;'
             : '';
         const rowTitle = isReplicate
-            ? ' title="Repeat run (center-point or exact-count replicate)"'
+            ? ' title="Repeat run (previously proposed combination)"'
             : '';
 
         const featCells = feats.map(f =>

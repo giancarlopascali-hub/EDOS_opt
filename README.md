@@ -25,7 +25,7 @@ verification and source-revision traceability.
 
 ## Key Features
 
-- **DoE Module**: Generate Box-Behnken, Central Composite, Fractional Factorial and Definitive Screening designs.
+- **DoE Module**: Generate Box-Behnken, Central Composite, Fractional Factorial, mixed-level Full Factorial, Definitive Screening, LHS, and D-Optimal designs. Reduced budgets prioritize unique combinations; Exact counts add flagged repeats only after unique conditions are exhausted.
 - **Scientific Quality Metrics**: Real-time calculation of Orthogonality, D-Efficiency, Resolution, and Curvature detection with a visual "Quality Dashboard".
 - **Bayesian Optimizer**: Suggest the best experiments to perform next and improve your peformance, visualizing objective trends and Pareto front. It supports categorical parameters and multi-objective optimization.
 - **Statistical Analysis**: Perform basic analysis on experimental data, including feature importance, correlation, and success-based optimization.

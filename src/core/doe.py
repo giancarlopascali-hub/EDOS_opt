@@ -12,13 +12,14 @@ import pydoe as doe
 from scipy.linalg import qr
 
 from src.core.bo import infer_decimal_precision
-from src.core.constraints import check_constraints
+from src.core.constraints import check_constraints, get_categorical_choices
 
 
 SUPPORTED_MODELS = {
     "bbdesign",
     "ccdesign",
     "fracfact",
+    "fullfact",
     "def_screening",
     "lhs",
     "doptimal",
@@ -28,6 +29,7 @@ MODEL_LABELS = {
     "bbdesign": "Box-Behnken",
     "ccdesign": "Central Composite",
     "fracfact": "Fractional Factorial",
+    "fullfact": "Full Factorial",
     "def_screening": "Definitive Screening",
     "lhs": "Latin Hypercube",
     "doptimal": "D-Optimal",
@@ -53,7 +55,7 @@ def _parse_features(features_config):
             continue
 
         if feature_type == "categorical":
-            choices = [item.strip() for item in range_text.split(",") if item.strip()]
+            choices = get_categorical_choices(feature)
             if choices:
                 valid_features.append(
                     {
@@ -119,7 +121,9 @@ def _feature_codes(feature):
     if feature["type"] == "categorical":
         count = len(feature["choices"])
     elif feature["type"] in {"regular", "discrete"}:
-        count = len(feature["levels"])
+        return 2.0 * (np.asarray(feature["levels"]) - feature["low"]) / (
+            feature["high"] - feature["low"]
+        ) - 1.0
     else:
         return None
     return np.linspace(-1.0, 1.0, count) if count > 1 else np.array([0.0])
@@ -140,6 +144,8 @@ def _decode_row(row, features, model_type):
         )
         if feature["type"] in {"regular", "discrete"}:
             value = min(feature["levels"], key=lambda candidate: abs(candidate - value))
+            entry[feature["name"]] = float(value)
+            continue
 
         precision = infer_decimal_precision(None, feature.get("range", ""))
         # Space-filling and optimal designs need enough precision to avoid
@@ -183,6 +189,7 @@ def _main_effect_columns(coded_design, features):
         # columns and works for categorical factors with any number of levels.
         groups.append(
             np.column_stack([(indices == level).astype(float) for level in range(1, len(choices))])
+            if len(choices) > 1 else np.empty((len(values), 0))
         )
     return groups
 
@@ -193,7 +200,7 @@ def _build_model_matrix(coded_design, features, model_spec):
     columns = [np.ones((len(coded_design), 1))]
     columns.extend(groups)
 
-    if model_spec in {"interaction", "quadratic", "response_surface"}:
+    if model_spec in {"interaction", "quadratic", "response_surface", "factorial"}:
         for first in range(len(groups)):
             for second in range(first + 1, len(groups)):
                 columns.append(
@@ -202,9 +209,11 @@ def _build_model_matrix(coded_design, features, model_spec):
                     )
                 )
 
-    if model_spec in {"quadratic", "response_surface", "dsd"}:
+    if model_spec in {"quadratic", "response_surface", "dsd", "factorial"}:
         for index, feature in enumerate(features):
             if feature["type"] != "categorical":
+                if model_spec == "factorial" and len(feature.get("levels", [])) < 3:
+                    continue
                 columns.append((coded_design[:, index] ** 2).reshape(-1, 1))
 
     return np.hstack([column for column in columns if column.shape[1] > 0])
@@ -221,6 +230,8 @@ def _d_efficiency(model_matrix):
 
 
 def _orthogonality(coded_design, features):
+    if len(coded_design) < 2:
+        return 0.0
     groups = _main_effect_columns(coded_design, features)
     columns = np.hstack(groups) if groups else np.empty((len(coded_design), 0))
     varying = columns[:, np.ptp(columns, axis=0) > 1e-12]
@@ -239,19 +250,10 @@ def _greedy_doptimal_indices(model_matrix, n_points):
             f"Only {n_candidates} distinct feasible candidate points are available "
             f"for the requested {n_points}-run D-Optimal design."
         )
-    if np.linalg.matrix_rank(model_matrix) < n_parameters:
-        raise ValueError(
-            "The candidate space cannot estimate every term in the selected D-Optimal model. "
-            "Add factor levels or choose a simpler model order."
-        )
-    if n_points < n_parameters:
-        raise ValueError(
-            f"D-Optimal requires at least {n_parameters} runs for the selected factor types "
-            f"and model (requested {n_points})."
-        )
+    rank = np.linalg.matrix_rank(model_matrix)
 
     _, _, pivots = qr(model_matrix.T, pivoting=True, mode="economic")
-    selected = [int(index) for index in pivots[:n_parameters]]
+    selected = [int(index) for index in pivots[:min(rank, n_points)]]
     selected_set = set(selected)
     information = model_matrix[selected].T @ model_matrix[selected]
 
@@ -266,7 +268,7 @@ def _greedy_doptimal_indices(model_matrix, n_points):
 
     # A few Fedorov-style exchange passes materially improve the sequential
     # start while retaining unique experimental conditions.
-    for _ in range(3):
+    for _ in range(3 if rank == n_parameters and n_points >= n_parameters else 0):
         improved = False
         for position, current_index in enumerate(list(selected)):
             available = [index for index in range(n_candidates) if index not in selected_set]
@@ -302,39 +304,58 @@ def _greedy_doptimal_indices(model_matrix, n_points):
 
 
 def _quality_subset(design, n_points, features, model_spec, center_count=0):
-    """Reduce a classical design by D-optimal row selection, keeping centers last."""
+    """Select informative unique conditions before spending any budget on repeats."""
     if n_points >= len(design):
         return design.copy()
-    reserved_centers = min(center_count, n_points)
-    noncenter_count = n_points - reserved_centers
-    noncenter_design = design[: len(design) - center_count] if center_count else design
-    centers = design[len(design) - center_count :] if center_count else np.empty((0, design.shape[1]))
+    unique, repeats = _partition_repeats(design)
+    if n_points >= len(unique):
+        return np.vstack([unique, repeats[:n_points - len(unique)]])
+    matrix = _build_model_matrix(unique, features, model_spec)
+    return unique[_greedy_doptimal_indices(matrix, n_points)]
 
-    if noncenter_count:
-        matrix = _build_model_matrix(noncenter_design, features, model_spec)
-        # Rank-deficient subsets are allowed here by design: the user explicitly
-        # requested fewer than the natural number of runs. Select the rows that
-        # maximize incremental information and let the metrics expose the loss.
-        selected = []
-        information = np.eye(matrix.shape[1]) * 1e-10
-        remaining = set(range(len(noncenter_design)))
-        for _ in range(min(noncenter_count, len(noncenter_design))):
-            inverse = np.linalg.pinv(information)
-            candidates = sorted(remaining)
-            scores = np.einsum(
-                "ij,jk,ik->i", matrix[candidates], inverse, matrix[candidates]
+
+def _partition_repeats(design):
+    """Stable partition of actual, decoded/re-encoded experimental conditions."""
+    seen, unique, repeats = set(), [], []
+    for row in design:
+        key = tuple(row)
+        (repeats if key in seen else unique).append(row)
+        seen.add(key)
+    width = design.shape[1]
+    return (np.asarray(unique, dtype=float).reshape(-1, width),
+            np.asarray(repeats, dtype=float).reshape(-1, width))
+
+
+def _factorial_levels(features):
+    return [codes if (codes := _feature_codes(feature)) is not None
+            else np.array([-1.0, 1.0]) for feature in features]
+
+
+def _factorial_candidates(features, n_runs):
+    """Enumerate modest grids; sample large grids without losing their true size."""
+    levels = _factorial_levels(features)
+    total = math.prod(map(len, levels))
+    if total <= 10000 or n_runs >= total:
+        if total > 100000:
+            raise ValueError(
+                f"The complete Full Factorial design has {total:,} runs. "
+                "Request a reduced run count or use fewer factor levels."
             )
-            best = candidates[int(np.argmax(scores))]
-            selected.append(best)
-            remaining.remove(best)
-            information += np.outer(matrix[best], matrix[best])
-        reduced = noncenter_design[selected]
-    else:
-        reduced = np.empty((0, design.shape[1]))
-
-    if reserved_centers:
-        reduced = np.vstack([reduced, centers[:reserved_centers]])
-    return reduced
+        return np.asarray(list(itertools.product(*levels)), dtype=float), total
+    count = min(total, max(2000, n_runs * 5))
+    rng = random.Random(42)
+    # Mixed-radix row indices avoid materialising an exponentially large grid.
+    indices = {0, total - 1}
+    while len(indices) < count:
+        indices.add(rng.randrange(total))
+    rows = []
+    for index in sorted(indices):
+        row = []
+        for values in reversed(levels):
+            index, digit = divmod(index, len(values))
+            row.append(values[digit])
+        rows.append(row[::-1])
+    return np.asarray(rows, dtype=float), total
 
 
 def _fractional_resolution(design):
@@ -384,10 +405,8 @@ def _filter_unique_candidates(candidates, features, constraints, model_type):
         ):
             continue
         key = tuple(decoded[feature["name"]] for feature in features)
-        unique.setdefault(key, candidate)
-    if not unique:
-        raise ValueError("No candidate design points satisfy the specified constraints.")
-    return np.asarray(list(unique.values()), dtype=float)
+        unique.setdefault(key, _encode_table([decoded], features)[0])
+    return np.asarray(list(unique.values()), dtype=float).reshape(-1, len(features))
 
 
 def _generate_lhs(features, n_runs):
@@ -398,7 +417,8 @@ def _generate_lhs(features, n_runs):
         raise ValueError("Latin Hypercube Sampling requires at least one numerical factor.")
     design = np.zeros((n_runs, len(features)), dtype=float)
     numeric = doe.lhs(
-        len(numeric_indices), samples=n_runs, criterion="maximin", seed=42
+        len(numeric_indices), samples=n_runs,
+        criterion="maximin" if n_runs > 1 else None, seed=42
     ) * 2.0 - 1.0
     for numeric_column, design_column in enumerate(numeric_indices):
         feature = features[design_column]
@@ -418,6 +438,60 @@ def _generate_lhs(features, n_runs):
         random.Random(42 + column).shuffle(balanced)
         design[:, column] = balanced
     return design
+
+
+def _unique_lhs(features, n_runs):
+    design = _encode_table(
+        [_decode_row(row, features, "lhs") for row in _generate_lhs(features, n_runs)],
+        features,
+    )
+    unique, _ = _partition_repeats(design)
+    if len(unique) == n_runs:
+        return unique
+    # A numerical continuous dimension normally makes every LHS row unique.
+    # For finite grids, fill missing combinations before introducing repeats.
+    if all(feature["type"] != "continuous" for feature in features):
+        candidates, _ = _factorial_candidates(features, n_runs)
+        np.random.default_rng(42).shuffle(candidates)
+        unique, _ = _partition_repeats(np.vstack([unique, candidates]))
+        return unique[:n_runs]
+    raise ValueError("The entered numerical precision cannot distinguish the requested LHS runs.")
+
+
+def _optimal_candidates(features, model_order, n_runs, constraints):
+    """Expand candidates before claiming that unique feasible conditions are exhausted."""
+    finite = all(feature["type"] != "continuous" for feature in features)
+    limit = max(1500, n_runs * 5)
+    while True:
+        candidates = _doptimal_candidates(features, model_order, max_candidates=limit)
+        feasible = _filter_unique_candidates(candidates, features, constraints, "doptimal")
+        if len(feasible) >= n_runs:
+            return feasible
+        if finite:
+            total = math.prod(len(_feature_codes(feature)) for feature in features)
+            if len(candidates) == total:
+                if not len(feasible):
+                    raise ValueError("No candidate design points satisfy the specified constraints.")
+                return feasible
+            if limit >= 100000:
+                raise ValueError("Too few feasible combinations found; relax constraints or request fewer runs.")
+            limit = min(100000, max(limit * 2, n_runs * 10))
+            continue
+        # The continuous search space is not exhausted just because a grid is.
+        rng = np.random.default_rng(42)
+        rows = {tuple(row): row for row in feasible}
+        for _ in range(max(10000, n_runs * 100)):
+            row = np.array([
+                rng.uniform(-1, 1) if feature["type"] == "continuous"
+                else rng.choice(_feature_codes(feature)) for feature in features
+            ])
+            decoded = _decode_row(row, features, "doptimal")
+            if check_constraints(decoded, constraints["numerical"], constraints["disallowed"], features):
+                actual = _encode_table([decoded], features)[0]
+                rows.setdefault(tuple(actual), actual)
+            if len(rows) >= n_runs:
+                return np.asarray(list(rows.values()))
+        raise ValueError("Too few distinct feasible combinations found; relax constraints or request fewer runs.")
 
 
 def _validate_design_compatibility(model_type, features, constraints):
@@ -444,7 +518,7 @@ def _validate_design_compatibility(model_type, features, constraints):
 
 
 def generate_doe(features_config, tweaks):
-    """Generate one of the six DoE designs exposed by the EDOS front end."""
+    """Generate a DoE, exhausting unique conditions before proposing repeats."""
     model_type = str(tweaks.get("model", "bbdesign"))
     if model_type not in SUPPORTED_MODELS:
         raise ValueError(
@@ -480,6 +554,7 @@ def generate_doe(features_config, tweaks):
     design_status = "Natural"
     design_warning = None
     fractional_resolution = None
+    factorial_sampled = False
 
     if model_type == "bbdesign":
         design, center_count = _move_centers_to_end(doe.bbdesign(n_factors))
@@ -498,6 +573,10 @@ def generate_doe(features_config, tweaks):
         design = doe.fracfact_by_res(n_factors, requested_resolution).astype(float)
         fractional_resolution = _fractional_resolution(design)
         model_spec = "linear"
+    elif model_type == "fullfact":
+        design, natural_runs = _factorial_candidates(features, requested_runs)
+        factorial_sampled = len(design) < natural_runs
+        model_spec = "factorial"
     elif model_type == "def_screening":
         numeric_indices = [
             index for index, feature in enumerate(features) if feature["type"] != "categorical"
@@ -513,41 +592,50 @@ def generate_doe(features_config, tweaks):
             design[:, target] = grouped[:, source]
         model_spec = "dsd"
     elif model_type == "lhs":
-        design = _generate_lhs(features, requested_runs)
+        design = _unique_lhs(features, requested_runs)
         model_spec = "linear"
     else:  # doptimal
         model_order = str(tweaks.get("dopt_model_order", "quadratic"))
         if model_order not in {"linear", "interaction", "quadratic"}:
             raise ValueError("D-Optimal model order must be linear, interaction, or quadratic.")
-        candidates = _doptimal_candidates(features, model_order)
-        candidates = _filter_unique_candidates(candidates, features, constraints, model_type)
+        candidates = _optimal_candidates(features, model_order, requested_runs, constraints)
         candidate_matrix = _build_model_matrix(candidates, features, model_order)
-        selected = _greedy_doptimal_indices(candidate_matrix, requested_runs)
+        selected = _greedy_doptimal_indices(candidate_matrix, min(requested_runs, len(candidates)))
         design = candidates[selected]
         model_spec = model_order
 
-    natural_runs = len(design)
-    if not exact_only:
-        if requested_runs < natural_runs:
-            design = _quality_subset(
-                design, requested_runs, features, model_spec, center_count=center_count
-            )
-            design_status = "Reduced"
-            design_warning = (
-                f"The requested {requested_runs} runs are below the natural {natural_runs}-run "
-                f"{MODEL_LABELS[model_type]} design. A quality-optimized reduced subset is shown; "
-                "it is not the complete classical design."
-            )
-        elif use_exact_runs and requested_runs > natural_runs:
-            added_replicates = requested_runs - natural_runs
-            repeated = np.vstack([design[index % natural_runs] for index in range(added_replicates)])
-            design = np.vstack([design, repeated])
-            design_status = "Replicated"
-            design_warning = (
-                f"The exact request exceeds the natural {natural_runs}-run "
-                f"{MODEL_LABELS[model_type]} design. {added_replicates} repeat run(s) were "
-                "added at the end of the table."
-            )
+    if model_type != "fullfact":
+        natural_runs = len(design)
+    # Compare actual conditions: snapping numerical levels can create duplicates.
+    design = _encode_table([_decode_row(row, features, model_type) for row in design], features)
+    unique, repeats = _partition_repeats(design)
+    design = np.vstack([unique, repeats])
+    if requested_runs < natural_runs:
+        design = _quality_subset(design, requested_runs, features, model_spec)
+        design_status = "Reduced"
+        design_warning = (
+            f"The requested {requested_runs} runs are below the natural {natural_runs}-run "
+            f"{MODEL_LABELS[model_type]} design. A quality-optimized reduced subset is shown; "
+            "it is not the complete classical design. Unique combinations take priority over repeats."
+        )
+        if factorial_sampled:
+            design_warning += " Selection used a sampled candidate pool from the full factorial grid."
+    elif use_exact_runs and requested_runs > natural_runs:
+        added_replicates = requested_runs - natural_runs
+        repeated = np.asarray([unique[index % len(unique)] for index in range(added_replicates)])
+        design = np.vstack([design, repeated])
+        design_status = "Replicated"
+        size_label = "unique feasible combinations" if exact_only else "natural design runs"
+        design_warning = (
+            f"The exact request exceeds the {natural_runs} {size_label}. "
+            f"{added_replicates} repeat run(s) were added after all unique combinations."
+        )
+
+    # Retain the familiar centre-at-end order within the unique RSM conditions.
+    unique, repeats = _partition_repeats(design)
+    if model_type in {"bbdesign", "ccdesign"}:
+        unique, _ = _move_centers_to_end(unique)
+    design = np.vstack([unique, repeats])
 
     suggested_table = [_decode_row(row, features, model_type) for row in design]
     actual_coded = _encode_table(suggested_table, features)
@@ -576,7 +664,17 @@ def generate_doe(features_config, tweaks):
         orthogonality = round(_orthogonality(actual_coded, features), 1)
         efficiency = round(_d_efficiency(metric_matrix), 1)
 
-        if model_type == "fracfact":
+        if model_type == "fullfact":
+            resolution = "Full factorial" if design_status != "Reduced" else "N/A (Reduced design)"
+            numeric = [feature for feature in features if feature["type"] != "categorical"]
+            curved = [feature for feature in numeric if len(feature.get("levels", [])) >= 3]
+            if not numeric:
+                curvature = "N/A"
+            elif not curved:
+                curvature = "None (Two-level numerical factors)"
+            else:
+                curvature = "Excellent" if len(curved) == len(numeric) and rank == n_parameters else "Partial"
+        elif model_type == "fracfact":
             if fractional_resolution is None:
                 resolution = "Full factorial"
             elif fractional_resolution >= 5:
@@ -586,6 +684,8 @@ def generate_doe(features_config, tweaks):
             else:
                 resolution = "3 (III)"
             curvature = "None (Linear only)"
+            if design_status == "Reduced":
+                resolution = "N/A (Reduced design)"
         else:
             resolution = "N/A"
             if model_type in {"bbdesign", "ccdesign", "def_screening"}:
@@ -621,5 +721,7 @@ def generate_doe(features_config, tweaks):
         "center_replicates": center_count,
         "rank": rank,
         "parameters": n_parameters,
+        "unique_runs": len(unique),
+        "repeat_runs": len(repeats),
     }
     return suggested_table, metrics
