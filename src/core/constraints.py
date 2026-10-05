@@ -315,6 +315,7 @@ def validate_feature_ranges(features_config):
 
 def check_constraints(row_dict, numerical_rules, disallowed_rules, features_config):
     """Return whether a decoded candidate satisfies all feature constraints."""
+    feature_types = {feature['name']: feature.get('type') for feature in features_config}
     for rule in disallowed_rules or []:
         if not rule:
             continue
@@ -322,9 +323,16 @@ def check_constraints(row_dict, numerical_rules, disallowed_rules, features_conf
         for condition in rule:
             feature_name = condition.get("feature")
             feature_value = condition.get("value")
-            if feature_name not in row_dict or (
-                str(row_dict[feature_name]).strip() != str(feature_value).strip()
-            ):
+            matches = feature_name in row_dict
+            if matches and feature_types.get(feature_name) in {'continuous', 'discrete', 'regular'}:
+                try:
+                    matches = math.isclose(float(row_dict[feature_name]), float(feature_value),
+                                           rel_tol=0.0, abs_tol=CONSTRAINT_TOLERANCE)
+                except (TypeError, ValueError):
+                    matches = False
+            elif matches:
+                matches = str(row_dict[feature_name]).strip() == str(feature_value).strip()
+            if not matches:
                 violation = False
                 break
         if violation:

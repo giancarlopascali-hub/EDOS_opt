@@ -106,6 +106,7 @@ All templates and static assets are served from the `templates/` and `static/` d
 These modules perform the underlying mathematical operations:
 
 *   **`src/core/doe.py`**:
+    *   **Constraint handling**: All seven families accept algebraic and disallowed-combination rules. Classical matrices are decoded, filtered, then reduced or replicated from surviving rows. Constrained LHS uses bounded reproducible sampling (or a finite candidate grid) and farthest-point selection, returning explicit distinct-run shortfalls. D-Optimal retains pre-selection feasibility filtering. Returned diagnostics describe actual conditions, rank, missing levels and excluded centre rows; filtered designs do not inherit classical resolution or curvature guarantees.
     *   **Role**: Generator for Design of Experiments (DoE).
     *   **Details**: Generates classical experimental layouts (Full/Fractional Factorial, Box-Behnken, Central Composite, Definitive Screening Designs). It also computes quality metrics like Orthogonality, Resolution, and D-Efficiency.
 *   **`src/core/bo.py`**:

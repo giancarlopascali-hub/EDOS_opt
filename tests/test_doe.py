@@ -175,13 +175,14 @@ class TestConstraints:
         for row in table:
             assert not (row['Solvent'] == 'Water' and row['Catalyst'] == 'A')
 
-    def test_structured_design_rejects_post_filtering(self, three_cont_features):
-        """Filtering a completed classical design would invalidate the design."""
-        with pytest.raises(ValueError, match="D-Optimal designs only"):
-            generate_doe(three_cont_features, {
-                'model': 'bbdesign',
-                'constraints': {'numerical': ['A <= 5'], 'disallowed': []},
-            })
+    def test_structured_design_reports_filtering(self, three_cont_features):
+        table, metrics = generate_doe(three_cont_features, {
+            'model': 'bbdesign',
+            'constraints': {'numerical': ['A <= 5'], 'disallowed': []},
+        })
+        assert all(row['A'] <= 5 for row in table)
+        assert metrics['constraint_filtered']
+        assert metrics['excluded_runs'] > 0
 
 
 # ==============================================================================
@@ -532,9 +533,11 @@ class TestFullFactorial:
         assert metrics['curvature'] == 'Excellent'
         assert metrics['rank'] == metrics['parameters'] == 6
 
-    def test_constraints_direct_user_to_doptimal(self, three_cont_features):
-        with pytest.raises(ValueError, match='D-Optimal designs only'):
-            generate_doe(three_cont_features, {'model': 'fullfact', 'constraints': {'numerical': ['A < 5']}})
+    def test_fullfactorial_constraints_filter_combinations(self, three_cont_features):
+        table, metrics = generate_doe(three_cont_features, {'model': 'fullfact', 'constraints': {'numerical': ['A < 5']}})
+        assert all(row['A'] < 5 for row in table)
+        assert metrics['parent_runs'] == 8
+        assert metrics['excluded_runs'] == 4
 
     def test_large_reduced_grid_reports_true_natural_size(self):
         features = [{'name': f'X{i}', 'type': 'categorical', 'range': 'A, B, C'} for i in range(9)]
@@ -642,6 +645,157 @@ def test_doptimal_empty_finite_space_is_not_repeated():
     features = [{'name': name, 'type': 'discrete', 'range': '0, 1'} for name in ['X', 'Y']]
     with pytest.raises(ValueError, match='No candidate design points'):
         generate_doe(features, {'model': 'doptimal', 'max_runs': 2, 'constraints': {'numerical': ['X > 2']}})
+
+
+ALL_DESIGNS = ['bbdesign', 'ccdesign', 'fracfact', 'fullfact', 'def_screening', 'lhs', 'doptimal']
+
+
+@pytest.fixture
+def constraint_features():
+    return [{'name': name, 'type': 'continuous', 'range': '[0, 1]'} for name in 'ABCD']
+
+
+@pytest.mark.parametrize('model', ALL_DESIGNS)
+@pytest.mark.parametrize('rule_kind', ['numerical', 'disallowed', 'both'])
+def test_all_designs_enforce_constraints_after_decoding(model, rule_kind, constraint_features):
+    from src.core.constraints import check_constraints
+    rules = {
+        'numerical': ['A <= 0.5'] if rule_kind != 'disallowed' else [],
+        'disallowed': [[{'feature': 'B', 'value': '1'}]] if rule_kind != 'numerical' else [],
+    }
+    table, metrics = generate_doe(constraint_features, {
+        'model': model, 'max_runs': 8, 'constraints': rules, 'dopt_model_order': 'linear'
+    })
+    assert table
+    assert all(check_constraints(row, rules['numerical'], rules['disallowed'], constraint_features) for row in table)
+    if model != 'doptimal':
+        assert metrics['constraint_filtered']
+        assert metrics['resolution'].startswith('N/A')
+        assert 'original' in metrics['design_warning'].lower()
+
+
+@pytest.mark.parametrize('model', ['bbdesign', 'ccdesign', 'fracfact', 'fullfact', 'def_screening'])
+def test_filtered_exact_count_repeats_only_surviving_parent_rows(model, constraint_features):
+    parent, _ = generate_doe(constraint_features, {'model': model, 'max_runs': 100})
+    allowed = {tuple(row.values()) for row in parent if row['A'] <= .5}
+    table, metrics = generate_doe(constraint_features, {
+        'model': model, 'max_runs': 100, 'use_exact_runs': True,
+        'constraints': {'numerical': ['A <= 0.5']},
+    })
+    assert len(table) == 100
+    assert {tuple(row.values()) for row in table} <= allowed
+    assert metrics['added_replicates'] > 0
+    assert metrics['shortfall_runs'] == 0
+    assert 'full experimental region' in metrics['design_warning']
+
+
+@pytest.mark.parametrize('model', ['bbdesign', 'ccdesign', 'fracfact', 'fullfact', 'def_screening'])
+def test_filtered_max_count_does_not_top_up(model, constraint_features):
+    table, metrics = generate_doe(constraint_features, {
+        'model': model, 'max_runs': 100,
+        'constraints': {'numerical': ['A <= 0.5']},
+    })
+    assert len(table) < 100
+    assert metrics['added_replicates'] == 0
+    assert metrics['shortfall_runs'] == 0
+
+
+def test_filtering_recomputes_rank_levels_and_center_loss(constraint_features):
+    table, metrics = generate_doe(constraint_features, {
+        'model': 'bbdesign', 'max_runs': 100,
+        'constraints': {'numerical': ['A < 0.5']},
+    })
+    assert all(row['A'] == 0 for row in table)
+    assert metrics['rank'] < metrics['parameters']
+    assert metrics['model_estimable'] is False
+    assert metrics['efficiency'] == 0
+    assert metrics['curvature'] == 'Rank deficient'
+    assert metrics['constraint_removed_center_runs'] > 0
+    assert metrics['center_replicates'] == 0
+    assert '0.5' in metrics['missing_levels']['A']
+
+
+def test_constraint_is_checked_after_classical_rounding():
+    # The centre of [0, .1] is rounded to .1 at the declared one-decimal precision.
+    features = [{'name': name, 'type': 'continuous', 'range': '[0, 0.1]'} for name in 'ABC']
+    table, _ = generate_doe(features, {
+        'model': 'bbdesign', 'constraints': {'numerical': ['A <= 0.05']}
+    })
+    assert table and all(row['A'] <= .05 for row in table)
+
+
+@pytest.mark.parametrize('model', ['fullfact', 'fracfact', 'def_screening', 'lhs', 'doptimal'])
+def test_mixed_designs_enforce_disallowed_category_pairs(model):
+    features = [{'name': name, 'type': 'categorical', 'range': 'A, B'} for name in ['Solvent', 'Catalyst']]
+    features += [{'name': name, 'type': 'continuous', 'range': '[0, 1]'} for name in ['X', 'Y']]
+    table, _ = generate_doe(features, {
+        'model': model, 'max_runs': 8, 'dopt_model_order': 'linear',
+        'constraints': {'disallowed': [[{'feature': 'Solvent', 'value': 'A'}, {'feature': 'Catalyst', 'value': 'B'}]]},
+    })
+    assert table and all(not (row['Solvent'] == 'A' and row['Catalyst'] == 'B') for row in table)
+
+
+def test_constrained_lhs_finite_shortfall_has_no_repeats():
+    features = [{'name': name, 'type': 'discrete', 'range': '0, 1'} for name in 'XY']
+    table, metrics = generate_doe(features, {'model': 'lhs', 'max_runs': 8, 'constraints': {'numerical': ['X == 0']}})
+    assert len(table) == 2
+    assert metrics['repeat_runs'] == 0
+    assert metrics['shortfall_runs'] == 6
+    assert metrics['candidate_pool_complete'] is True
+
+
+def test_constrained_lhs_continuous_shortfall_is_explicit(monkeypatch, two_cont_features):
+    monkeypatch.setattr('src.core.doe.CONSTRAINED_LHS_BATCH_LIMIT', 1)
+    table, metrics = generate_doe(two_cont_features, {'model': 'lhs', 'max_runs': 20, 'constraints': {'numerical': ['X < 0.1']}})
+    assert 0 < len(table) < 20
+    assert metrics['shortfall_runs'] == 20 - len(table)
+    assert metrics['candidate_pool_complete'] is False
+    assert metrics['repeat_runs'] == 0
+
+
+def test_constrained_lhs_is_reproducible(two_cont_features):
+    tweaks = {'model': 'lhs', 'max_runs': 12, 'constraints': {'numerical': ['X + Y < 0.7']}}
+    first = generate_doe(two_cont_features, tweaks)
+    assert first == generate_doe(two_cont_features, tweaks)
+    assert len(first[0]) == 12
+
+
+def test_no_candidates_is_not_claimed_global_infeasibility(monkeypatch, two_cont_features):
+    monkeypatch.setattr('src.core.doe.CONSTRAINED_LHS_BATCH_LIMIT', 1)
+    with pytest.raises(ValueError, match='not been proven empty'):
+        generate_doe(two_cont_features, {'model': 'lhs', 'constraints': {'numerical': ['X == 0.5']}})
+
+
+def test_empty_parent_has_precise_error(constraint_features):
+    with pytest.raises(ValueError, match='parent design'):
+        generate_doe(constraint_features, {'model': 'bbdesign', 'constraints': {'numerical': ['A < 0']}})
+
+
+def test_sampled_factorial_shortfall_does_not_add_repeats(monkeypatch):
+    monkeypatch.setattr('src.core.doe.CONSTRAINED_CANDIDATE_LIMIT', 20)
+    features = [{'name': name, 'type': 'regular', 'range': '[0, 1]10'} for name in 'XY']
+    table, metrics = generate_doe(features, {
+        'model': 'fullfact', 'max_runs': 40, 'use_exact_runs': True,
+        'constraints': {'numerical': ['X <= 0.5']},
+    })
+    assert 0 < len(table) < 40
+    assert metrics['candidate_pool_complete'] is False
+    assert metrics['repeat_runs'] == 0
+    assert metrics['shortfall_runs'] == 40 - len(table)
+
+
+def test_numeric_disallowed_values_match_by_number_not_spelling():
+    from src.core.constraints import check_constraints
+    features = [{'name': 'X', 'type': 'continuous'}, {'name': 'S', 'type': 'categorical'}]
+    assert not check_constraints({'X': 10.0, 'S': '1'}, [], [[{'feature': 'X', 'value': '10'}]], features)
+    assert check_constraints({'X': 10.0, 'S': '1'}, [], [[{'feature': 'S', 'value': '1.0'}]], features)
+
+
+def test_existing_factor_type_restrictions_remain():
+    features = [{'name': 'S', 'type': 'categorical', 'range': 'A, B'}]
+    features += [{'name': name, 'type': 'continuous', 'range': '[0, 1]'} for name in 'XY']
+    with pytest.raises(ValueError, match='numerical factors only'):
+        generate_doe(features, {'model': 'bbdesign', 'constraints': {'numerical': ['X < 0.5']}})
 
 
 def test_metrics_include_the_returned_repeat_rows(three_cont_features):

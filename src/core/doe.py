@@ -409,7 +409,7 @@ def _filter_unique_candidates(candidates, features, constraints, model_type):
     return np.asarray(list(unique.values()), dtype=float).reshape(-1, len(features))
 
 
-def _generate_lhs(features, n_runs):
+def _generate_lhs(features, n_runs, seed=42):
     numeric_indices = [
         index for index, feature in enumerate(features) if feature["type"] != "categorical"
     ]
@@ -418,7 +418,7 @@ def _generate_lhs(features, n_runs):
     design = np.zeros((n_runs, len(features)), dtype=float)
     numeric = doe.lhs(
         len(numeric_indices), samples=n_runs,
-        criterion="maximin" if n_runs > 1 else None, seed=42
+        criterion="maximin" if n_runs > 1 else None, seed=seed
     ) * 2.0 - 1.0
     for numeric_column, design_column in enumerate(numeric_indices):
         feature = features[design_column]
@@ -435,7 +435,7 @@ def _generate_lhs(features, n_runs):
             continue
         codes = _feature_codes(feature)
         balanced = np.resize(codes, n_runs).copy()
-        random.Random(42 + column).shuffle(balanced)
+        random.Random(seed + column).shuffle(balanced)
         design[:, column] = balanced
     return design
 
@@ -494,9 +494,98 @@ def _optimal_candidates(features, model_order, n_runs, constraints):
         raise ValueError("Too few distinct feasible combinations found; relax constraints or request fewer runs.")
 
 
+CONSTRAINED_CANDIDATE_LIMIT = 100000
+CONSTRAINED_LHS_BATCH_LIMIT = 40
+
+
+def _filter_actual_rows(design, features, constraints, model_type):
+    """Check executable (decoded and rounded) conditions; retain parent repeats."""
+    actual = [_decode_row(row, features, model_type) for row in design]
+    keep = [check_constraints(row, constraints.get("numerical", []),
+                              constraints.get("disallowed", []), features) for row in actual]
+    encoded = _encode_table(actual, features)
+    return encoded[np.asarray(keep, dtype=bool)], len(keep) - sum(keep)
+
+
+def _feasible_factorial_pool(features, n_runs, constraints):
+    """Enumerate a bounded finite grid, or expand a reproducible sampled pool."""
+    levels = _factorial_levels(features)
+    total = math.prod(map(len, levels))
+    if total <= CONSTRAINED_CANDIDATE_LIMIT:
+        candidates = np.asarray(list(itertools.product(*levels)), dtype=float)
+        feasible, excluded = _filter_actual_rows(candidates, features, constraints, "fullfact")
+        return feasible, total, excluded, True
+    rng = random.Random(42)
+    seen, feasible = set(), []
+    excluded = 0
+    target = max(1500, n_runs * 5)
+    while len(seen) < CONSTRAINED_CANDIDATE_LIMIT and len(feasible) < target:
+        index = rng.randrange(total)
+        if index in seen:
+            continue
+        seen.add(index)
+        row = []
+        for values in reversed(levels):
+            index, digit = divmod(index, len(values))
+            row.append(values[digit])
+        candidate, rejected = _filter_actual_rows([row[::-1]], features, constraints, "fullfact")
+        excluded += rejected
+        if len(candidate):
+            feasible.append(candidate[0])
+    return np.asarray(feasible, dtype=float).reshape(-1, len(features)), len(seen), excluded, False
+
+
+def _space_filling_subset(candidates, n_runs, features):
+    """Deterministic farthest-point selection; categories use mismatch distance."""
+    unique, _ = _partition_repeats(candidates)
+    if len(unique) <= n_runs:
+        return unique
+    distances = np.full(len(unique), np.inf)
+    selected = []
+    next_index = 0
+    for _ in range(n_runs):
+        selected.append(next_index)
+        delta = np.zeros(len(unique))
+        for column, feature in enumerate(features):
+            if feature["type"] == "categorical":
+                delta += unique[:, column] != unique[next_index, column]
+            else:
+                delta += ((unique[:, column] - unique[next_index, column]) / 2.0) ** 2
+        distances = np.minimum(distances, delta)
+        distances[selected] = -1.0
+        next_index = int(np.argmax(distances))
+    return unique[selected]
+
+
+def _constrained_lhs(features, n_runs, constraints):
+    if not any(feature["type"] != "categorical" for feature in features):
+        raise ValueError("Latin Hypercube Sampling requires at least one numerical factor.")
+    if all(feature["type"] != "continuous" for feature in features):
+        pool, tested, excluded, complete = _feasible_factorial_pool(features, n_runs, constraints)
+        initial, rejected = _filter_actual_rows(
+            _generate_lhs(features, min(n_runs, 512)), features, constraints, "lhs"
+        )
+        tested += min(n_runs, 512)
+        excluded += rejected
+        pool = np.vstack([initial, pool])
+    else:
+        pool = np.empty((0, len(features)))
+        tested = excluded = 0
+        complete = False
+        batch_size = min(512, max(32, n_runs * 2))
+        for batch in range(CONSTRAINED_LHS_BATCH_LIMIT):
+            candidates = _generate_lhs(features, batch_size, seed=42 + batch)
+            feasible, rejected = _filter_actual_rows(candidates, features, constraints, "lhs")
+            tested += len(candidates)
+            excluded += rejected
+            pool, _ = _partition_repeats(np.vstack([pool, feasible]))
+            if len(pool) >= n_runs:
+                break
+    return _space_filling_subset(pool, n_runs, features), tested, excluded, complete
+
+
 def _validate_design_compatibility(model_type, features, constraints):
     categorical = [feature for feature in features if feature["type"] == "categorical"]
-    has_constraints = bool(constraints.get("numerical") or constraints.get("disallowed"))
 
     if model_type in {"bbdesign", "ccdesign"} and categorical:
         raise ValueError(
@@ -510,11 +599,6 @@ def _validate_design_compatibility(model_type, features, constraints):
                 f"{MODEL_LABELS[model_type]} supports only two-level categorical factors; "
                 f"check: {', '.join(invalid)}."
             )
-    if has_constraints and model_type != "doptimal":
-        raise ValueError(
-            "Constraints are supported with D-Optimal designs only. Filtering a completed "
-            f"{MODEL_LABELS[model_type]} design would invalidate its statistical properties."
-        )
 
 
 def generate_doe(features_config, tweaks):
@@ -545,6 +629,13 @@ def generate_doe(features_config, tweaks):
     constraints["numerical"] = constraints.get("numerical") or []
     constraints["disallowed"] = constraints.get("disallowed") or []
     _validate_design_compatibility(model_type, features, constraints)
+    filtered_design = model_type != "doptimal" and bool(
+        constraints["numerical"] or constraints["disallowed"]
+    )
+    candidates_tested = excluded_runs = 0
+    candidate_pool_complete = True
+    parent_design = None
+    eligible_runs = None
 
     exact_only = model_type in {"lhs", "doptimal"}
     use_exact_runs = exact_only or _as_bool(tweaks.get("use_exact_runs", False))
@@ -574,7 +665,13 @@ def generate_doe(features_config, tweaks):
         fractional_resolution = _fractional_resolution(design)
         model_spec = "linear"
     elif model_type == "fullfact":
-        design, natural_runs = _factorial_candidates(features, requested_runs)
+        if filtered_design:
+            design, candidates_tested, excluded_runs, candidate_pool_complete = _feasible_factorial_pool(
+                features, requested_runs, constraints
+            )
+            natural_runs = math.prod(map(len, _factorial_levels(features)))
+        else:
+            design, natural_runs = _factorial_candidates(features, requested_runs)
         factorial_sampled = len(design) < natural_runs
         model_spec = "factorial"
     elif model_type == "def_screening":
@@ -592,7 +689,12 @@ def generate_doe(features_config, tweaks):
             design[:, target] = grouped[:, source]
         model_spec = "dsd"
     elif model_type == "lhs":
-        design = _unique_lhs(features, requested_runs)
+        if filtered_design:
+            design, candidates_tested, excluded_runs, candidate_pool_complete = _constrained_lhs(
+                features, requested_runs, constraints
+            )
+        else:
+            design = _unique_lhs(features, requested_runs)
         model_spec = "linear"
     else:  # doptimal
         model_order = str(tweaks.get("dopt_model_order", "quadratic"))
@@ -606,11 +708,29 @@ def generate_doe(features_config, tweaks):
 
     if model_type != "fullfact":
         natural_runs = len(design)
+    if filtered_design:
+        if model_type not in {"lhs", "fullfact"}:
+            parent_design = _encode_table([_decode_row(row, features, model_type) for row in design], features)
+            candidates_tested = len(design)
+            design, excluded_runs = _filter_actual_rows(design, features, constraints, model_type)
+        if not len(design):
+            if model_type not in {"lhs", "fullfact"}:
+                raise ValueError("No feasible conditions remain in the selected parent design. "
+                                 "This does not establish that the experimental region is empty.")
+            if candidate_pool_complete:
+                raise ValueError("No feasible conditions exist in the fully enumerated candidate grid.")
+            raise ValueError("No feasible conditions found within the bounded candidate search; "
+                             "the experimental region has not been proven empty.")
+        eligible_runs = len(design)
     # Compare actual conditions: snapping numerical levels can create duplicates.
     design = _encode_table([_decode_row(row, features, model_type) for row in design], features)
     unique, repeats = _partition_repeats(design)
     design = np.vstack([unique, repeats])
-    if requested_runs < natural_runs:
+    selection_runs = eligible_runs if filtered_design else natural_runs
+    allow_replicates = not filtered_design or (
+        model_type != "lhs" and candidate_pool_complete
+    )
+    if requested_runs < selection_runs:
         design = _quality_subset(design, requested_runs, features, model_spec)
         design_status = "Reduced"
         design_warning = (
@@ -620,8 +740,8 @@ def generate_doe(features_config, tweaks):
         )
         if factorial_sampled:
             design_warning += " Selection used a sampled candidate pool from the full factorial grid."
-    elif use_exact_runs and requested_runs > natural_runs:
-        added_replicates = requested_runs - natural_runs
+    elif use_exact_runs and requested_runs > selection_runs and allow_replicates:
+        added_replicates = requested_runs - selection_runs
         repeated = np.asarray([unique[index % len(unique)] for index in range(added_replicates)])
         design = np.vstack([design, repeated])
         design_status = "Replicated"
@@ -638,6 +758,10 @@ def generate_doe(features_config, tweaks):
     design = np.vstack([unique, repeats])
 
     suggested_table = [_decode_row(row, features, model_type) for row in design]
+    if filtered_design and not all(check_constraints(row, constraints["numerical"],
+                                                     constraints["disallowed"], features)
+                                   for row in suggested_table):
+        raise ValueError("Final design failed constraint validation after decoding.")
     actual_coded = _encode_table(suggested_table, features)
 
     if model_type in {"bbdesign", "ccdesign"}:
@@ -702,6 +826,75 @@ def generate_doe(features_config, tweaks):
             )
             design_warning = (design_warning or "Design quality is limited.") + rank_warning
 
+    constraint_metadata = {}
+    if filtered_design:
+        shortfall = max(0, requested_runs - len(suggested_table)) if use_exact_runs else 0
+        design_status = "Constrained LHS-derived" if model_type == "lhs" else "Constraint-filtered"
+        if requested_runs < eligible_runs:
+            design_status += " reduced"
+        if added_replicates:
+            design_status += " replicated"
+        resolution = "N/A (constraint-modified design)"
+        if model_type != "lhs":
+            # Describe the actual intended model's rank, not inherited RSM quality.
+            has_squares = model_spec in {"response_surface", "dsd", "quadratic"} or (
+                model_spec == "factorial" and any(len(f.get("levels", [])) >= 3
+                                                 for f in features if f["type"] != "categorical")
+            )
+            curvature = ("Full model rank" if rank == n_parameters else "Rank deficient") if has_squares else "None (no quadratic terms)"
+        missing_levels = {}
+        if model_type != "lhs":
+            for column, feature in enumerate(features):
+                if parent_design is not None:
+                    before = {str(_decode_row(row, features, model_type)[feature["name"]]) for row in parent_design}
+                else:
+                    levels = _factorial_levels(features)
+                    before = set()
+                    for value in levels[column]:
+                        row = np.array([values[0] for values in levels], dtype=float)
+                        row[column] = value
+                        before.add(str(_decode_row(row, features, model_type)[feature["name"]]))
+                after = {str(row[feature["name"]]) for row in suggested_table}
+                if before - after:
+                    missing_levels[feature["name"]] = sorted(before - after)
+        removed_centers = 0
+        if parent_design is not None and model_type in {"bbdesign", "ccdesign"}:
+            feasible_parent, _ = _filter_actual_rows(parent_design, features, constraints, model_type)
+            removed_centers = int(np.all(np.abs(parent_design) < 1e-9, axis=1).sum()
+                                  - np.all(np.abs(feasible_parent) < 1e-9, axis=1).sum())
+        messages = [f"{excluded_runs} of {candidates_tested} examined candidate rows excluded by constraints. "
+                    "Original design properties are not assumed for this modified design."]
+        if model_type == "lhs":
+            messages.append("Feasible points are selected by farthest-point spacing; strict Latin hypercube stratification is not retained.")
+        if added_replicates:
+            messages.append(f"{added_replicates} feasible repeats added from the surviving candidate conditions; "
+                            "this does not imply exhaustion of the full experimental region.")
+        if not candidate_pool_complete:
+            messages.append("Candidate search was bounded; the full experimental region was not enumerated.")
+        if shortfall:
+            messages.append(f"Requested {requested_runs} runs; returned {len(suggested_table)} distinct feasible conditions "
+                            f"with a shortfall of {shortfall}. No repeats were added to mask the shortfall.")
+        if missing_levels:
+            messages.append("Some parent-design factor levels are absent from the returned design.")
+        if removed_centers:
+            messages.append(f"{removed_centers} parent centre-point rows excluded by constraints.")
+        if model_type != "lhs" and rank < n_parameters:
+            messages.append(f"Model rank {rank} for {n_parameters} terms: not all intended effects can be estimated independently.")
+        design_warning = " ".join(messages)
+        constraint_metadata = {
+            "constraint_filtered": True,
+            "parent_design_label": MODEL_LABELS[model_type],
+            "parent_runs": natural_runs if model_type != "lhs" else None,
+            "candidates_tested": candidates_tested,
+            "excluded_runs": excluded_runs,
+            "eligible_runs": eligible_runs,
+            "candidate_pool_complete": candidate_pool_complete,
+            "shortfall_runs": shortfall,
+            "missing_levels": missing_levels,
+            "constraint_removed_center_runs": removed_centers,
+            "model_estimable": rank == n_parameters if model_type != "lhs" else None,
+        }
+
     metrics = {
         "orthogonality": orthogonality,
         "efficiency": efficiency,
@@ -709,7 +902,7 @@ def generate_doe(features_config, tweaks):
         "curvature": curvature,
         "runs": len(suggested_table),
         "model": model_type,
-        "model_label": MODEL_LABELS[model_type],
+        "model_label": (f"{design_status}: {MODEL_LABELS[model_type]}" if filtered_design else MODEL_LABELS[model_type]),
         "design_status": design_status,
         "natural_runs": natural_runs,
         "requested_runs": requested_runs,
@@ -723,5 +916,6 @@ def generate_doe(features_config, tweaks):
         "parameters": n_parameters,
         "unique_runs": len(unique),
         "repeat_runs": len(repeats),
+        **constraint_metadata,
     }
     return suggested_table, metrics

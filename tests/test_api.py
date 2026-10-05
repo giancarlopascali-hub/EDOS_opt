@@ -69,6 +69,23 @@ def test_exploration_rejects_values_outside_public_scale(exploration):
         validate_exploration(exploration)
 
 
+@pytest.mark.parametrize('model', ['bbdesign', 'ccdesign', 'fracfact', 'fullfact', 'def_screening', 'lhs', 'doptimal'])
+def test_all_doe_api_models_accept_constraint_rules(client, model):
+    response = client.post('/doe', json={
+        'features': [{'name': name, 'type': 'continuous', 'range': '[0, 1]'} for name in 'ABCD'],
+        'tweaks': {'model': model, 'max_runs': 8, 'dopt_model_order': 'linear',
+                   'constraints': {'numerical': ['A <= 0.5'],
+                                   'disallowed': [[{'feature': 'B', 'value': '1'}]]}},
+    })
+    assert response.status_code == 200
+    output = response.get_json()
+    assert output['suggestions']
+    assert all(row['A'] <= .5 and row['B'] != 1 for row in output['suggestions'])
+    if model != 'doptimal':
+        assert output['metrics']['constraint_filtered'] is True
+        assert 'missing_levels' in output['metrics']
+
+
 # ==============================================================================
 # Test: Static Pages
 # ==============================================================================
@@ -222,5 +239,4 @@ class TestBoSurfaceEndpoint:
         assert len(result['y']) == 10
         assert len(result['z']) == 10
         assert len(result['experiments']) == 5
-
 

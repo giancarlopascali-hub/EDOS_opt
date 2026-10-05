@@ -71,7 +71,7 @@ function setExactRunsMode(isExact, isBlocked = false) {
             switchExactBtn.disabled = true;
             switchMaxBtn.style.display = 'none';
             switchContainer.classList.add('disabled');
-            switchContainer.title   = "LHS and D-Optimal require an exact run count";
+            switchContainer.title   = "LHS and D-Optimal target an exact run count; constrained LHS reports any shortfall";
         } else {
             switchMaxBtn.disabled   = false;
             switchExactBtn.disabled = false;
@@ -159,6 +159,15 @@ function initDoEListeners() {
 
     // Model selector: sync toggle state + show/hide D-Optimal panel
     const modelSelect = document.getElementById('doe-model-select');
+    if (modelSelect && !document.getElementById('doe-constraint-policy')) {
+        const notice = document.createElement('p');
+        notice.id = 'doe-constraint-policy';
+        notice.className = 'hint';
+        notice.textContent = 'Constraints are supported for all designs, subject to factor-type restrictions. ' +
+            'For non-D-optimal designs, filtering changes the design and its original statistical properties may not be retained. ' +
+            'Constrained LHS may return fewer distinct runs than requested when its bounded search is insufficient.';
+        modelSelect.parentElement.appendChild(notice);
+    }
     if (modelSelect) {
         modelSelect.addEventListener('change', (e) => {
             const isDopt = e.target.value === 'doptimal';
@@ -281,9 +290,29 @@ export function renderDoEResults(metrics) {
     if (warningBanner) {
         warningBanner.innerHTML = '';
         warningBanner.classList.add('hidden');
+        if (metrics?.constraint_filtered) {
+            const notice = document.createElement('div');
+            notice.style.cssText = 'background:#fffbeb;border:1px solid #fde68a;color:#78350f;padding:1rem;border-radius:12px;margin-bottom:1rem;text-align:left';
+            const title = document.createElement('strong');
+            title.textContent = metrics.model_label;
+            const detail = document.createElement('p');
+            detail.textContent = metrics.design_warning;
+            const counts = document.createElement('p');
+            counts.textContent = `Returned ${metrics.runs} runs: ${metrics.unique_runs} unique, ${metrics.repeat_runs} repeated. ` +
+                `Feasible rows before run-count adjustment: ${metrics.eligible_runs}. Model rank: ${metrics.rank} / ${metrics.parameters}.`;
+            notice.append(title, detail, counts);
+            if (Object.keys(metrics.missing_levels || {}).length) {
+                const levels = document.createElement('p');
+                levels.textContent = 'Absent parent levels: ' + Object.entries(metrics.missing_levels)
+                    .map(([name, values]) => `${name}: ${values.join(', ')}`).join('; ');
+                notice.appendChild(levels);
+            }
+            warningBanner.appendChild(notice);
+            warningBanner.classList.remove('hidden');
+        }
 
         // Low-quality / error warning (red)
-        if (metrics && (metrics.runs <= 1 || metrics.resolution === 'Error' ||
+        if (metrics && !metrics.constraint_filtered && (metrics.runs <= 1 || metrics.resolution === 'Error' ||
                         metrics.orthogonality === 0 || metrics.efficiency === 0)) {
             warningBanner.innerHTML += `
                 <div style="background:#fff1f2; border:1px solid #fecdd3; color:#9f1239;
@@ -319,7 +348,7 @@ export function renderDoEResults(metrics) {
         }
 
         // Exact-N above the natural size is fulfilled with clearly identified repeats.
-        if (metrics && metrics.added_replicates > 0) {
+        if (metrics && metrics.added_replicates > 0 && !metrics.constraint_filtered) {
             warningBanner.innerHTML += `
                 <div style="background:#fffbeb; border:1px solid #fde68a; color:#92400e;
                             padding:1rem; border-radius:12px; margin-bottom:1rem;
@@ -375,6 +404,8 @@ export function renderDoEResults(metrics) {
                 return                                { text: 'Screening',  class: 'flag-poor' };
             }
             if (type === 'curve') {
+                if (val === 'Full model rank') return { text: 'Estimable', class: 'flag-limited' };
+                if (val === 'Rank deficient') return { text: 'Limited', class: 'flag-poor' };
                 if (val === 'Excellent') return { text: 'Good',    class: 'flag-good' };
                 if (val === 'Partial')   return { text: 'Limited', class: 'flag-limited' };
                 return                          { text: 'None',    class: 'flag-poor' };
