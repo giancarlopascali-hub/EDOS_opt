@@ -159,15 +159,6 @@ function initDoEListeners() {
 
     // Model selector: sync toggle state + show/hide D-Optimal panel
     const modelSelect = document.getElementById('doe-model-select');
-    if (modelSelect && !document.getElementById('doe-constraint-policy')) {
-        const notice = document.createElement('p');
-        notice.id = 'doe-constraint-policy';
-        notice.className = 'hint';
-        notice.textContent = 'Constraints are supported for all designs, subject to factor-type restrictions. ' +
-            'For non-D-optimal designs, filtering changes the design and its original statistical properties may not be retained. ' +
-            'Constrained LHS may return fewer distinct runs than requested when its bounded search is insufficient.';
-        modelSelect.parentElement.appendChild(notice);
-    }
     if (modelSelect) {
         modelSelect.addEventListener('change', (e) => {
             const isDopt = e.target.value === 'doptimal';
