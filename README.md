@@ -7,6 +7,7 @@ colorTo: indigo
 sdk: docker
 app_port: 7860
 pinned: false
+license: apache-2.0
 ---
 
 # EDOS
@@ -55,6 +56,15 @@ verification and source-revision traceability.
 ## Developer
 Giancarlo Pascali
 UNSW, Sydney
+
+## Licence and citation
+
+EDOS is licensed under the [Apache License 2.0](LICENSE). Copyright and
+attribution information is provided in [NOTICE](NOTICE), and third-party
+components are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+If you use EDOS in research, please see [CITATION.md](CITATION.md). Definitive
+publication and DOI details are coming soon.
 
 ---
 *Created with the help of Antigravity AI.*

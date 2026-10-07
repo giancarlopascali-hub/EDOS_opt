@@ -58,6 +58,9 @@ jobs:
             --exclude='tests' --exclude='conftest.py' --exclude='alignment' \
             --exclude='deployment' --exclude='ARCHITECTURE.md' --exclude='hf_repo' \
             ./ hf_repo/
+          for FILE in LICENSE NOTICE CITATION.cff CITATION.md THIRD_PARTY_NOTICES.md; do
+            test -f "hf_repo/${FILE}"
+          done
           cd hf_repo
           git config user.email "action@github.com"
           git config user.name "EDOS deployment"
