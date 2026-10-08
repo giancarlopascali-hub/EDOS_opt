@@ -240,3 +240,87 @@ class TestBoSurfaceEndpoint:
         assert len(result['z']) == 10
         assert len(result['experiments']) == 5
 
+    def test_bo_surface_accepts_historical_category_removed_from_search_domain(self, client):
+        payload = {
+            'data': [
+                [1.0, 5.0, 'THF', 10.0],
+                [2.0, 6.0, 'DMF', 12.0],
+                [3.0, 7.0, 'Water', 15.0],
+                [4.0, 8.0, 'DMF', 18.0],
+                [5.0, 9.0, 'THF', 20.0],
+            ],
+            'columns': ['X1', 'X2', 'Solvent', 'Y1'],
+            'features': [
+                {'name': 'X1', 'type': 'continuous', 'range': '[1, 5]'},
+                {'name': 'X2', 'type': 'continuous', 'range': '[5, 9]'},
+                {
+                    'name': 'Solvent',
+                    'type': 'categorical',
+                    'range': 'THF, Water',
+                    'choices': ['THF', 'Water'],
+                },
+            ],
+            'objectives': [
+                {'name': 'Y1', 'type': 'maximize', 'importance': '100'}
+            ],
+            'tweaks': {'kernel': 'matern52'},
+            'x_feat': 'X1',
+            'y_feat': 'X2',
+            'z_axis': 'Y1',
+            'color_obj': 'Y1',
+            'fixed_values': {'Solvent': 'THF'},
+            'resolution': 5,
+        }
+        response = client.post('/bo_surface', json=payload)
+        assert response.status_code == 200
+        result = response.get_json()
+        assert 'error' not in result
+        assert result['slice_targets']['Solvent'] == 'THF'
+        assert len(result['experiments']) == 5
+
+
+class TestBoCategoricalDomainEdits:
+    def test_optimizer_never_proposes_a_removed_historical_category(self, client):
+        payload = {
+            'data': [
+                [1.0, 'THF', 10.0],
+                [2.0, 'DMF', 12.0],
+                [1.0, 'Water', 15.0],
+                [2.0, 'THF', 18.0],
+            ],
+            'columns': ['Dose', 'Solvent', 'Yield'],
+            'features': [
+                {'name': 'Dose', 'type': 'discrete', 'range': '1, 2'},
+                {
+                    'name': 'Solvent',
+                    'type': 'categorical',
+                    'range': 'THF, Water',
+                    'choices': ['THF', 'Water'],
+                },
+            ],
+            'objectives': [
+                {'name': 'Yield', 'type': 'maximize', 'importance': '100'}
+            ],
+            'tweaks': {
+                'batch_size': 1,
+                'acq_type': 'EI',
+                'kernel': 'matern52',
+                'exploration': 0.5,
+                'optimization_strategy': 'exhaustive_grid',
+                'avoid_reval': True,
+            },
+        }
+        response = client.post('/optimize', json=payload)
+        assert response.status_code == 200
+        result = response.get_json()
+        assert 'error' not in result
+        assert result['suggestions']
+        assert all(
+            suggestion['Solvent'] in {'THF', 'Water'}
+            for suggestion in result['suggestions']
+        )
+        assert all(
+            suggestion['Solvent'] != 'DMF'
+            for suggestion in result['suggestions']
+        )
+

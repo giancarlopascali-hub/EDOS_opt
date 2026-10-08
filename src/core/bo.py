@@ -43,7 +43,7 @@ from botorch.sampling.normal import SobolQMCNormalSampler
 from src.core.constraints import (
     check_constraints,
     check_objective_constraints,
-    encode_categorical_series,
+    encode_categorical_training_series,
     get_categorical_choices,
 )
 from src.core.feasibility import (
@@ -229,7 +229,8 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
             feature_levels.append(values)
 
         elif f['type'] == 'categorical':
-            encoded, choices = encode_categorical_series(df_clean[name], f)
+            encoded, _ = encode_categorical_training_series(df_clean[name], f)
+            choices = get_categorical_choices(f)
             train_x_list.append(encoded)
             low, high = 0, len(choices) - 1
             if low == high:
@@ -1051,7 +1052,8 @@ def run_bo_estimation(df, input_values, features_config, objectives_config, twea
             bounds.append([low, high])
 
         elif f['type'] == 'categorical':
-            encoded, choices = encode_categorical_series(df_clean[name], f)
+            encoded, _ = encode_categorical_training_series(df_clean[name], f)
+            choices = get_categorical_choices(f)
             train_x_list.append(encoded)
             low, high = 0, len(choices) - 1
             if low == high: high = low + 0.1
@@ -1326,7 +1328,8 @@ def run_bo_surface(
             feat_ranges[name] = (low, high, f['type'], values)
 
         elif f['type'] == 'categorical':
-            encoded, choices = encode_categorical_series(df_clean[name], f)
+            encoded, _ = encode_categorical_training_series(df_clean[name], f)
+            choices = get_categorical_choices(f)
             train_x_list.append(encoded)
             low, high = 0, len(choices) - 1
             if low == high:

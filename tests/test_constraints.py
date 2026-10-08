@@ -6,6 +6,7 @@ import pandas as pd
 from src.core.constraints import (
     check_objective_constraints,
     encode_categorical_series,
+    encode_categorical_training_series,
     eval_numerical_expression,
     get_categorical_choices,
     validate_feature_constraints,
@@ -77,6 +78,19 @@ class ConstraintTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, '1,4-Dioxane'):
             encode_categorical_series(pd.Series(['1,4-Dioxane']), feature)
+
+    def test_bo_training_keeps_removed_categories_outside_candidate_codes(self):
+        feature = {
+            'name': 'Solvent',
+            'type': 'categorical',
+            'range': 'THF, Water',
+            'choices': ['THF', 'Water'],
+        }
+        encoded, model_choices = encode_categorical_training_series(
+            pd.Series(['THF', 'DMF', 'Water', 'DMF']), feature
+        )
+        self.assertEqual(model_choices, ['THF', 'Water', 'DMF'])
+        self.assertEqual(encoded.tolist(), [0, 2, 1, 2])
 
     def test_objective_constraints_are_strictly_validated(self):
         objectives = [{'name': 'Yield'}, {'name': 'Impurity'}]

@@ -86,6 +86,24 @@ def encode_categorical_series(series, feature):
     return encoded.to_numpy(), choices
 
 
+def encode_categorical_training_series(series, feature):
+    """Encode BO training data while preserving levels outside the current search domain.
+
+    Configured choices are assigned the first codes so candidate generation can remain
+    restricted to ``0..len(configured_choices)-1``. Historical levels that were removed
+    from the feature configuration receive additional, distinct codes and can therefore
+    still contribute to model fitting without being proposed as future experiments.
+    """
+    configured_choices = get_categorical_choices(feature)
+    values = series.astype(str)
+    observed_choices = list(dict.fromkeys(values.tolist()))
+    model_choices = configured_choices + [
+        value for value in observed_choices if value not in configured_choices
+    ]
+    mapping = {choice: idx for idx, choice in enumerate(model_choices)}
+    return values.map(mapping).to_numpy(), model_choices
+
+
 def _parse_expression(expression):
     if not isinstance(expression, str):
         raise ValueError("Constraint expression must be text.")
