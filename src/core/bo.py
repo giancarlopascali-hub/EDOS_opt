@@ -1,6 +1,7 @@
 import ast
 import re
 import itertools
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -9,40 +10,29 @@ from gpytorch.kernels import RBFKernel, MaternKernel, ScaleKernel
 
 from botorch.models import SingleTaskGP, MixedSingleTaskGP, ModelListGP
 from botorch.models.transforms import Standardize, Normalize
-from botorch.fit import fit_gpytorch_mll
-from botorch.optim.initializers import gen_batch_initial_conditions
+from botorch.fit import fit_gpytorch_mll, fit_gpytorch_mll_scipy
 
 # Acquisition functions
-from botorch.acquisition import (
-    ExpectedImprovement,
-    UpperConfidenceBound,
-    qExpectedImprovement,
-    qUpperConfidenceBound,
+from botorch.acquisition import qLogExpectedImprovement, qUpperConfidenceBound
+from botorch.acquisition.multi_objective.logei import (
+    qLogNoisyExpectedHypervolumeImprovement,
 )
-try:
-    from botorch.acquisition import qLogExpectedImprovement
-except ImportError:
-    qLogExpectedImprovement = qExpectedImprovement
-
-from botorch.acquisition.multi_objective.monte_carlo import (
-    qNoisyExpectedHypervolumeImprovement,
-    qExpectedHypervolumeImprovement,
-)
-try:
-    from botorch.acquisition.multi_objective.monte_carlo import qLogNoisyExpectedHypervolumeImprovement
-except ImportError:
-    qLogNoisyExpectedHypervolumeImprovement = qNoisyExpectedHypervolumeImprovement
+from botorch.acquisition.multi_objective.parego import qLogNParEGO
 
 from botorch.acquisition.multi_objective.objective import WeightedMCMultiOutputObjective
 from botorch.acquisition.objective import ScalarizedPosteriorTransform
 
-from botorch.optim import optimize_acqf, optimize_acqf_discrete
+from botorch.optim import optimize_acqf_discrete
+from botorch.optim.core import OptimizationStatus
+from botorch.optim.optimize import optimize_acqf
 from botorch.utils.sampling import draw_sobol_samples
 from botorch.sampling.normal import SobolQMCNormalSampler
 
 from src.core.constraints import (
+    CONSTRAINT_TOLERANCE,
     check_constraints,
     check_objective_constraints,
+    compile_numerical_expression,
     encode_categorical_training_series,
     get_categorical_choices,
 )
@@ -50,6 +40,20 @@ from src.core.feasibility import (
     ProbabilityOfFeasibilityAcquisition,
     candidate_feasibility_report,
 )
+from src.core.bo_policy import (
+    BOCalculationCancelled,
+    BOModelFitError,
+    BOOptimizationResult,
+    BOTimeoutExceeded,
+    FeasibleInitializationError,
+    assess_bo_workload,
+    load_bo_budget,
+    load_bo_large_data_settings,
+    normalized_objective_weights,
+    select_bo_policy,
+    validate_bo_data_mode,
+)
+from src.core.bo_sampling import select_representative_bo_rows
 
 
 class SurfaceCalculationCancelled(RuntimeError):
@@ -57,6 +61,144 @@ class SurfaceCalculationCancelled(RuntimeError):
 
 
 STANDARD_BO_MAX_BETA = 10.0
+BO_TENSOR_DTYPE = torch.float64
+
+
+def _check_bo_runtime(cancel_event=None, deadline=None):
+    if cancel_event is not None and cancel_event.is_set():
+        raise BOCalculationCancelled("Bayesian optimization was cancelled by the user.")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise BOTimeoutExceeded("Bayesian optimization exceeded its wall-clock budget.")
+
+
+def _remaining_bo_seconds(deadline):
+    if deadline is None:
+        return float("inf")
+    return max(0.0, deadline - time.monotonic())
+
+
+def _fit_required_model(
+    mll,
+    *,
+    label,
+    maxiter,
+    timeout_sec,
+    maxls=50,
+    retries=1,
+    cancel_event=None,
+    deadline=None,
+):
+    """Fit and validate one model through BoTorch's timed SciPy path.
+
+    L-BFGS-B can report ``ABNORMAL`` after retaining a perfectly finite best
+    point, particularly with single-precision arithmetic. BO uses double
+    precision, allows a longer line search, and retries that narrow failure
+    mode once. A persistent ``ABNORMAL`` result is accepted only when its loss,
+    parameters, posterior mean, and posterior variance are all finite.
+    """
+
+    _check_bo_runtime(cancel_event, deadline)
+    operation_deadline = time.monotonic() + float(timeout_sec)
+    if deadline is not None:
+        operation_deadline = min(operation_deadline, float(deadline))
+    effective_timeout = operation_deadline - time.monotonic()
+    if effective_timeout < 1.0:
+        raise BOTimeoutExceeded(f"No time remains to fit {label}.")
+    try:
+        attempt_history = []
+        fit_result = None
+        max_attempts = 1 + max(0, int(retries))
+        for attempt_index in range(max_attempts):
+            _check_bo_runtime(cancel_event, deadline)
+            attempt_timeout = operation_deadline - time.monotonic()
+            if attempt_timeout < 1.0:
+                if fit_result is None:
+                    raise BOTimeoutExceeded(f"No time remains to fit {label}.")
+                break
+            attempt_maxls = int(maxls) * (attempt_index + 1)
+            fit_result = fit_gpytorch_mll_scipy(
+                mll,
+                options={
+                    "maxiter": int(maxiter),
+                    "maxls": attempt_maxls,
+                },
+                timeout_sec=attempt_timeout,
+            )
+            attempt_history.append({
+                "attempt": attempt_index + 1,
+                "status": fit_result.status.name.lower(),
+                "message": str(fit_result.message),
+                "step": int(fit_result.step),
+                "maxls": attempt_maxls,
+            })
+            if fit_result.status in {
+                OptimizationStatus.SUCCESS,
+                OptimizationStatus.STOPPED,
+            }:
+                break
+            if "ABNORMAL" not in str(fit_result.message).upper():
+                break
+
+        if fit_result is None:  # Defensive; the loop always assigns or raises.
+            raise RuntimeError("optimizer did not return a result")
+        is_abnormal = (
+            fit_result.status is OptimizationStatus.FAILURE
+            and "ABNORMAL" in str(fit_result.message).upper()
+        )
+        if fit_result.status not in {
+            OptimizationStatus.SUCCESS,
+            OptimizationStatus.STOPPED,
+        } and not is_abnormal:
+            raise RuntimeError(
+                f"optimizer stopped with {fit_result.status.name}: "
+                f"{fit_result.message}"
+            )
+
+        try:
+            objective_value = float(fit_result.fval)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("optimizer returned an invalid objective value") from exc
+        if not np.isfinite(objective_value):
+            raise RuntimeError("optimizer returned a non-finite objective value")
+        for parameter_name, parameter in mll.named_parameters():
+            if not torch.isfinite(parameter.detach()).all():
+                raise RuntimeError(
+                    f"model parameter '{parameter_name}' contains non-finite values"
+                )
+
+        mll.eval()
+        model = mll.model.eval()
+        train_inputs = getattr(model, "train_inputs", None)
+        if train_inputs:
+            with torch.no_grad():
+                posterior = model.posterior(train_inputs[0])
+            if not torch.isfinite(posterior.mean).all():
+                raise RuntimeError("posterior mean contains non-finite values")
+            if not torch.isfinite(posterior.variance).all():
+                raise RuntimeError("posterior variance contains non-finite values")
+    except (BOCalculationCancelled, BOTimeoutExceeded):
+        raise
+    except Exception as exc:
+        raise BOModelFitError(f"Failed to fit {label}: {exc}") from exc
+    _check_bo_runtime(cancel_event, deadline)
+    return {
+        "label": label,
+        "status": fit_result.status.name.lower(),
+        "degraded": (
+            fit_result.status is OptimizationStatus.STOPPED or is_abnormal
+        ),
+        "accepted_after_validation": bool(is_abnormal),
+        "message": str(fit_result.message),
+        "step": int(fit_result.step),
+        "attempts": len(attempt_history),
+        "attempt_history": attempt_history,
+        "dtype": str(train_inputs[0].dtype) if train_inputs else None,
+        "runtime_seconds": (
+            round(float(fit_result.runtime), 3)
+            if fit_result.runtime is not None
+            else None
+        ),
+    }
 
 
 def validate_exploration(value):
@@ -75,40 +217,48 @@ def exploration_to_beta(exploration, max_beta=STANDARD_BO_MAX_BETA):
     return validate_exploration(exploration) * float(max_beta)
 
 
-def generate_feasible_initial_conditions(bounds_t, q, num_restarts, p_constraints, max_attempts=500):
-    """
-    Generates a tensor of shape (num_restarts, q, d) where all points satisfy
-    the constraints specified in p_constraints.
-    """
+def generate_feasible_initial_conditions(
+    bounds_t,
+    q,
+    num_restarts,
+    p_constraints,
+    *,
+    max_draws=8192,
+    chunk_size=512,
+    cancel_event=None,
+    deadline=None,
+):
+    """Return feasible restart points without ever falling back to invalid points."""
+
     d = bounds_t.shape[1]
+    needed = int(num_restarts) * int(q)
     feasible_points = []
-    
-    for attempt in range(max_attempts):
-        samples = draw_sobol_samples(bounds=bounds_t, n=1, q=2000).squeeze(0)
-        
+    draws = 0
+    while draws < int(max_draws):
+        _check_bo_runtime(cancel_event, deadline)
+        draw_count = min(int(chunk_size), int(max_draws) - draws)
+        samples = draw_sobol_samples(bounds=bounds_t, n=draw_count, q=1).squeeze(-2)
+        draws += draw_count
         mask = torch.ones(samples.shape[0], dtype=torch.bool, device=samples.device)
         for constraint_func, _ in p_constraints:
-            val = constraint_func(samples)
-            mask = mask & (val >= 0)
-            
-        feasible_samples = samples[mask]
-        feasible_points.append(feasible_samples)
-        
-        all_feasible = torch.cat(feasible_points, dim=0)
-        if all_feasible.shape[0] >= num_restarts * q:
-            selected = all_feasible[:num_restarts * q]
-            return selected.view(num_restarts, q, d)
-            
-    all_feasible = torch.cat(feasible_points, dim=0) if feasible_points else torch.empty((0, d), device=bounds_t.device)
-    if all_feasible.shape[0] < num_restarts * q:
-        if all_feasible.shape[0] == 0:
-            return draw_sobol_samples(bounds=bounds_t, n=num_restarts, q=q)
-        else:
-            repeats = (num_restarts * q // all_feasible.shape[0]) + 1
-            tiled = all_feasible.repeat(repeats, 1)[:num_restarts * q]
-            return tiled.view(num_restarts, q, d)
-            
-    return all_feasible[:num_restarts * q].view(num_restarts, q, d)
+            values = constraint_func(samples)
+            mask &= values >= 0
+        if mask.any():
+            feasible_points.append(samples[mask])
+            all_feasible = torch.unique(torch.cat(feasible_points, dim=0), dim=0)
+            if all_feasible.shape[0] >= needed:
+                return all_feasible[:needed].view(num_restarts, q, d)
+
+    feasible_count = (
+        torch.unique(torch.cat(feasible_points, dim=0), dim=0).shape[0]
+        if feasible_points
+        else 0
+    )
+    raise FeasibleInitializationError(
+        "Unable to find enough feasible optimizer starting points "
+        f"({feasible_count} found, {needed} required after {draws} draws). "
+        "Review or relax the numerical feature constraints."
+    )
 
 
 def clean_dataframe(df, features_config, objectives_config):
@@ -151,6 +301,81 @@ def clean_dataframe(df, features_config, objectives_config):
     return df_clean
 
 
+def analyze_objective_data(df, objectives_config, feature_count):
+    """Return serializable objective statistics and non-blocking quality notes."""
+
+    statistics = {}
+    warnings = []
+    numeric_columns = {}
+    recommended_minimum = max(3, int(feature_count) + 1)
+
+    for objective in objectives_config:
+        name = objective["name"]
+        values = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+        finite_values = values[np.isfinite(values)]
+        finite_count = int(finite_values.size)
+        unique_count = int(np.unique(finite_values).size)
+        missing_count = int(values.size - finite_count)
+        numeric_columns[name] = values
+        statistics[name] = {
+            "finite_count": finite_count,
+            "missing_count": missing_count,
+            "unique_count": unique_count,
+            "minimum": float(finite_values.min()) if finite_count else None,
+            "maximum": float(finite_values.max()) if finite_count else None,
+            "standard_deviation": (
+                float(np.std(finite_values)) if finite_count else None
+            ),
+        }
+        if missing_count:
+            warnings.append(
+                f"Objective '{name}' has {missing_count} missing value(s); "
+                f"its model will use the remaining {finite_count} row(s)."
+            )
+        if finite_count and finite_count < recommended_minimum:
+            warnings.append(
+                f"Objective '{name}' has only {finite_count} finite observation(s) "
+                f"for {feature_count} feature(s); its surrogate may be unreliable."
+            )
+        if finite_count and unique_count <= 1:
+            warnings.append(
+                f"Objective '{name}' is constant and cannot influence optimization; "
+                "consider excluding it or representing it as a constraint."
+            )
+
+    redundant_pairs = []
+    objective_names = [objective["name"] for objective in objectives_config]
+    for left_index, left_name in enumerate(objective_names):
+        left_values = numeric_columns[left_name]
+        for right_name in objective_names[left_index + 1:]:
+            right_values = numeric_columns[right_name]
+            finite = np.isfinite(left_values) & np.isfinite(right_values)
+            if int(finite.sum()) < 3:
+                continue
+            left_overlap = left_values[finite]
+            right_overlap = right_values[finite]
+            if np.unique(left_overlap).size <= 1 or np.unique(right_overlap).size <= 1:
+                continue
+            correlation = float(np.corrcoef(left_overlap, right_overlap)[0, 1])
+            if np.isfinite(correlation) and abs(correlation) >= 0.999:
+                pair = {
+                    "left": left_name,
+                    "right": right_name,
+                    "correlation": correlation,
+                }
+                redundant_pairs.append(pair)
+                warnings.append(
+                    f"Objectives '{left_name}' and '{right_name}' are almost perfectly "
+                    f"correlated (r={correlation:.4f}); consider whether both are needed."
+                )
+
+    return {
+        "objectives": statistics,
+        "recommended_minimum_observations": recommended_minimum,
+        "redundant_pairs": redundant_pairs,
+    }, warnings
+
+
 def infer_decimal_precision(col_series: pd.Series = None, range_str: str = '') -> int:
     """
     Return the maximum number of decimal places seen in col_series or range_str.
@@ -173,806 +398,1146 @@ def infer_decimal_precision(col_series: pd.Series = None, range_str: str = '') -
     return max_dec if max_dec > 0 else 1
 
 
-def run_bo_optimization(df, features_config, objectives_config, tweaks, device, compute_device):
-    # Filter the dataframe to drop incomplete rows
-    df_clean = clean_dataframe(df, features_config, objectives_config)
+def _eval_constraint_arithmetic(node, x_value, placeholder_indices):
+    """Evaluate the arithmetic side of a validated feature constraint on tensors."""
 
-    # STEP 1 — Build Training Features (X)
-    train_x_list    = []
-    bounds          = []
-    categorical_features = []
-    feature_levels  = []
+    if isinstance(node, ast.Expression):
+        return _eval_constraint_arithmetic(node.body, x_value, placeholder_indices)
+    if isinstance(node, ast.Constant):
+        return float(node.value)
+    if isinstance(node, ast.Num):  # pragma: no cover - Python < 3.8
+        return float(node.n)
+    if isinstance(node, ast.Name):
+        return x_value[..., placeholder_indices[node.id]]
+    if isinstance(node, ast.UnaryOp):
+        operand = _eval_constraint_arithmetic(
+            node.operand, x_value, placeholder_indices
+        )
+        if isinstance(node.op, ast.USub):
+            return -operand
+        if isinstance(node.op, ast.UAdd):
+            return operand
+    if isinstance(node, ast.BinOp):
+        left = _eval_constraint_arithmetic(node.left, x_value, placeholder_indices)
+        right = _eval_constraint_arithmetic(node.right, x_value, placeholder_indices)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Pow):
+            return left ** right
+    raise ValueError(
+        f"Unsupported numerical constraint element: {type(node).__name__}."
+    )
 
-    for i, f in enumerate(features_config):
-        name    = f['name']
-        f_range = f['range']
 
-        if f['type'] == 'continuous':
-            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
-            low, high = sorted([float(matches[0]), float(matches[1])]) if len(matches) >= 2 else (0.0, 1.0)
-            if low == high:
-                high = low + abs(low) * 0.01 + 0.1
-            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(0).values
-            train_x_list.append(feat_vals)
-            bounds.append([low, high])
-            feature_levels.append(None)
+def _constraint_margin(left, right, operator_node):
+    """Convert a comparison to BoTorch's required non-negative margin."""
 
-        elif f['type'] == 'discrete':
-            clean_range = f_range.replace('[', '').replace(']', '')
-            values = sorted([float(x.strip()) for x in clean_range.split(',') if x.strip()])
-            if not values:
-                values = [0.0]
-            low, high = values[0], values[-1]
-            if low == high:
-                high = low + abs(low) * 0.01 + 0.1
-            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(values[0]).values
-            train_x_list.append(feat_vals)
-            bounds.append([low, high])
-            feature_levels.append(values)
+    tolerance = float(CONSTRAINT_TOLERANCE)
+    if isinstance(operator_node, ast.LtE):
+        return right - left
+    if isinstance(operator_node, ast.Lt):
+        return right - left - tolerance
+    if isinstance(operator_node, ast.GtE):
+        return left - right
+    if isinstance(operator_node, ast.Gt):
+        return left - right - tolerance
+    if isinstance(operator_node, ast.Eq):
+        return tolerance - torch.abs(left - right)
+    if isinstance(operator_node, ast.NotEq):
+        return torch.abs(left - right) - tolerance
+    raise ValueError(
+        f"Unsupported numerical constraint comparison: {type(operator_node).__name__}."
+    )
 
-        elif f['type'] == 'regular':
-            matches = re.findall(r"[-+]?\d*\.?\d+", f_range)
-            if len(matches) >= 3:
-                low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
-                values = np.linspace(low, high, steps).tolist()
-            elif len(matches) == 2:
-                low, high = sorted([float(matches[0]), float(matches[1])])
-                values = np.linspace(low, high, 10).tolist()
-            else:
-                values = [0.0]
-            low, high = values[0], values[-1]
-            if low == high:
-                high = low + abs(low) * 0.01 + 0.1
-            feat_vals = pd.to_numeric(df_clean[name], errors='coerce').fillna(values[0]).values
-            train_x_list.append(feat_vals)
-            bounds.append([low, high])
-            feature_levels.append(values)
 
-        elif f['type'] == 'categorical':
-            encoded, _ = encode_categorical_training_series(df_clean[name], f)
-            choices = get_categorical_choices(f)
-            train_x_list.append(encoded)
-            low, high = 0, len(choices) - 1
-            if low == high:
-                high = low + 0.1
-            bounds.append([low, high])
-            categorical_features.append(i)
-            feature_levels.append(list(range(len(choices))))
+def compile_botorch_feature_constraints(numerical_rules, features_config):
+    """Compile validated UI equations into intra-point BoTorch constraints.
 
-    if not df_clean.empty:
-        train_x  = torch.tensor(np.stack(train_x_list, axis=1), dtype=torch.float32).to(device)
+    The Boolean in BoTorch's ``(callable, bool)`` tuple describes whether the
+    callable is intra-point, not whether it represents equality. Every feature
+    equation here applies independently to one proposed experiment, so it is
+    always ``True``. Equality is represented by a tolerance margin.
+    """
+
+    feature_names = [feature["name"] for feature in features_config]
+    feature_indices = {name: index for index, name in enumerate(feature_names)}
+    compiled = []
+    for expression in numerical_rules or []:
+        tree, placeholders = compile_numerical_expression(expression, feature_names)
+        comparison = tree.body
+        if not isinstance(comparison, ast.Compare):
+            raise ValueError(
+                f"Numerical constraint '{expression}' must be a comparison."
+            )
+        placeholder_indices = {
+            placeholder: feature_indices[feature_name]
+            for placeholder, feature_name in placeholders.items()
+        }
+        left_node = comparison.left
+        for operator_node, right_node in zip(
+            comparison.ops, comparison.comparators
+        ):
+            def constraint_function(
+                x_value,
+                lhs=left_node,
+                rhs=right_node,
+                operator_value=operator_node,
+                mapping=placeholder_indices,
+            ):
+                left = _eval_constraint_arithmetic(lhs, x_value, mapping)
+                right = _eval_constraint_arithmetic(rhs, x_value, mapping)
+                return _constraint_margin(left, right, operator_value)
+
+            compiled.append((constraint_function, True))
+            left_node = right_node
+    return compiled
+
+def run_bo_optimization(
+    df,
+    features_config,
+    objectives_config,
+    tweaks,
+    device,
+    compute_device,
+    *,
+    progress_callback=None,
+    cancel_event=None,
+    deadline=None,
+    compute_performance=False,
+    random_seed=1729,
+):
+    """Run bounded BO and return a serializable, named result.
+
+    Candidate generation is deliberately sequential. Each candidate gets a
+    fresh acquisition with all earlier candidates supplied as ``X_pending`` and
+    an independent optimizer timeout. The outer process supervisor provides the
+    hard-stop boundary; these checks make normal cancellation and deadlines
+    cooperative and fast between native calls.
+    """
+
+    started = time.monotonic()
+    is_cuda = str(getattr(device, "type", device)).lower().startswith("cuda")
+    budget = load_bo_budget(is_cuda=is_cuda)
+    if deadline is None:
+        deadline = started + budget.total_job_timeout_sec
     else:
-        train_x  = torch.zeros((0, len(features_config)), dtype=torch.float32).to(device)
-    bounds_t = torch.tensor(bounds, dtype=torch.float32).T.to(device)
+        deadline = min(float(deadline), started + budget.total_job_timeout_sec)
 
-    # Build per-feature decimal precision for continuous/regular/discrete features
-    # (used later by get_fingerprint and decode_cand to round suggested values)
+    try:
+        seed = int(random_seed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The BO random seed must be an integer.") from exc
+    if not 0 <= seed < 2**63:
+        raise ValueError("The BO random seed must be between 0 and 2^63 - 1.")
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    diagnostics = {
+        "algorithm": None,
+        "algorithm_label": None,
+        "algorithm_reason": None,
+        "acquisition_policy": None,
+        "batch_size": None,
+        "rows_received": int(len(df)),
+        "rows_valid": None,
+        "rows_used": None,
+        "feature_count": len(features_config or []),
+        "objective_count": len(objectives_config or []),
+        "random_seed": seed,
+        "compute_performance_requested": bool(compute_performance),
+        "compute_performance_completed": False,
+        "tensor_dtype": str(BO_TENSOR_DTYPE),
+        "effective_budget": budget.to_dict(),
+        "phase_seconds": {},
+        "model_fits": [],
+        "objective_data": {},
+        "data_warnings": [],
+        "data_handling": None,
+        "workload": None,
+    }
+
+    def report(phase, percent, **details):
+        _check_bo_runtime(cancel_event, deadline)
+        payload = {
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "algorithm": diagnostics.get("algorithm"),
+            **details,
+        }
+        if progress_callback is not None:
+            progress_callback(phase, max(0, min(99, int(percent))), payload)
+
+    def record_phase(name, phase_started):
+        diagnostics["phase_seconds"][name] = round(
+            time.monotonic() - phase_started, 3
+        )
+
+    report("Validating and preparing data", 1)
+    preparation_started = time.monotonic()
+    if not features_config:
+        raise ValueError("At least one feature is required for optimization.")
+    if not objectives_config:
+        raise ValueError("At least one objective is required for optimization.")
+    try:
+        raw_batch_size = float(tweaks.get("batch_size", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Batch size must be a whole number.") from exc
+    if not np.isfinite(raw_batch_size) or not raw_batch_size.is_integer():
+        raise ValueError("Batch size must be a whole number.")
+    batch_size = int(raw_batch_size)
+    if not 1 <= batch_size <= budget.max_batch_size:
+        raise ValueError(
+            f"Batch size must be between 1 and {budget.max_batch_size}."
+        )
+    diagnostics["batch_size"] = batch_size
+
+    required_columns = {
+        config["name"] for config in [*features_config, *objectives_config]
+    }
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise ValueError(
+            "The dataset is missing configured column(s): "
+            + ", ".join(missing_columns)
+            + "."
+        )
+    df_clean = clean_dataframe(df, features_config, objectives_config)
+    if not df.empty and df_clean.empty:
+        raise ValueError(
+            "No rows contain valid selected features and at least one valid "
+            "objective value. Review missing or non-numeric cells."
+        )
+    df_all_clean = df_clean.copy()
+    diagnostics["rows_valid"] = int(len(df_all_clean))
+    objective_data, data_warnings = analyze_objective_data(
+        df_all_clean, objectives_config, len(features_config)
+    )
+    diagnostics["objective_data"] = objective_data
+    diagnostics["data_warnings"] = data_warnings
+
+    raw_weights = [
+        float(objective.get("importance", 1)) for objective in objectives_config
+    ]
+    normalized_weights = normalized_objective_weights(raw_weights)
+    acquisition_type = str(tweaks.get("acq_type", "EI"))
+    requested_method = str(tweaks.get("multi_objective_method", "auto"))
+    policy = select_bo_policy(
+        len(objectives_config),
+        raw_weights,
+        acquisition_type,
+        budget.nehvi_max_objectives,
+        requested_method=requested_method,
+    )
+    diagnostics.update({
+        "algorithm": policy.key,
+        "algorithm_label": policy.label,
+        "algorithm_reason": policy.reason,
+        "acquisition_policy": policy.to_dict(),
+    })
+
+    constraints_config = dict(tweaks.get("constraints") or {})
+    numerical_rules = constraints_config.get("numerical") or []
+    disallowed_rules = constraints_config.get("disallowed") or []
+    objective_constraints = tweaks.get("objective_constraints") or []
+    constrained_names = list(dict.fromkeys(
+        constraint["objective"] for constraint in objective_constraints
+    ))
+
+    large_data_settings = load_bo_large_data_settings()
+    requested_data_mode = validate_bo_data_mode(tweaks.get("data_mode", "auto"))
+    per_model_rows = [
+        int(pd.to_numeric(df_all_clean[objective["name"]], errors="coerce").notna().sum())
+        for objective in objectives_config
+    ]
+    per_model_rows.extend(
+        int(pd.to_numeric(df_all_clean[name], errors="coerce").notna().sum())
+        for name in constrained_names
+    )
+    full_workload = assess_bo_workload(
+        row_count=len(df_all_clean),
+        feature_count=len(features_config),
+        objective_count=len(objectives_config),
+        batch_size=batch_size,
+        method=policy.key,
+        budget=budget,
+        per_model_rows=per_model_rows,
+        model_count=len(per_model_rows),
+        settings=large_data_settings,
+    )
+    allow_unsafe_full = bool(tweaks.get("_allow_unsafe_full", False))
+    should_reduce = (
+        requested_data_mode == "representative"
+        or (requested_data_mode == "auto" and full_workload.tier == "unsafe")
+    )
+    if (
+        requested_data_mode == "full"
+        and full_workload.tier == "unsafe"
+        and not allow_unsafe_full
+    ):
+        raise ValueError(
+            "Full exact-GP training is above this deployment's safety limit "
+            f"(workload score {full_workload.risk_score:.2f}). Choose Auto or "
+            "Representative exact GP. A standalone installation can allow this "
+            "override with a larger runtime and memory budget."
+        )
+
+    selection_diagnostic = None
+    effective_data_mode = "full"
+    if should_reduce and len(df_all_clean) > full_workload.recommended_training_rows:
+        if not full_workload.representative_feasible:
+            raise ValueError(
+                "This acquisition and problem size remain above the safety limit "
+                "even at the minimum representative training size. Use the Auto "
+                "acquisition method, reduce the objectives or batch size, or run "
+                "the standalone app with larger server budgets."
+            )
+        report(
+            "Selecting representative training rows",
+            5,
+            source_rows=len(df_all_clean),
+            target_rows=full_workload.recommended_training_rows,
+        )
+        df_clean, selection_diagnostic = select_representative_bo_rows(
+            df_all_clean,
+            features_config,
+            objectives_config,
+            max_rows=full_workload.recommended_training_rows,
+            target_fidelity_score=large_data_settings.target_fidelity_score,
+            random_seed=seed,
+            maximum_attempts=(
+                large_data_settings.representative_selection_attempts
+            ),
+            search_time_limit_seconds=(
+                large_data_settings.representative_selection_search_timeout_sec
+            ),
+            check_runtime=lambda: _check_bo_runtime(cancel_event, deadline),
+        )
+        effective_data_mode = "representative"
+        if selection_diagnostic.fidelity_target_met:
+            diagnostics["data_warnings"].append(
+                "Large-data protection trained the exact GP on "
+                f"{len(df_clean):,} representative rows from "
+                f"{len(df_all_clean):,} valid rows "
+                f"(fidelity {selection_diagnostic.fidelity_score:.1f}/100; "
+                f"target {selection_diagnostic.target_fidelity_score:.1f}/100). "
+                "All uploaded rows were still retained for duplicate avoidance."
+            )
+        else:
+            attempt_word = (
+                "attempt"
+                if selection_diagnostic.selection_attempts == 1
+                else "attempts"
+            )
+            time_limit_note = (
+                " The bounded subset search reached its selection-time limit."
+                if selection_diagnostic.search_time_limit_reached
+                else ""
+            )
+            diagnostics["data_warnings"].append(
+                "Representative-subset fallback used: large-data protection "
+                f"trained the exact GP on the best safe subset found after "
+                f"{selection_diagnostic.selection_attempts} bounded "
+                f"selection {attempt_word} ({len(df_clean):,} of "
+                f"{len(df_all_clean):,} valid rows). Its fidelity was "
+                f"{selection_diagnostic.fidelity_score:.1f}/100, below the "
+                f"target of {selection_diagnostic.target_fidelity_score:.1f}/100. "
+                "Optimization continued, but the recommendations may represent "
+                "the uploaded dataset less accurately. All uploaded rows were "
+                f"retained for duplicate avoidance.{time_limit_note}"
+            )
+    elif requested_data_mode == "full" and full_workload.tier == "unsafe":
+        diagnostics["data_warnings"].append(
+            "Full exact-GP training is running above the standard safety score "
+            "because this standalone deployment permits the override."
+        )
+
+    selected_model_rows = [
+        int(pd.to_numeric(df_clean[objective["name"]], errors="coerce").notna().sum())
+        for objective in objectives_config
+    ]
+    selected_model_rows.extend(
+        int(pd.to_numeric(df_clean[name], errors="coerce").notna().sum())
+        for name in constrained_names
+    )
+    selected_workload = assess_bo_workload(
+        row_count=len(df_clean),
+        feature_count=len(features_config),
+        objective_count=len(objectives_config),
+        batch_size=batch_size,
+        method=policy.key,
+        budget=budget,
+        per_model_rows=selected_model_rows,
+        model_count=len(selected_model_rows),
+        settings=large_data_settings,
+    )
+    diagnostics["rows_used"] = int(len(df_clean))
+    diagnostics["data_handling"] = {
+        "requested_mode": requested_data_mode,
+        "effective_mode": effective_data_mode,
+        "source_rows": int(len(df_all_clean)),
+        "training_rows": int(len(df_clean)),
+        "selection": (
+            selection_diagnostic.to_dict() if selection_diagnostic else None
+        ),
+    }
+    diagnostics["workload"] = {
+        "full_data": full_workload.to_dict(),
+        "training_data": selected_workload.to_dict(),
+        "thresholds": large_data_settings.to_dict(),
+        "note": (
+            "Planning estimate only; actual runtime depends on data geometry and "
+            "hardware. The server always enforces the hard job deadline."
+        ),
+    }
+    opt_device = compute_device
+    bo_dtype = BO_TENSOR_DTYPE
+
+    train_x_columns = []
+    bounds = []
+    categorical_features = []
+    feature_levels = []
+    for feature_index, feature in enumerate(features_config):
+        name = feature["name"]
+        range_value = str(feature.get("range", ""))
+        feature_type = feature.get("type", "continuous")
+        if feature_type == "continuous":
+            matches = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", range_value)
+            low, high = sorted(map(float, matches[:2]))
+            values = pd.to_numeric(df_clean[name], errors="coerce").fillna(low).values
+            levels = None
+        elif feature_type == "discrete":
+            levels = sorted(
+                float(value.strip())
+                for value in range_value.replace("[", "").replace("]", "").split(",")
+                if value.strip()
+            )
+            if not levels:
+                raise ValueError(f"Feature '{name}' requires at least one value.")
+            low, high = levels[0], levels[-1]
+            values = pd.to_numeric(df_clean[name], errors="coerce").fillna(low).values
+        elif feature_type == "regular":
+            matches = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", range_value)
+            if len(matches) >= 3:
+                low, high = sorted(map(float, matches[:2]))
+                levels = np.linspace(low, high, int(float(matches[2]))).tolist()
+            elif len(matches) == 2:
+                low, high = sorted(map(float, matches))
+                levels = np.linspace(low, high, 10).tolist()
+            else:
+                raise ValueError(
+                    f"Feature '{name}' requires a regular range like [min, max]steps."
+                )
+            values = pd.to_numeric(df_clean[name], errors="coerce").fillna(low).values
+        elif feature_type == "categorical":
+            values, _ = encode_categorical_training_series(df_clean[name], feature)
+            choices = get_categorical_choices(feature)
+            low, high = 0.0, float(len(choices) - 1)
+            levels = list(range(len(choices)))
+            categorical_features.append(feature_index)
+        else:
+            raise ValueError(f"Feature '{name}' has unknown type '{feature_type}'.")
+        if low == high:
+            high = low + max(abs(low) * 0.01, 0.1)
+        train_x_columns.append(values)
+        bounds.append([float(low), float(high)])
+        feature_levels.append(levels)
+
+    if df_clean.empty:
+        train_x = torch.empty(
+            (0, len(features_config)), dtype=bo_dtype, device=opt_device
+        )
+    else:
+        train_x = torch.tensor(
+            np.stack(train_x_columns, axis=1),
+            dtype=bo_dtype,
+            device=opt_device,
+        )
+    bounds_t = torch.tensor(bounds, dtype=bo_dtype, device=opt_device).T
+
     feature_precision = {}
-    for f in features_config:
-        col_s = (
-            df_clean[f['name']].astype(str)
-            if (not df_clean.empty and f['name'] in df_clean.columns)
+    for feature in features_config:
+        column = (
+            df_all_clean[feature["name"]].astype(str)
+            if not df_all_clean.empty and feature["name"] in df_all_clean
             else pd.Series(dtype=str)
         )
-        feature_precision[f['name']] = infer_decimal_precision(col_s, f.get('range', ''))
-
-    # STEP 2 — Build Training Objectives (Y)
-    train_y_list = []
-    weights_list = []
-
-    for obj in objectives_config:
-        weights_list.append(float(obj.get('importance', 1)))
-        if not df_clean.empty:
-            vals = pd.to_numeric(df_clean[obj['name']], errors='coerce').values
-            if obj['type'] == 'minimize':
-                train_y_list.append(-vals)
-            elif obj['type'] == 'maximize':
-                train_y_list.append(vals)
-            elif obj['type'] == 'target':
-                target   = float(obj.get('target', 0))
-                valid_vals = vals[~np.isnan(vals)]
-                variance = np.var(valid_vals) if len(valid_vals) > 0 and np.var(valid_vals) > 0 else 1.0
-                train_y_list.append(-((vals - target) ** 2) / variance)
-
-    if not df_clean.empty:
-        train_y = torch.tensor(np.stack(train_y_list, axis=1), dtype=torch.float32).to(device)
-    else:
-        train_y = torch.zeros((0, len(objectives_config)), dtype=torch.float32).to(device)
-
-    weights_t   = torch.tensor(weights_list, dtype=torch.float32).to(device)
-    batch_size  = int(float(tweaks.get('batch_size', 1)))
-    avoid_reval = tweaks.get('avoid_reval', True)
-    # acq_type is ignored in multi-objective mode (which always uses EHVI or scalarized posterior transform)
-    acq_type    = tweaks.get('acq_type', 'EI')
-    exploration = validate_exploration(tweaks.get('exploration', 0.5))
-
-    # Hoist constraint extraction so variables are always in scope (needed on cold start too)
-    constraints_cfg  = tweaks.get('constraints', {})
-    num_rules        = constraints_cfg.get('numerical', [])
-    disallowed_rules = constraints_cfg.get('disallowed', [])
-    objective_constraints = tweaks.get('objective_constraints', [])
-    feasibility_models = {}
-
-    # STEP 3 — Optimization Logic
-    if df_clean.empty:
-        # Cold start: generate Sobol candidates and filter by constraints if any
-        n_pool = max(batch_size * 500, 2000)
-        pool   = draw_sobol_samples(bounds=bounds_t, n=1, q=n_pool).squeeze(0)
-        if num_rules or disallowed_rules:
-            feasible = []
-            for pt in pool:
-                decoded = {}
-                for idx_f, f in enumerate(features_config):
-                    v = pt[idx_f].item()
-                    if f['type'] == 'categorical':
-                        choices = get_categorical_choices(f)
-                        v = choices[max(0, min(len(choices) - 1, int(round(v))))]
-                    elif f['type'] in ('discrete', 'regular'):
-                        matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
-                        if f['type'] == 'discrete':
-                            d_vals = sorted([float(x.strip()) for x in f['range'].replace('[','').replace(']','').split(',') if x.strip()])
-                        elif len(matches) >= 3:
-                            lo, hi, st = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
-                            d_vals = np.linspace(lo, hi, st).tolist()
-                        elif len(matches) == 2:
-                            d_vals = np.linspace(float(matches[0]), float(matches[1]), 10).tolist()
-                        else:
-                            d_vals = []
-                        if d_vals:
-                            v = min(d_vals, key=lambda x: abs(x - v))
-                    if isinstance(v, (int, float)):
-                        v = round(float(v), 6)
-                    decoded[f['name']] = v
-                if check_constraints(decoded, num_rules, disallowed_rules, features_config):
-                    feasible.append(pt)
-                if len(feasible) >= batch_size:
-                    break
-            if feasible:
-                candidates = torch.stack(feasible[:batch_size])
-            else:
-                candidates = draw_sobol_samples(bounds=bounds_t, n=1, q=batch_size).squeeze(0)
-        else:
-            candidates = draw_sobol_samples(bounds=bounds_t, n=1, q=batch_size).squeeze(0)
-    else:
-        kernel_name  = tweaks.get('kernel', 'matern52')
-        is_noiseless = tweaks.get('noiseless', False)
-
-        def get_kernel(k_name):
-            if k_name == 'rbf':      return ScaleKernel(RBFKernel()).to(device)
-            if k_name == 'matern32': return ScaleKernel(MaternKernel(nu=1.5)).to(device)
-            if k_name == 'matern12': return ScaleKernel(MaternKernel(nu=0.5)).to(device)
-            return ScaleKernel(MaternKernel(nu=2.5)).to(device)
-
-        def build_single_model(tx, ty_slice):
-            all_dims  = list(range(tx.shape[1]))
-            cont_dims = [idx for idx in all_dims if idx not in categorical_features]
-
-            input_tf = (
-                Normalize(
-                    d=tx.shape[1],
-                    bounds=bounds_t.to(compute_device)[:, cont_dims],
-                    indices=cont_dims
-                ).to(compute_device)
-                if cont_dims else None
-            )
-
-            if categorical_features and len(cont_dims) > 0:
-                m = MixedSingleTaskGP(
-                    tx.to(compute_device), ty_slice.to(compute_device),
-                    cat_dims=categorical_features,
-                    outcome_transform=Standardize(m=1),
-                    input_transform=input_tf
-                ).to(compute_device)
-            else:
-                m = SingleTaskGP(
-                    tx.to(compute_device), ty_slice.to(compute_device),
-                    covar_module=get_kernel(kernel_name).to(compute_device),
-                    outcome_transform=Standardize(m=1),
-                    input_transform=input_tf
-                ).to(compute_device)
-
-            if is_noiseless:
-                # Pin noise to a small constant and freeze it so model fitting
-                # cannot increase it. This enforces near-noiseless behavior rather
-                # than just softly encouraging low noise via a prior.
-                with torch.no_grad():
-                    m.likelihood.noise_covar.noise = torch.tensor(1e-4, device=compute_device)
-                m.likelihood.noise_covar.raw_noise.requires_grad_(False)
-
-            return m.to(compute_device)
-
-        if train_y.shape[1] > 1:
-            models = []
-            for idx in range(train_y.shape[1]):
-                y_slice = train_y[:, idx:idx+1]
-                non_nan_mask = ~torch.isnan(y_slice.squeeze(-1))
-                tx_i = train_x[non_nan_mask]
-                ty_i = y_slice[non_nan_mask]
-                if tx_i.shape[0] == 0:
-                    raise ValueError(f"No valid observations for objective '{objectives_config[idx]['name']}' after filtering missing values.")
-                models.append(build_single_model(tx_i, ty_i))
-
-            model   = ModelListGP(*models).to(compute_device)
-            mll     = SumMarginalLogLikelihood(model.likelihood, model).to(compute_device)
-        else:
-            model = build_single_model(train_x, train_y).to(compute_device)
-            mll   = ExactMarginalLogLikelihood(model.likelihood, model).to(compute_device)
-
-        try:
-            fit_gpytorch_mll(mll, optimizer_kwargs={"options": {"maxiter": 100}})
-        except Exception as e:
-            print(f"Warning: Main model fit failed: {e}")
-
-        OPT_DEVICE = device if device.type == 'cuda' else compute_device
-        model = model.to(OPT_DEVICE)
-
-        intensity = 2 if train_y.shape[1] > 1 else 1
-        if device.type == 'cuda':
-            intensity *= 6
-        else:
-            intensity *= 2
-
-        is_mo      = train_y.shape[1] > 1
-        is_uniform = (
-            torch.allclose(weights_t, weights_t[0].expand_as(weights_t), atol=1e-2)
-            if is_mo else True
+        feature_precision[feature["name"]] = infer_decimal_precision(
+            column, feature.get("range", "")
         )
 
-        base_mc_samples = 64 if is_mo else 256
-        mc_samples = int(base_mc_samples * intensity)
-        sampler    = SobolQMCNormalSampler(sample_shape=torch.Size([mc_samples]))
+    def decode_candidate(candidate):
+        decoded = {}
+        for index, feature in enumerate(features_config):
+            value = float(candidate[index].item())
+            feature_type = feature.get("type", "continuous")
+            levels = feature_levels[index]
+            if feature_type in {"discrete", "regular"} and levels:
+                value = min(levels, key=lambda level: abs(level - value))
+            elif feature_type == "categorical":
+                choices = get_categorical_choices(feature)
+                choice_index = max(0, min(len(choices) - 1, int(round(value))))
+                value = choices[choice_index]
+            if isinstance(value, (int, float)):
+                value = round(float(value), feature_precision[feature["name"]])
+            decoded[feature["name"]] = value
+        return decoded
 
-        acq_is_logarithmic = False
-        if is_mo:
-            if is_uniform:
-                mo_obj = WeightedMCMultiOutputObjective(weights=weights_t.to(OPT_DEVICE))
-                ty_compute = train_y.to(OPT_DEVICE)
+    feature_names = [feature["name"] for feature in features_config]
 
-                mins_list = []
-                maxs_list = []
-                for idx in range(ty_compute.shape[1]):
-                    valid_vals = ty_compute[:, idx][~torch.isnan(ty_compute[:, idx])]
-                    if valid_vals.numel() > 0:
-                        mins_list.append(valid_vals.min())
-                        maxs_list.append(valid_vals.max())
-                    else:
-                        mins_list.append(torch.tensor(0.0, device=OPT_DEVICE))
-                        maxs_list.append(torch.tensor(1.0, device=OPT_DEVICE))
-                mins = torch.stack(mins_list)
-                maxs = torch.stack(maxs_list)
-
-                ref_point = (mins - 0.2 * (maxs - mins + 1e-6)) * weights_t.to(OPT_DEVICE)
-                acq_func = qLogNoisyExpectedHypervolumeImprovement(
-                    model=model,
-                    ref_point=ref_point,
-                    X_baseline=train_x.to(OPT_DEVICE),
-                    sampler=sampler,
-                    objective=mo_obj,
-                    prune_baseline=True
-                ).to(OPT_DEVICE)
-                acq_is_logarithmic = True
+    def fingerprint(row):
+        parts = []
+        for name in feature_names:
+            value = row[name]
+            if isinstance(value, (int, float)):
+                parts.append(f"{float(value):.{feature_precision[name]}f}")
             else:
-                post_tf = ScalarizedPosteriorTransform(weights=weights_t.to(OPT_DEVICE))
-                
-                # Fill NaNs with the minimum observed value for each objective
-                train_y_filled = train_y.clone()
-                for idx in range(train_y.shape[1]):
-                    valid_vals = train_y[:, idx][~torch.isnan(train_y[:, idx])]
-                    min_val = valid_vals.min().item() if valid_vals.numel() > 0 else 0.0
-                    nan_mask = torch.isnan(train_y_filled[:, idx])
-                    train_y_filled[nan_mask, idx] = min_val
-                
-                best_f = (train_y_filled.to(OPT_DEVICE) * weights_t.to(OPT_DEVICE)).sum(dim=-1).max().item()
-                acq_func = qLogExpectedImprovement(
+                parts.append(str(value))
+        return "|".join(parts)
+
+    existing_fingerprints = set()
+    if not df_all_clean.empty:
+        for _, row in df_all_clean[feature_names].iterrows():
+            existing_fingerprints.add(fingerprint(row.to_dict()))
+
+    weights_t = torch.tensor(
+        normalized_weights, dtype=bo_dtype, device=opt_device
+    )
+
+    train_y_columns = []
+    if not df_clean.empty:
+        for objective in objectives_config:
+            values = pd.to_numeric(df_clean[objective["name"]], errors="coerce").values
+            objective_type = objective.get("type", "maximize")
+            if objective_type == "maximize":
+                transformed = values
+            elif objective_type == "minimize":
+                transformed = -values
+            elif objective_type == "target":
+                target = float(objective.get("target", 0))
+                valid = values[~np.isnan(values)]
+                variance = float(np.var(valid)) if valid.size else 1.0
+                if not np.isfinite(variance) or variance <= 0:
+                    variance = 1.0
+                transformed = -((values - target) ** 2) / variance
+            else:
+                raise ValueError(
+                    f"Objective '{objective['name']}' has unknown type '{objective_type}'."
+                )
+            train_y_columns.append(transformed)
+        train_y = torch.tensor(
+            np.stack(train_y_columns, axis=1),
+            dtype=bo_dtype,
+            device=opt_device,
+        )
+    else:
+        train_y = torch.empty(
+            (0, len(objectives_config)), dtype=bo_dtype, device=opt_device
+        )
+
+    avoid_revalidation = bool(tweaks.get("avoid_reval", True))
+    exploration = validate_exploration(tweaks.get("exploration", 0.5))
+    record_phase("preparation", preparation_started)
+
+    raw_candidates = []
+    feasibility_models = {}
+    build_single_model = None
+    strategy = "cold_start"
+
+    if df_clean.empty:
+        diagnostics.update({
+            "algorithm": "sobol-cold-start",
+            "algorithm_label": "Constrained Sobol cold start",
+            "algorithm_reason": "No completed observations are available for GP fitting.",
+        })
+        report("Generating cold-start candidates", 35)
+        phase_started = time.monotonic()
+        seen = set(existing_fingerprints if avoid_revalidation else ())
+        draws = 0
+        while len(raw_candidates) < batch_size and draws < budget.feasible_ic_max_draws:
+            _check_bo_runtime(cancel_event, deadline)
+            chunk_size = min(
+                budget.feasible_ic_chunk_size,
+                budget.feasible_ic_max_draws - draws,
+            )
+            sample = draw_sobol_samples(
+                bounds=bounds_t, n=chunk_size, q=1
+            ).squeeze(-2)
+            draws += chunk_size
+            for point in sample:
+                decoded = decode_candidate(point)
+                candidate_fingerprint = fingerprint(decoded)
+                if candidate_fingerprint in seen:
+                    continue
+                if not check_constraints(
+                    decoded, numerical_rules, disallowed_rules, features_config
+                ):
+                    continue
+                seen.add(candidate_fingerprint)
+                raw_candidates.append(point.detach().cpu())
+                if len(raw_candidates) >= batch_size:
+                    break
+        if len(raw_candidates) < batch_size:
+            raise FeasibleInitializationError(
+                f"Only {len(raw_candidates)} distinct feasible cold-start conditions "
+                f"were found after {draws} bounded draws; {batch_size} were requested. "
+                "Review the feature ranges, precision, or constraints."
+            )
+        record_phase("cold_start", phase_started)
+    else:
+        kernel_name = str(tweaks.get("kernel", "matern52"))
+        is_noiseless = bool(tweaks.get("noiseless", False))
+        continuous_dimensions = [
+            index for index in range(train_x.shape[1])
+            if index not in categorical_features
+        ]
+
+        def get_kernel():
+            if kernel_name == "rbf":
+                return ScaleKernel(RBFKernel()).to(
+                    device=opt_device, dtype=bo_dtype
+                )
+            if kernel_name == "matern32":
+                return ScaleKernel(MaternKernel(nu=1.5)).to(
+                    device=opt_device, dtype=bo_dtype
+                )
+            if kernel_name == "matern12":
+                return ScaleKernel(MaternKernel(nu=0.5)).to(
+                    device=opt_device, dtype=bo_dtype
+                )
+            return ScaleKernel(MaternKernel(nu=2.5)).to(
+                device=opt_device, dtype=bo_dtype
+            )
+
+        def build_single_model(training_x, training_y):
+            input_transform = (
+                Normalize(
+                    d=training_x.shape[1],
+                    bounds=bounds_t[:, continuous_dimensions],
+                    indices=continuous_dimensions,
+                ).to(opt_device)
+                if continuous_dimensions
+                else None
+            )
+            if categorical_features and continuous_dimensions:
+                fitted_model = MixedSingleTaskGP(
+                    training_x.to(opt_device),
+                    training_y.to(opt_device),
+                    cat_dims=categorical_features,
+                    outcome_transform=Standardize(m=1),
+                    input_transform=input_transform,
+                ).to(device=opt_device, dtype=bo_dtype)
+            else:
+                fitted_model = SingleTaskGP(
+                    training_x.to(opt_device),
+                    training_y.to(opt_device),
+                    covar_module=get_kernel(),
+                    outcome_transform=Standardize(m=1),
+                    input_transform=input_transform,
+                ).to(device=opt_device, dtype=bo_dtype)
+            if is_noiseless:
+                with torch.no_grad():
+                    fitted_model.likelihood.noise_covar.noise = train_x.new_tensor(1e-4)
+                fitted_model.likelihood.noise_covar.raw_noise.requires_grad_(False)
+            return fitted_model
+
+        total_models = len(objectives_config) + len(constrained_names)
+        fitted_count = 0
+        fit_phase_started = time.monotonic()
+        fit_deadline = min(
+            deadline, fit_phase_started + budget.fit_phase_timeout_sec
+        )
+        objective_models = []
+        for objective_index, objective in enumerate(objectives_config):
+            _check_bo_runtime(cancel_event, fit_deadline)
+            y_slice = train_y[:, objective_index:objective_index + 1]
+            valid_mask = torch.isfinite(y_slice.squeeze(-1))
+            if not valid_mask.any():
+                raise ValueError(
+                    f"No valid observations are available for objective '{objective['name']}'."
+                )
+            fitted_model = build_single_model(train_x[valid_mask], y_slice[valid_mask])
+            fitted_count += 1
+            tasks_left = max(1, total_models - fitted_count + 1)
+            per_model_timeout = max(
+                1.0, _remaining_bo_seconds(fit_deadline) / tasks_left
+            )
+            report(
+                f"Fitting objective model {objective_index + 1} of {len(objectives_config)}",
+                10 + round(18 * objective_index / max(1, len(objectives_config))),
+                model_index=objective_index + 1,
+                model_count=len(objectives_config),
+            )
+            objective_mll = ExactMarginalLogLikelihood(
+                fitted_model.likelihood, fitted_model
+            ).to(opt_device)
+            fit_diagnostic = _fit_required_model(
+                objective_mll,
+                label=f"objective '{objective['name']}'",
+                maxiter=budget.fit_maxiter,
+                maxls=budget.fit_maxls,
+                retries=budget.fit_retries,
+                timeout_sec=per_model_timeout,
+                cancel_event=cancel_event,
+                deadline=fit_deadline,
+            )
+            diagnostics["model_fits"].append(fit_diagnostic)
+            objective_models.append(fitted_model.eval())
+
+        model = (
+            objective_models[0]
+            if len(objective_models) == 1
+            else ModelListGP(*objective_models).to(
+                device=opt_device, dtype=bo_dtype
+            )
+        )
+
+        for objective_name in constrained_names:
+            _check_bo_runtime(cancel_event, fit_deadline)
+            raw_values = pd.to_numeric(
+                df_clean[objective_name], errors="coerce"
+            ).to_numpy(dtype=float)
+            valid_mask_np = np.isfinite(raw_values)
+            if not valid_mask_np.any():
+                raise ValueError(
+                    f"No valid observations are available for constrained objective '{objective_name}'."
+                )
+            valid_mask = torch.tensor(
+                valid_mask_np, dtype=torch.bool, device=opt_device
+            )
+            raw_y = torch.tensor(
+                raw_values[valid_mask_np], dtype=bo_dtype, device=opt_device
+            ).unsqueeze(-1)
+            feasibility_model = build_single_model(train_x[valid_mask], raw_y)
+            fitted_count += 1
+            tasks_left = max(1, total_models - fitted_count + 1)
+            per_model_timeout = max(
+                1.0, _remaining_bo_seconds(fit_deadline) / tasks_left
+            )
+            report(
+                f"Fitting feasibility model for {objective_name}",
+                28,
+                model_index=fitted_count,
+                model_count=total_models,
+            )
+            feasibility_mll = ExactMarginalLogLikelihood(
+                feasibility_model.likelihood, feasibility_model
+            ).to(opt_device)
+            fit_diagnostic = _fit_required_model(
+                feasibility_mll,
+                label=f"feasibility objective '{objective_name}'",
+                maxiter=budget.fit_maxiter,
+                maxls=budget.fit_maxls,
+                retries=budget.fit_retries,
+                timeout_sec=per_model_timeout,
+                cancel_event=cancel_event,
+                deadline=fit_deadline,
+            )
+            diagnostics["model_fits"].append(fit_diagnostic)
+            feasibility_models[objective_name] = feasibility_model.eval()
+        record_phase("model_fitting", fit_phase_started)
+
+        report(
+            f"Selected {policy.label}", 35,
+            algorithm=policy.key,
+            algorithm_reason=policy.reason,
+        )
+        sampler = SobolQMCNormalSampler(
+            sample_shape=torch.Size([budget.mc_samples]), seed=seed
+        )
+        train_y_filled = train_y.clone()
+        for objective_index in range(train_y.shape[1]):
+            column = train_y_filled[:, objective_index]
+            valid = column[torch.isfinite(column)]
+            replacement = valid.min() if valid.numel() else torch.tensor(
+                0.0, dtype=bo_dtype, device=opt_device
+            )
+            column[~torch.isfinite(column)] = replacement
+
+        def build_acquisition(x_pending):
+            if policy.key == "qLogNEHVI":
+                minima = train_y_filled.min(dim=0).values
+                maxima = train_y_filled.max(dim=0).values
+                reference = (
+                    minima - 0.2 * (maxima - minima + 1e-6)
+                ) * weights_t
+                acquisition = qLogNoisyExpectedHypervolumeImprovement(
+                    model=model,
+                    ref_point=reference,
+                    X_baseline=train_x,
+                    sampler=sampler,
+                    objective=WeightedMCMultiOutputObjective(weights=weights_t),
+                    X_pending=x_pending,
+                    prune_baseline=True,
+                    alpha=budget.nehvi_alpha,
+                )
+                logarithmic = True
+            elif policy.key == "qLogNParEGO":
+                acquisition = qLogNParEGO(
+                    model=model,
+                    X_baseline=train_x,
+                    sampler=sampler,
+                    X_pending=x_pending,
+                    prune_baseline=True,
+                )
+                logarithmic = True
+            elif policy.key == "scalarized-qLogEI":
+                posterior_transform = ScalarizedPosteriorTransform(
+                    weights=weights_t
+                )
+                best_f = (train_y_filled * weights_t).sum(dim=-1).max()
+                acquisition = qLogExpectedImprovement(
                     model=model,
                     best_f=best_f,
                     sampler=sampler,
-                    posterior_transform=post_tf
-                ).to(OPT_DEVICE)
-                acq_is_logarithmic = True
-        else:
-            if acq_type == 'EI':
-                acq_func = qLogExpectedImprovement(
-                    model=model,
-                    best_f=train_y.to(OPT_DEVICE).max().item(),
-                    sampler=sampler,
-                    objective=None
-                ).to(OPT_DEVICE)
-                acq_is_logarithmic = True
-            elif acq_type == 'LCB':
-                beta     = exploration_to_beta(exploration)
-                acq_func = qUpperConfidenceBound(model, beta=beta, sampler=sampler).to(OPT_DEVICE)
-            else:
-                acq_func = qLogExpectedImprovement(
-                    model=model,
-                    best_f=train_y.to(OPT_DEVICE).max().item(),
-                    sampler=sampler,
-                    objective=None
-                ).to(OPT_DEVICE)
-                acq_is_logarithmic = True
-
-        if objective_constraints:
-            constrained_names = {c['objective'] for c in objective_constraints}
-            for objective_name in constrained_names:
-                raw_values = pd.to_numeric(
-                    df_clean[objective_name], errors='coerce'
-                ).values
-                valid_mask_np = ~np.isnan(raw_values)
-                valid_mask = torch.tensor(
-                    valid_mask_np, dtype=torch.bool, device=train_x.device
+                    posterior_transform=posterior_transform,
+                    X_pending=x_pending,
                 )
-                raw_x = train_x[valid_mask]
-                raw_y = torch.tensor(
-                    raw_values[valid_mask_np], dtype=torch.float32
-                ).unsqueeze(-1).to(device)
-                if raw_x.shape[0] == 0:
-                    raise ValueError(
-                        f"No valid observations for constrained objective '{objective_name}'."
-                    )
-                raw_model = build_single_model(raw_x, raw_y)
-                raw_mll = ExactMarginalLogLikelihood(
-                    raw_model.likelihood, raw_model
-                ).to(compute_device)
-                try:
-                    fit_gpytorch_mll(
-                        raw_mll, optimizer_kwargs={"options": {"maxiter": 75}}
-                    )
-                except Exception as exc:
-                    print(
-                        f"Warning: Feasibility model fit failed for "
-                        f"{objective_name}: {exc}"
-                    )
-                raw_model.eval()
-                feasibility_models[objective_name] = raw_model.to(OPT_DEVICE)
+                logarithmic = True
+            elif policy.key == "qUCB":
+                acquisition = qUpperConfidenceBound(
+                    model=model,
+                    beta=exploration_to_beta(exploration),
+                    sampler=sampler,
+                    X_pending=x_pending,
+                )
+                logarithmic = False
+            else:
+                acquisition = qLogExpectedImprovement(
+                    model=model,
+                    best_f=train_y_filled.max(),
+                    sampler=sampler,
+                    X_pending=x_pending,
+                )
+                logarithmic = True
+            if objective_constraints:
+                acquisition = ProbabilityOfFeasibilityAcquisition(
+                    acquisition,
+                    feasibility_models,
+                    objective_constraints,
+                    logarithmic=logarithmic,
+                )
+            return acquisition.to(opt_device)
 
-            acq_func = ProbabilityOfFeasibilityAcquisition(
-                acq_func,
-                feasibility_models,
-                objective_constraints,
-                logarithmic=acq_is_logarithmic,
-            ).to(OPT_DEVICE)
-
-        strategy = tweaks.get('optimization_strategy', 'gradient_based')
-
-        if strategy == 'exhaustive_grid':
+        strategy = str(tweaks.get("optimization_strategy", "gradient_based"))
+        candidate_phase_started = time.monotonic()
+        if strategy == "exhaustive_grid":
             final_levels = []
-            for idx, levels in enumerate(feature_levels):
+            for index, levels in enumerate(feature_levels):
                 if levels is None:
-                    low, high = bounds[idx]
-                    final_levels.append(np.linspace(low, high, 10).tolist())
+                    final_levels.append(
+                        np.linspace(bounds[index][0], bounds[index][1], 10).tolist()
+                    )
                 else:
                     final_levels.append(levels)
-
-            import math
-            n_combos = math.prod(len(l) for l in final_levels)
-            if n_combos > 100000:
+            combination_count = int(np.prod([len(levels) for levels in final_levels]))
+            if combination_count > 100_000:
                 raise ValueError(
-                    f"Exhaustive grid size ({n_combos:,} combinations) exceeds the safety cap of 100,000. "
-                    "To optimize successfully, please reduce the number of steps in your 'regular' features "
-                    "or limit the categories in 'categorical' features."
+                    f"Exhaustive grid size ({combination_count:,}) exceeds the "
+                    "100,000-condition safety limit. Reduce feature levels or use "
+                    "gradient-based optimization."
                 )
-
-            all_combos = list(itertools.product(*final_levels))
-            train_fps  = {tuple(np.round(row, 6)) for row in train_x.cpu().numpy()}
-            filtered_combos = [c for c in all_combos if tuple(np.round(c, 6)) not in train_fps]
-
-            if not filtered_combos:
-                raise ValueError('All points in the grid scope have already been evaluated.')
-
-            candidates_grid = torch.tensor(filtered_combos, dtype=torch.float32).to(OPT_DEVICE)
-
-            if num_rules or disallowed_rules:
-                feasible_indices = []
-                for idx, cand in enumerate(filtered_combos):
-                    row_dict = {}
-                    for col_idx, f in enumerate(features_config):
-                        val = cand[col_idx]
-                        if f['type'] == 'categorical':
-                            choices = get_categorical_choices(f)
-                            choice_idx = max(0, min(len(choices) - 1, int(round(val))))
-                            val = choices[choice_idx]
-                        elif f['type'] == 'discrete':
-                            d_vals = sorted([float(x.strip()) for x in f['range'].split(',') if x.strip()])
-                            val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
-                        elif f['type'] == 'regular':
-                            matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
-                            if len(matches) >= 3:
-                                low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
-                                d_vals = np.linspace(low, high, steps).tolist()
-                            elif len(matches) == 2:
-                                low, high = sorted([float(matches[0]), float(matches[1])])
-                                d_vals = np.linspace(low, high, 10).tolist()
-                            else:
-                                d_vals = []
-                            val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
-                        
-                        if isinstance(val, (int, float)):
-                            prec = feature_precision.get(f['name'], infer_decimal_precision(None, f.get('range', '')))
-                            val = round(float(val), prec)
-                        row_dict[f['name']] = val
-
-                    if check_constraints(row_dict, num_rules, disallowed_rules, features_config):
-                        feasible_indices.append(idx)
-
-                if not feasible_indices:
-                    raise ValueError('No grid points satisfy the provided constraints.')
-
-                filtered_combos = [filtered_combos[idx] for idx in feasible_indices]
-                candidates_grid = torch.tensor(filtered_combos, dtype=torch.float32).to(OPT_DEVICE)
-
-            if not objective_constraints and not is_mo and acq_type == 'EI':
-                try:
-                    from botorch.acquisition.analytic import LogExpectedImprovement
-                    acq_func_grid = LogExpectedImprovement(model=model, best_f=train_y.to(OPT_DEVICE).max().item()).to(OPT_DEVICE)
-                except ImportError:
-                    from botorch.acquisition.analytic import ExpectedImprovement
-                    acq_func_grid = ExpectedImprovement(model=model, best_f=train_y.to(OPT_DEVICE).max().item()).to(OPT_DEVICE)
-            else:
-                acq_func_grid = acq_func
-
-            candidates, _ = optimize_acqf_discrete(
-                acq_function=acq_func_grid,
-                q=batch_size,
-                choices=candidates_grid,
-                unique=True
-            )
-            candidates = candidates.cpu()
-
-        else:
-            p_constraints = []
-            if num_rules:
-                indices = {f['name']: idx for idx, f in enumerate(features_config)}
-                sorted_names = sorted(indices.keys(), key=len, reverse=True)
-
-                def _eval_tensor_ast(node, X, ph_to_idx):
-                    if isinstance(node, ast.Expression):
-                        return _eval_tensor_ast(node.body, X, ph_to_idx)
-                    elif isinstance(node, ast.Constant):
-                        return float(node.value)
-                    elif isinstance(node, ast.Num):
-                        return float(node.n)
-                    elif isinstance(node, ast.Name):
-                        if node.id in ph_to_idx:
-                            return X[..., ph_to_idx[node.id]]
-                        raise ValueError(f"Unknown variable in constraint: {node.id}")
-                    elif isinstance(node, ast.UnaryOp):
-                        opnd = _eval_tensor_ast(node.operand, X, ph_to_idx)
-                        if isinstance(node.op, ast.USub):
-                            return -opnd
-                        elif isinstance(node.op, ast.UAdd):
-                            return opnd
-                        raise ValueError(f"Unsupported unary operator: {type(node.op)}")
-                    elif isinstance(node, ast.BinOp):
-                        l = _eval_tensor_ast(node.left, X, ph_to_idx)
-                        r = _eval_tensor_ast(node.right, X, ph_to_idx)
-                        if isinstance(node.op, ast.Add):
-                            return l + r
-                        elif isinstance(node.op, ast.Sub):
-                            return l - r
-                        elif isinstance(node.op, ast.Mult):
-                            return l * r
-                        elif isinstance(node.op, ast.Div):
-                            return l / r
-                        elif isinstance(node.op, ast.Pow):
-                            return l ** r
-                        raise ValueError(f"Unsupported binary operator: {type(node.op)}")
-                    raise ValueError(f"Unsupported constraint node: {type(node)}")
-
-                for expr in num_rules:
-                    try:
-                        clean_expr = expr.strip()
-                        clean_expr = re.sub(r'(?<![<>=!])=(?!=)', '==', clean_expr)
-                        op_found = None
-                        for op in ['<=', '>=', '==', '<', '>']:
-                            if op in clean_expr:
-                                op_found = op
-                                break
-                        if op_found:
-                            parts = clean_expr.split(op_found)
-                            lhs_str = parts[0].strip()
-                            rhs_str = parts[1].strip()
-                            
-                            ph_to_idx = {}
-                            for i, name in enumerate(sorted_names):
-                                ph = f"_ph_{i}"
-                                ph_to_idx[ph] = indices[name]
-                                pattern = rf'(?<![\w]){re.escape(name)}(?![\w])'
-                                lhs_str = re.sub(pattern, ph, lhs_str)
-                                rhs_str = re.sub(pattern, ph, rhs_str)
-                            
-                            if op_found in ('<=', '<'):
-                                vec_expr = f"({rhs_str}) - ({lhs_str})"
-                                is_inequality = True
-                            elif op_found == '==':
-                                vec_expr = f"({lhs_str}) - ({rhs_str})"
-                                is_inequality = False
-                            else:
-                                vec_expr = f"({lhs_str}) - ({rhs_str})"
-                                is_inequality = True
-                                
-                            parsed_tree = ast.parse(vec_expr, mode='eval')
-                            def constraint_func(X, tree=parsed_tree, mapping=ph_to_idx):
-                                return _eval_tensor_ast(tree, X, mapping)
-                            p_constraints.append((constraint_func, is_inequality))
-                    except Exception as ex:
-                        print(f"Error compiling continuous constraint '{expr}': {ex}")
-
-            base_restarts    = 8  if is_mo else 32
-            base_raw_samples = 128 if is_mo else 512
-
-            batch_initial_conditions = None
-            if p_constraints:
-                try:
-                    batch_initial_conditions = generate_feasible_initial_conditions(
-                        bounds_t=bounds_t.to(OPT_DEVICE),
-                        q=batch_size,
-                        num_restarts=int(base_restarts * intensity),
-                        p_constraints=p_constraints
-                    )
-                except Exception as e:
-                    print(f"Error generating feasible initial conditions: {e}")
-
-            candidates, _ = optimize_acqf(
-                acq_function=acq_func,
-                bounds=bounds_t.to(OPT_DEVICE),
-                q=batch_size,
-                num_restarts=int(base_restarts * intensity),
-                raw_samples=int(base_raw_samples * intensity),
-                nonlinear_inequality_constraints=p_constraints if p_constraints else None,
-                batch_initial_conditions=batch_initial_conditions
-            )
-            candidates = candidates.cpu()
-
-    # Decode Candidate Tensors
-    feat_names = [f['name'] for f in features_config]
-
-    def get_fingerprint(row_dict):
-        parts = []
-        for name in feat_names:
-            val = row_dict[name]
-            if isinstance(val, (int, float)):
-                prec = feature_precision.get(name, 6)
-                parts.append(f"{float(val):.{prec}f}")
-            else:
-                parts.append(str(val))
-        return "|".join(parts)
-
-
-
-    existing_fps = set()
-    if not df_clean.empty:
-        for _, row in df_clean[feat_names].iterrows():
-            existing_fps.add(get_fingerprint(row.to_dict()))
-
-    def decode_cand(c_tensor):
-        row = {}
-        for idx, f in enumerate(features_config):
-            val = c_tensor[idx].item()
-
-            if f['type'] == 'discrete':
-                d_vals = sorted([float(x.strip()) for x in f['range'].split(',') if x.strip()])
-                val    = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
-
-            elif f['type'] == 'regular':
-                matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
-                if len(matches) >= 3:
-                    low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
-                    d_vals = np.linspace(low, high, steps).tolist()
-                elif len(matches) == 2:
-                    low, high = sorted([float(matches[0]), float(matches[1])])
-                    d_vals = np.linspace(low, high, 10).tolist()
+            available = []
+            seen_training = existing_fingerprints if avoid_revalidation else set()
+            for combination in itertools.product(*final_levels):
+                point = torch.tensor(combination, dtype=bo_dtype)
+                decoded = decode_candidate(point)
+                if fingerprint(decoded) in seen_training:
+                    continue
+                if not check_constraints(
+                    decoded, numerical_rules, disallowed_rules, features_config
+                ):
+                    continue
+                available.append(combination)
+            if len(available) < batch_size:
+                if not available and avoid_revalidation:
+                    diagnostics["exhausted"] = True
                 else:
-                    d_vals = []
-                val = min(d_vals, key=lambda x: abs(x - val)) if d_vals else val
+                    raise ValueError(
+                        f"Only {len(available)} unevaluated feasible grid conditions "
+                        f"remain, but {batch_size} were requested."
+                    )
+            if available:
+                choices = torch.tensor(
+                    available, dtype=bo_dtype, device=opt_device
+                )
+                pending = None
+                for candidate_index in range(min(batch_size, len(available))):
+                    report(
+                        f"Optimizing candidate {candidate_index + 1} of {batch_size}",
+                        40 + round(38 * candidate_index / batch_size),
+                        candidate_index=candidate_index + 1,
+                        candidate_count=batch_size,
+                    )
+                    acquisition = build_acquisition(pending)
+                    candidate, _ = optimize_acqf_discrete(
+                        acquisition,
+                        q=1,
+                        choices=choices,
+                        max_batch_size=budget.discrete_eval_batch_size,
+                        unique=True,
+                    )
+                    _check_bo_runtime(cancel_event, deadline)
+                    raw_candidates.append(candidate.squeeze(0).detach().cpu())
+                    pending = (
+                        candidate
+                        if pending is None
+                        else torch.cat([pending, candidate], dim=0)
+                    )
+                    selected_mask = torch.isclose(
+                        choices, candidate.squeeze(0), rtol=0.0, atol=1e-7
+                    ).all(dim=-1)
+                    choices = choices[~selected_mask]
+        else:
+            optimizer_constraints = compile_botorch_feature_constraints(
+                numerical_rules, features_config
+            )
+            pending = None
+            for candidate_index in range(batch_size):
+                report(
+                    f"Optimizing candidate {candidate_index + 1} of {batch_size}",
+                    40 + round(38 * candidate_index / batch_size),
+                    candidate_index=candidate_index + 1,
+                    candidate_count=batch_size,
+                )
+                acquisition = build_acquisition(pending)
+                initial_conditions = None
+                if optimizer_constraints:
+                    initial_conditions = generate_feasible_initial_conditions(
+                        bounds_t,
+                        q=1,
+                        num_restarts=budget.num_restarts,
+                        p_constraints=optimizer_constraints,
+                        max_draws=budget.feasible_ic_max_draws,
+                        chunk_size=budget.feasible_ic_chunk_size,
+                        cancel_event=cancel_event,
+                        deadline=deadline,
+                    )
+                candidate_timeout = min(
+                    budget.candidate_timeout_sec,
+                    _remaining_bo_seconds(deadline),
+                )
+                if candidate_timeout < 1.0:
+                    raise BOTimeoutExceeded(
+                        f"No time remains to optimize candidate {candidate_index + 1}."
+                    )
+                candidate, _ = optimize_acqf(
+                    acq_function=acquisition,
+                    bounds=bounds_t,
+                    q=1,
+                    num_restarts=budget.num_restarts,
+                    raw_samples=budget.raw_samples,
+                    options={
+                        "maxiter": budget.acq_maxiter,
+                        "batch_limit": (
+                            1
+                            if optimizer_constraints
+                            else min(4, budget.num_restarts)
+                        ),
+                    },
+                    nonlinear_inequality_constraints=(
+                        optimizer_constraints or None
+                    ),
+                    batch_initial_conditions=initial_conditions,
+                    timeout_sec=candidate_timeout,
+                    retry_on_optimization_warning=False,
+                )
+                _check_bo_runtime(cancel_event, deadline)
+                if not torch.isfinite(candidate).all():
+                    raise RuntimeError(
+                        f"Candidate {candidate_index + 1} contains non-finite values."
+                    )
+                raw_candidates.append(candidate.squeeze(0).detach().cpu())
+                pending = (
+                    candidate
+                    if pending is None
+                    else torch.cat([pending, candidate], dim=0)
+                )
+        record_phase("candidate_optimization", candidate_phase_started)
 
-            elif f['type'] == 'categorical':
-                choices = get_categorical_choices(f)
-                idx_choice = max(0, min(len(choices) - 1, int(round(val))))
-                val     = choices[idx_choice]
-
-            if isinstance(val, (int, float)):
-                prec = feature_precision.get(f['name'], infer_decimal_precision(None, f.get('range', '')))
-                val = round(float(val), prec)
-            row[f['name']] = val
-        return row
-
+    report("Decoding and validating candidates", 82)
+    validation_started = time.monotonic()
     suggestions = []
-    duplicate_count = 0  # tracks candidates rejected solely due to fingerprint collision
-    for cand in candidates:
-        suggestion = decode_cand(cand)
-
-        if avoid_reval or num_rules or disallowed_rules:
-            attempts = 0
-            t_cand   = cand.clone()
-            while (get_fingerprint(suggestion) in existing_fps or not check_constraints(suggestion, num_rules, disallowed_rules, features_config)) and attempts < 40:
-                attempts += 1
-                for idx, f in enumerate(features_config):
-                    if f['type'] == 'continuous':
-                        span     = bounds[idx][1] - bounds[idx][0]
-                        t_cand[idx] = torch.clamp(
-                            t_cand[idx] + (torch.rand(1).item() - 0.5) * span * 0.1,
-                            bounds[idx][0], bounds[idx][1]
-                        )
-                    elif f['type'] == 'discrete':
-                        d_vals  = sorted([float(x.strip()) for x in f['range'].split(',') if x.strip()])
-                        if len(d_vals) > 1:
-                            cur_idx   = d_vals.index(suggestion[f['name']])
-                            t_cand[idx] = d_vals[(cur_idx + attempts) % len(d_vals)]
-                    elif f['type'] == 'regular':
-                        matches = re.findall(r"[-+]?\d*\.?\d+", f['range'])
-                        if len(matches) >= 3:
-                            low, high, steps = sorted([float(matches[0]), float(matches[1])]) + [int(float(matches[2]))]
-                            d_vals = np.linspace(low, high, steps).tolist()
-                        elif len(matches) == 2:
-                            low, high = sorted([float(matches[0]), float(matches[1])])
-                            d_vals = np.linspace(low, high, 10).tolist()
-                        else:
-                            d_vals = []
-                        if len(d_vals) > 1:
-                            cur_idx   = d_vals.index(suggestion[f['name']])
-                            t_cand[idx] = d_vals[(cur_idx + attempts) % len(d_vals)]
-                    elif f['type'] == 'categorical':
-                        choices = get_categorical_choices(f)
-                        if len(choices) > 1:
-                            cur_idx   = choices.index(suggestion[f['name']])
-                            t_cand[idx] = float((cur_idx + attempts) % len(choices))
-                suggestion = decode_cand(t_cand)
-
-        # If avoid_reval is on and the candidate is still a known fingerprint after
-        # all retry attempts, count it as a duplicate and skip (do not append).
-        if avoid_reval and get_fingerprint(suggestion) in existing_fps:
+    seen_fingerprints = set(
+        existing_fingerprints if avoid_revalidation else ()
+    )
+    duplicate_count = 0
+    for candidate in raw_candidates:
+        decoded = decode_candidate(candidate)
+        candidate_fingerprint = fingerprint(decoded)
+        if candidate_fingerprint in seen_fingerprints:
             duplicate_count += 1
             continue
+        if not check_constraints(
+            decoded, numerical_rules, disallowed_rules, features_config
+        ):
+            continue
+        suggestions.append(decoded)
+        seen_fingerprints.add(candidate_fingerprint)
 
-        suggestions.append(suggestion)
-        existing_fps.add(get_fingerprint(suggestion))
+    # Bounded Sobol completion handles rounding collisions and non-differentiable
+    # disallowed combinations. It never returns an invalid or duplicate point.
+    completion_draws = 0
+    while (
+        len(suggestions) < batch_size
+        and strategy != "exhaustive_grid"
+        and completion_draws < budget.feasible_ic_max_draws
+    ):
+        _check_bo_runtime(cancel_event, deadline)
+        chunk_size = min(
+            budget.feasible_ic_chunk_size,
+            budget.feasible_ic_max_draws - completion_draws,
+        )
+        sample = draw_sobol_samples(
+            bounds=bounds_t, n=chunk_size, q=1
+        ).squeeze(-2).cpu()
+        completion_draws += chunk_size
+        for point in sample:
+            decoded = decode_candidate(point)
+            candidate_fingerprint = fingerprint(decoded)
+            if candidate_fingerprint in seen_fingerprints:
+                continue
+            if not check_constraints(
+                decoded, numerical_rules, disallowed_rules, features_config
+            ):
+                continue
+            suggestions.append(decoded)
+            seen_fingerprints.add(candidate_fingerprint)
+            if len(suggestions) >= batch_size:
+                break
 
-    if num_rules or disallowed_rules:
-        suggestions = [s for s in suggestions if check_constraints(s, num_rules, disallowed_rules, features_config)]
+    exhausted = (
+        avoid_revalidation
+        and not suggestions
+        and (duplicate_count > 0 or diagnostics.get("exhausted", False))
+    )
+    if not exhausted and len(suggestions) != batch_size:
+        raise FeasibleInitializationError(
+            f"Only {len(suggestions)} distinct feasible suggestions could be "
+            f"generated after {completion_draws} bounded completion draws; "
+            f"{batch_size} were requested. Review the ranges, rounding precision, "
+            "or constraints."
+        )
+    record_phase("candidate_validation", validation_started)
 
-    # Sobol gap-filling
-    if len(suggestions) < batch_size:
-        gap = batch_size - len(suggestions)
-        try:
-            n_pool = max(gap * 200, 2000)
-            pool = draw_sobol_samples(bounds=bounds_t.to(OPT_DEVICE), n=1, q=n_pool).squeeze(0)
-            for pt in pool:
-                if len(suggestions) >= batch_size:
-                    break
-                decoded = decode_cand(pt.cpu())
-                fp = get_fingerprint(decoded)
-                if fp in existing_fps:
-                    continue
-                if not check_constraints(decoded, num_rules, disallowed_rules, features_config):
-                    continue
-                suggestions.append(decoded)
-                existing_fps.add(fp)
-        except Exception as e:
-            print(f"Error in Sobol gap-filling: {e}")
-
-    # Exhaustion flag: if avoid_reval is active and every candidate was a
-    # precision-rounded duplicate (not a constraint failure), we will signal
-    # exhaustion after computing performance metrics (so the user still gets R² info).
-    is_exhausted = avoid_reval and len(suggestions) == 0 and duplicate_count > 0
-
-    if not is_exhausted and not suggestions:
-        raise ValueError('No suggestions satisfy the specified constraints.')
-
-    # Cross-Validation
     performance_results = {}
-    if not df_clean.empty and train_x.shape[0] >= 5:
+    if compute_performance and not df_clean.empty and train_x.shape[0] >= 5:
+        report("Computing optional validation diagnostics", 91)
+        performance_started = time.monotonic()
         from sklearn.model_selection import KFold
-        n_splits = 5
-        kf       = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-        for idx, obj_cfg in enumerate(objectives_config):
-            obj_name  = obj_cfg['name']
-            y_all_np  = train_y[:, idx:idx+1].cpu().numpy()
-            x_all_np  = train_x.cpu().numpy()
+        validation_deadline = min(deadline - 3.0, time.monotonic() + 60.0)
+        kfold = KFold(n_splits=5, shuffle=True, random_state=42)
 
-            nan_mask = np.isnan(y_all_np.flatten())
-            y_all_np_clean = y_all_np[~nan_mask]
-            x_all_np_clean = x_all_np[~nan_mask]
+        def validation_score(values, label):
+            finite = np.isfinite(values)
+            x_values = train_x.detach().cpu().numpy()[finite]
+            y_values = values[finite]
+            if y_values.size < 5:
+                return {"r2": None, "status": "Unavailable", "message": "Fewer than five valid observations."}
+            predictions = []
+            observed = []
+            try:
+                for fold_index, (training_indices, test_indices) in enumerate(
+                    kfold.split(x_values), start=1
+                ):
+                    if time.monotonic() >= validation_deadline:
+                        raise BOTimeoutExceeded("Optional validation budget was reached.")
+                    x_training = torch.tensor(
+                        x_values[training_indices], dtype=bo_dtype, device=opt_device
+                    )
+                    y_training = torch.tensor(
+                        y_values[training_indices], dtype=bo_dtype, device=opt_device
+                    ).unsqueeze(-1)
+                    x_test = torch.tensor(
+                        x_values[test_indices], dtype=bo_dtype, device=opt_device
+                    )
+                    temporary_model = build_single_model(x_training, y_training)
+                    temporary_mll = ExactMarginalLogLikelihood(
+                        temporary_model.likelihood, temporary_model
+                    ).to(opt_device)
+                    _fit_required_model(
+                        temporary_mll,
+                        label=f"validation model for {label}, fold {fold_index}",
+                        maxiter=min(25, budget.fit_maxiter),
+                        maxls=budget.fit_maxls,
+                        retries=budget.fit_retries,
+                        timeout_sec=min(5.0, _remaining_bo_seconds(validation_deadline)),
+                        cancel_event=cancel_event,
+                        deadline=validation_deadline,
+                    )
+                    with torch.no_grad():
+                        fold_predictions = temporary_model.posterior(x_test).mean
+                    predictions.extend(fold_predictions.detach().cpu().numpy().ravel())
+                    observed.extend(y_values[test_indices])
+            except (BOModelFitError, BOTimeoutExceeded) as exc:
+                return {"r2": None, "status": "Unavailable", "message": str(exc)}
+            predictions = np.asarray(predictions)
+            observed = np.asarray(observed)
+            residual = np.sum((observed - predictions) ** 2)
+            total = np.sum((observed - observed.mean()) ** 2)
+            score = max(0.0, float(1.0 - residual / (total + 1e-9)))
+            return {
+                "r2": round(score, 3),
+                "status": "Good" if score > 0.7 else ("Limited" if score >= 0.4 else "Poor"),
+            }
 
-            if len(y_all_np_clean) < 5:
-                performance_results[obj_name] = {
-                    'r2': 0.0,
-                    'status': 'Poor'
+        for objective_index, objective in enumerate(objectives_config):
+            if time.monotonic() >= validation_deadline:
+                performance_results[objective["name"]] = {
+                    "r2": None,
+                    "status": "Unavailable",
+                    "message": "Optional validation budget was reached.",
                 }
                 continue
-
-            all_preds = []
-            all_true  = []
-
-            for train_idx, test_idx in kf.split(x_all_np_clean):
-                x_tr = torch.tensor(x_all_np_clean[train_idx], dtype=torch.float32).to(device)
-                x_te = torch.tensor(x_all_np_clean[test_idx],  dtype=torch.float32).to(device)
-                y_tr = torch.tensor(y_all_np_clean[train_idx], dtype=torch.float32).to(device)
-
-                try:
-                    m_tmp   = build_single_model(x_tr, y_tr)
-                    mll_tmp = ExactMarginalLogLikelihood(m_tmp.likelihood, m_tmp).to(compute_device)
-                    fit_gpytorch_mll(mll_tmp, optimizer_kwargs={"options": {"maxiter": 25}})
-                    m_tmp.eval()
-                    with torch.no_grad():
-                        post  = m_tmp.posterior(x_te.to(compute_device))
-                        preds = post.mean.cpu().numpy().flatten()
-                        all_preds.extend(preds)
-                        all_true.extend(y_all_np_clean[test_idx].flatten())
-                except Exception as ex:
-                    print(f"Error in CV for {obj_name}: {ex}")
-                    all_preds.extend([np.mean(y_all_np_clean[train_idx])] * len(test_idx))
-                    all_true.extend(y_all_np_clean[test_idx].flatten())
-
-            all_preds = np.array(all_preds)
-            all_true  = np.array(all_true)
-            ss_res    = np.sum((all_true - all_preds) ** 2)
-            ss_tot    = np.sum((all_true - np.mean(all_true)) ** 2)
-            r2        = 1 - (ss_res / (ss_tot + 1e-9))
-            avg_r2    = max(0, r2)
-
-            performance_results[obj_name] = {
-                'r2':     round(float(avg_r2), 3),
-                'status': 'Good' if avg_r2 > 0.7 else ('Limited' if avg_r2 >= 0.4 else 'Poor')
-            }
-
-        if train_y.shape[1] > 1:
-            weights_np = weights_t.cpu().numpy()
-            
-            # Fill NaNs in train_y for global success metric calculation
-            train_y_filled_np = train_y.cpu().numpy()
-            for idx in range(train_y_filled_np.shape[1]):
-                valid_vals = train_y_filled_np[:, idx][~np.isnan(train_y_filled_np[:, idx])]
-                min_val = valid_vals.min() if len(valid_vals) > 0 else 0.0
-                train_y_filled_np[np.isnan(train_y_filled_np[:, idx]), idx] = min_val
-                
-            y_min, y_max = train_y_filled_np.min(axis=0), train_y_filled_np.max(axis=0)
-            y_norm     = (train_y_filled_np - y_min) / (y_max - y_min + 1e-9)
-            global_y   = np.average(y_norm, axis=1, weights=weights_np)
-
-            all_preds_g = []
-            all_true_g  = []
-            for train_idx, test_idx in kf.split(x_all_np):
-                x_tr   = torch.tensor(x_all_np[train_idx], dtype=torch.float32).to(device)
-                x_te   = torch.tensor(x_all_np[test_idx],  dtype=torch.float32).to(device)
-                y_tr_g = torch.tensor(global_y[train_idx], dtype=torch.float32).unsqueeze(-1).to(device)
-
-                try:
-                    m_tmp   = build_single_model(x_tr, y_tr_g)
-                    mll_tmp = ExactMarginalLogLikelihood(m_tmp.likelihood, m_tmp).to(compute_device)
-                    fit_gpytorch_mll(mll_tmp, optimizer_kwargs={"options": {"maxiter": 25}})
-                    m_tmp.eval()
-                    with torch.no_grad():
-                        post  = m_tmp.posterior(x_te.to(compute_device))
-                        preds = post.mean.cpu().numpy().flatten()
-                        all_preds_g.extend(preds)
-                        all_true_g.extend(global_y[test_idx].flatten())
-                except Exception:
-                    all_preds_g.extend([np.mean(global_y[train_idx])] * len(test_idx))
-                    all_true_g.extend(global_y[test_idx].flatten())
-
-            ss_res_g = np.sum((np.array(all_true_g) - np.array(all_preds_g)) ** 2)
-            ss_tot_g = np.sum((np.array(all_true_g) - np.mean(all_true_g)) ** 2)
-            r2_g     = 1 - (ss_res_g / (ss_tot_g + 1e-9))
-            avg_r2_g = max(0, r2_g)
-
-            performance_results['global_success'] = {
-                'r2':     round(float(avg_r2_g), 3),
-                'status': 'Good' if avg_r2_g > 0.7 else ('Limited' if avg_r2_g >= 0.4 else 'Poor')
-            }
+            values = train_y[:, objective_index].detach().cpu().numpy()
+            performance_results[objective["name"]] = validation_score(
+                values, objective["name"]
+            )
+        if len(objectives_config) > 1:
+            filled = train_y.detach().cpu().numpy().copy()
+            for objective_index in range(filled.shape[1]):
+                column = filled[:, objective_index]
+                finite = column[np.isfinite(column)]
+                replacement = finite.min() if finite.size else 0.0
+                column[~np.isfinite(column)] = replacement
+            minima = filled.min(axis=0)
+            maxima = filled.max(axis=0)
+            normalized = (filled - minima) / (maxima - minima + 1e-9)
+            global_values = np.average(
+                normalized, axis=1, weights=np.asarray(normalized_weights)
+            )
+            performance_results["global_success"] = validation_score(
+                global_values, "global success"
+            )
+        diagnostics["compute_performance_completed"] = all(
+            result.get("r2") is not None
+            for result in performance_results.values()
+        )
+        record_phase("optional_validation", performance_started)
+    elif compute_performance:
+        diagnostics["performance_note"] = (
+            "Validation requires at least five complete observations."
+        )
+    else:
+        diagnostics["performance_note"] = "Optional cross-validation was not requested."
 
     constraint_status = {
-        'constrained': bool(objective_constraints),
-        'all_likely_feasible': True,
-        'candidates': [],
+        "constrained": bool(objective_constraints),
+        "all_likely_feasible": True,
+        "candidates": [],
     }
     if objective_constraints and df_clean.empty:
         constraint_status.update({
-            'cold_start': True,
-            'all_likely_feasible': None,
-            'message': (
-                'Cold Start: objective constraints will be evaluated once the '
-                'first experimental observation is recorded.'
+            "cold_start": True,
+            "all_likely_feasible": None,
+            "message": (
+                "Cold Start: objective constraints will be evaluated after the "
+                "first experimental observations are recorded."
             ),
         })
     elif objective_constraints and suggestions:
@@ -980,36 +1545,41 @@ def run_bo_optimization(df, features_config, objectives_config, tweaks, device, 
         for suggestion in suggestions:
             encoded = []
             for feature in features_config:
-                value = suggestion[feature['name']]
-                if feature['type'] == 'categorical':
-                    choices = get_categorical_choices(feature)
-                    value = choices.index(str(value))
+                value = suggestion[feature["name"]]
+                if feature.get("type") == "categorical":
+                    value = get_categorical_choices(feature).index(str(value))
                 encoded.append(float(value))
             encoded_suggestions.append(encoded)
         report_tensor = torch.tensor(
-            encoded_suggestions, dtype=torch.float32, device=OPT_DEVICE
+            encoded_suggestions, dtype=bo_dtype, device=opt_device
         )
         constraint_status = candidate_feasibility_report(
-            feasibility_models,
-            objective_constraints,
-            report_tensor,
+            feasibility_models, objective_constraints, report_tensor
         )
-        if not constraint_status['all_likely_feasible']:
+        if not constraint_status["all_likely_feasible"]:
             best_probability = max(
-                (item['probability'] for item in constraint_status['candidates']),
+                (
+                    item["probability"]
+                    for item in constraint_status["candidates"]
+                ),
                 default=0.0,
             )
-            constraint_status['message'] = (
-                '⚠️ Feasibility Warning: at least one recommended candidate '
-                'does not confidently satisfy every objective constraint '
-                f'(best predicted feasibility: {best_probability:.1%}).'
+            constraint_status["message"] = (
+                "Feasibility warning: at least one recommendation does not "
+                "confidently satisfy every objective constraint "
+                f"(best predicted feasibility: {best_probability:.1%})."
             )
 
-    # Return exhaustion sentinel after CV so performance table is still populated
-    if is_exhausted:
-        return None, performance_results, constraint_status
-
-    return suggestions, performance_results, constraint_status
+    diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    diagnostics["suggestion_count"] = 0 if exhausted else len(suggestions)
+    diagnostics["duplicate_candidates_rejected"] = duplicate_count
+    diagnostics["completion_draws"] = completion_draws
+    return BOOptimizationResult(
+        suggestions=None if exhausted else suggestions,
+        performance=performance_results,
+        constraint_status=constraint_status,
+        diagnostics=diagnostics,
+    )
 
 
 def run_bo_estimation(df, input_values, features_config, objectives_config, tweaks, device, compute_device):

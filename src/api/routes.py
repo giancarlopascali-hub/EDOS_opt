@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import time
 import torch
 import pandas as pd
@@ -9,9 +10,23 @@ from flask import Blueprint, request, jsonify, render_template
 from src.core.doe import generate_doe
 from src.core.bo import (
     SurfaceCalculationCancelled,
+    validate_exploration,
     run_bo_optimization,
     run_bo_estimation,
     run_bo_surface,
+)
+from src.core.bo_policy import (
+    load_bo_budget,
+    normalized_objective_weights,
+    select_bo_policy,
+    validate_bo_data_mode,
+    validate_multi_objective_method,
+)
+from src.api.bo_worker import (
+    BOChildFailure,
+    BOProcessCancelled,
+    BOProcessTimeout,
+    run_bo_in_subprocess,
 )
 from src.api.jobs import (
     cancel_background_job,
@@ -45,6 +60,17 @@ except Exception:
 BO_SURFACE_MAX_ROWS = 650
 
 
+def _is_hosted_environment():
+    environment = os.environ.get('ENVIRONMENT', '').strip().lower()
+    hostname = (request.host or '').split(':', 1)[0].strip().lower()
+    return (
+        environment in ('production', 'prod')
+        or bool(os.environ.get('SPACE_ID'))
+        or bool(os.environ.get('HF_SPACE'))
+        or hostname.endswith('.hf.space')
+    )
+
+
 def _validate_bo_surface_row_count(data):
     """Protect the local exact-GP surface calculation from huge datasets."""
     if isinstance(data, list) and len(data) > BO_SURFACE_MAX_ROWS:
@@ -68,6 +94,31 @@ def _validated_tweaks(raw_tweaks, features_config, objectives_config=None):
     tweaks['objective_constraints'] = validate_objective_constraints(
         tweaks.get('objective_constraints') or [], objectives_config or []
     )
+    acquisition_type = str(tweaks.get('acq_type', 'EI')).upper()
+    if acquisition_type not in {'EI', 'LCB'}:
+        raise ValueError("Acquisition must be either 'EI' or 'LCB'.")
+    tweaks['acq_type'] = acquisition_type
+    tweaks['multi_objective_method'] = validate_multi_objective_method(
+        tweaks.get('multi_objective_method', 'auto')
+    )
+    tweaks['data_mode'] = validate_bo_data_mode(tweaks.get('data_mode', 'auto'))
+    strategy = str(tweaks.get('optimization_strategy', 'gradient_based'))
+    if strategy not in {'gradient_based', 'exhaustive_grid'}:
+        raise ValueError('Unknown Bayesian optimization strategy.')
+    tweaks['optimization_strategy'] = strategy
+    tweaks['exploration'] = validate_exploration(tweaks.get('exploration', 0.5))
+    if objectives_config:
+        weights = [
+            objective.get('importance', 1) for objective in objectives_config
+        ]
+        normalized_objective_weights(weights)
+        select_bo_policy(
+            len(objectives_config),
+            weights,
+            acquisition_type,
+            load_bo_budget(is_cuda=False).nehvi_max_objectives,
+            requested_method=tweaks['multi_objective_method'],
+        )
     return tweaks
 
 import math
@@ -113,6 +164,114 @@ def _format_sa_result(sa_output):
         'extended_obj_names': extended_obj_names,
         'metadata': metadata,
     })
+
+
+def _format_bo_result(result):
+    """Preserve the public BO response while adding bounded-run diagnostics."""
+
+    serialized = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+    response = {
+        "performance": serialized.get("performance") or {},
+        "constraint_status": serialized.get("constraint_status") or {},
+        "diagnostics": serialized.get("diagnostics") or {},
+    }
+    if serialized.get("suggestions") is None:
+        response["exhausted"] = True
+    else:
+        response["suggestions"] = serialized.get("suggestions")
+    return clean_json_data(response)
+
+
+def _run_bo_job(job_id, payload):
+    """Supervise one process-isolated BO calculation from a lightweight thread."""
+
+    cancel_event = get_cancel_event(job_id)
+    if cancel_event is None:
+        return
+
+    def progress_callback(phase, percent, details):
+        if cancel_event.is_set():
+            update_background_job(
+                job_id,
+                status="cancelling",
+                phase="Stopping optimization",
+                percent=percent,
+                details=details,
+            )
+            return
+        updates = {
+            "status": "running",
+            "phase": phase,
+            "percent": percent,
+            "details": details,
+        }
+        if details.get("algorithm"):
+            updates["algorithm"] = details["algorithm"]
+        update_background_job(job_id, **updates)
+
+    update_background_job(
+        job_id,
+        status="running",
+        phase="Starting isolated BO worker",
+        percent=1,
+        started_at=time.time(),
+    )
+    try:
+        result = run_bo_in_subprocess(payload, cancel_event, progress_callback)
+        diagnostics = result.get("diagnostics") or {}
+        update_background_job(
+            job_id,
+            status="completed",
+            phase="Completed",
+            percent=100,
+            algorithm=diagnostics.get("algorithm"),
+            details={
+                "elapsed_seconds": diagnostics.get("elapsed_seconds"),
+                "algorithm": diagnostics.get("algorithm"),
+                "algorithm_label": diagnostics.get("algorithm_label"),
+            },
+            result=_format_bo_result(result),
+            finished_at=time.time(),
+        )
+    except BOProcessCancelled as exc:
+        update_background_job(
+            job_id,
+            status="cancelled",
+            phase="Cancelled",
+            error=str(exc),
+            error_code="cancelled",
+            finished_at=time.time(),
+        )
+    except BOProcessTimeout as exc:
+        update_background_job(
+            job_id,
+            status="failed",
+            phase="Stopped at hard time limit",
+            error=str(exc),
+            error_code="timeout",
+            finished_at=time.time(),
+        )
+    except BOChildFailure as exc:
+        update_background_job(
+            job_id,
+            status="failed",
+            phase="Optimization failed",
+            error=str(exc),
+            error_code=exc.error_code,
+            finished_at=time.time(),
+        )
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        update_background_job(
+            job_id,
+            status="failed",
+            phase="Optimization failed",
+            error="The BO supervisor failed unexpectedly. Please retry.",
+            error_code="supervisor_error",
+            finished_at=time.time(),
+        )
 
 
 def _run_sa_job(job_id, payload):
@@ -211,21 +370,17 @@ def _shutdown_is_allowed():
     """Return True only for a local request in a non-hosted environment."""
     client_ip = request.remote_addr
     is_local = client_ip in ('127.0.0.1', '::1')
-    environment = os.environ.get('ENVIRONMENT', '').strip().lower()
-    hostname = (request.host or '').split(':', 1)[0].strip().lower()
-    is_hosted = (
-        environment in ('production', 'prod')
-        or bool(os.environ.get('SPACE_ID'))
-        or bool(os.environ.get('HF_SPACE'))
-        or hostname.endswith('.hf.space')
-    )
-    return is_local and not is_hosted
+    return is_local and not _is_hosted_environment()
 
 
 @api_bp.route('/')
 def index():
     """Serves the main single-page application (SPA)."""
-    return render_template('index.html', show_shutdown=_shutdown_is_allowed())
+    return render_template(
+        'index.html',
+        show_shutdown=_shutdown_is_allowed(),
+        hosted_environment=_is_hosted_environment(),
+    )
 
 
 @api_bp.route('/guide')
@@ -269,7 +424,7 @@ def upload():
 
 @api_bp.route('/optimize', methods=['POST'])
 def optimize():
-    """Core Bayesian Optimization endpoint."""
+    """Backward-compatible synchronous endpoint for small local/API jobs."""
     try:
         req_data = request.get_json()
         data             = req_data.get('data')
@@ -279,38 +434,116 @@ def optimize():
         tweaks = _validated_tweaks(
             req_data.get('tweaks', {}), features_config, objectives_config
         )
+        tweaks['_allow_unsafe_full'] = not _is_hosted_environment()
+
+        raw_batch_size = float(tweaks.get('batch_size', 1))
+        if not raw_batch_size.is_integer():
+            raise ValueError('Batch size must be a whole number.')
+        batch_size = int(raw_batch_size)
+        sync_max_objectives = max(1, int(os.environ.get('BO_SYNC_MAX_OBJECTIVES', '2')))
+        sync_max_batch = max(1, int(os.environ.get('BO_SYNC_MAX_BATCH_SIZE', '3')))
+        if _is_hosted_environment() and (
+            len(objectives_config or []) > sync_max_objectives
+            or batch_size > sync_max_batch
+        ):
+            return jsonify({
+                'error': (
+                    'This workload must use the background BO endpoint so it is '
+                    'observable and is not interrupted by the web gateway.'
+                ),
+                'error_code': 'async_required',
+            }), 422
 
         df = pd.DataFrame(data, columns=columns)
-        
-        suggestions, performance_results, constraint_status = run_bo_optimization(
+        result = run_bo_optimization(
             df=df,
             features_config=features_config,
             objectives_config=objectives_config,
             tweaks=tweaks,
             device=DEVICE,
-            compute_device=COMPUTE_DEVICE
+            compute_device=COMPUTE_DEVICE,
+            compute_performance=bool(req_data.get('compute_performance', False)),
         )
-
-        # Exhaustion sentinel: all optimal conditions have already been tested
-        if suggestions is None:
-            return jsonify(clean_json_data({
-                'exhausted': True,
-                'performance': performance_results,
-                'constraint_status': constraint_status
-            }))
-
-        return jsonify(clean_json_data({
-            'suggestions': suggestions,
-            'performance': performance_results,
-            'constraint_status': constraint_status
-        }))
+        return jsonify(_format_bo_result(result))
 
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'error': 'Bayesian optimization failed unexpectedly. Review the server log.',
+            'error_code': 'optimization_error',
+        }), 500
+
+
+@api_bp.route('/bo_submit', methods=['POST'])
+def submit_bo_job():
+    """Validate and queue a process-isolated Bayesian optimization job."""
+
+    try:
+        req_data = request.get_json() or {}
+        data = req_data.get('data')
+        columns = req_data.get('columns')
+        features = req_data.get('features', [])
+        objectives = req_data.get('objectives', [])
+        if not isinstance(data, list) or not isinstance(columns, list):
+            return jsonify({'error': 'A valid dataset and columns are required.'}), 400
+        if any(not isinstance(row, (list, tuple)) or len(row) != len(columns) for row in data):
+            return jsonify({'error': 'Every dataset row must match the columns.'}), 400
+        if not features or not objectives:
+            return jsonify({'error': 'At least one feature and objective are required.'}), 400
+        tweaks = _validated_tweaks(req_data.get('tweaks', {}), features, objectives)
+        # This is server-owned. A request cannot opt a hosted worker out of the
+        # exact-GP safety boundary.
+        tweaks['_allow_unsafe_full'] = not _is_hosted_environment()
+        # Parse here so malformed and out-of-range requests fail before reserving a slot.
+        raw_batch_size = float(tweaks.get('batch_size', 1))
+        if not raw_batch_size.is_integer():
+            raise ValueError('Batch size must be a whole number.')
+        batch_size = int(raw_batch_size)
+        max_batch_size = max(1, int(os.environ.get('BO_MAX_BATCH_SIZE', '20')))
+        if not 1 <= batch_size <= max_batch_size:
+            raise ValueError(
+                f'Batch size must be between 1 and {max_batch_size}.'
+            )
+        try:
+            random_seed = int(req_data.get('random_seed', 1729))
+        except (TypeError, ValueError) as exc:
+            raise ValueError('The BO random seed must be an integer.') from exc
+        if not 0 <= random_seed < 2**63:
+            raise ValueError('The BO random seed must be between 0 and 2^63 - 1.')
+        payload = {
+            'data': data,
+            'columns': columns,
+            'features': features,
+            'objectives': objectives,
+            'tweaks': tweaks,
+            'compute_performance': bool(req_data.get('compute_performance', False)),
+            'random_seed': random_seed,
+        }
+        job_id = queue_background_job(
+            'bo-optimization', payload, _run_bo_job, 'Queued Bayesian optimization'
+        )
+        if job_id is None:
+            return jsonify({
+                'error': (
+                    'Another analysis is already running. Wait for it to finish '
+                    'or cancel it before starting BO.'
+                ),
+                'error_code': 'busy',
+            }), 429
+        return jsonify({'job_id': job_id, 'status': 'queued'}), 202
+    except ValueError as exc:
+        return jsonify({'error': str(exc), 'error_code': 'validation'}), 400
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({
+            'error': 'Unable to queue Bayesian optimization.',
+            'error_code': 'submission_error',
+        }), 500
 
 
 @api_bp.route('/doe', methods=['POST'])

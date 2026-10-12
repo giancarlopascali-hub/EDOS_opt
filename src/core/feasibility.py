@@ -54,7 +54,7 @@ class ProbabilityOfFeasibilityAcquisition(AcquisitionFunction):
         base_acquisition,
         models_by_name,
         objective_constraints,
-        logarithmic=False,
+        logarithmic=None,
     ):
         super().__init__(base_acquisition.model)
         self.base_acquisition = base_acquisition
@@ -63,7 +63,19 @@ class ProbabilityOfFeasibilityAcquisition(AcquisitionFunction):
             [models_by_name[name] for name in self.objective_names]
         )
         self.objective_constraints = list(objective_constraints)
-        self.logarithmic = bool(logarithmic)
+        self.logarithmic = bool(
+            getattr(base_acquisition, "_log", False)
+            if logarithmic is None
+            else logarithmic
+        )
+        self.set_X_pending(getattr(base_acquisition, "X_pending", None))
+
+    def set_X_pending(self, X_pending=None):
+        """Keep pending candidates synchronized with the wrapped acquisition."""
+
+        super().set_X_pending(X_pending)
+        if hasattr(self, "base_acquisition"):
+            self.base_acquisition.set_X_pending(X_pending)
 
     def _models_by_name(self):
         return {

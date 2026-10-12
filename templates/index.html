@@ -13,7 +13,7 @@
     <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
 </head>
 
-<body>
+<body data-hosted-environment="{{ 'true' if hosted_environment else 'false' }}">
     <div class="container">
         <header>
                 <div class="banner-container">
@@ -360,10 +360,20 @@
                 </div>
                 <div id="bo-tweaks-tab" class="tab-content hidden">
                     <div class="tweak-grid">
-                        <div class="tweak-item"><label>Batch Size</label><input type="number" id="batch-size" value="1"></div>
+                        <div class="tweak-item"><label>Batch Size</label><input type="number" id="batch-size" value="1" min="1" max="20" step="1"></div>
                         <div class="tweak-item">
                             <label>Acquisition</label>
                             <select id="acq-type-select"><option value="EI">EI</option><option value="LCB">LCB</option></select>
+                        </div>
+                        <div id="bo-mo-method-item" class="tweak-item hidden">
+                            <label>Multi-objective method</label>
+                            <select id="bo-mo-method-select">
+                                <option value="auto">Auto (recommended)</option>
+                                <option value="qLogNEHVI">qLogNEHVI</option>
+                                <option value="qLogNParEGO">qLogNParEGO</option>
+                                <option value="scalarized-qLogEI">Scalarized qLogEI</option>
+                            </select>
+                            <small id="bo-mo-method-note" aria-live="polite" style="display:block;color:var(--text-secondary);font-size:0.75rem;margin-top:4px;"></small>
                         </div>
                         <div class="tweak-item">
                             <label>Kernel Function</label>
@@ -389,6 +399,23 @@
                         </div>
                         <div class="tweak-item">
                             <label><input type="checkbox" id="bo-avoid-reval" checked> No Re-evaluation</label>
+                        </div>
+                        <div class="tweak-item">
+                            <label><input type="checkbox" id="bo-compute-performance"> Compute predictive cross-validation</label>
+                            <small style="display:block;color:var(--text-secondary);margin-top:4px;">Optional; this fits additional models and can materially increase runtime.</small>
+                        </div>
+                        <div id="bo-large-data-options" class="tweak-item full-width hidden" style="padding:0.85rem 1rem;border:1px solid #fde68a;border-radius:8px;background:#fffbeb;">
+                            <label style="display:flex;justify-content:space-between;gap:1rem;align-items:center;">
+                                <span>Workload protection</span>
+                                <span id="bo-workload-badge" class="badge limited">Review</span>
+                            </label>
+                            <small id="bo-workload-summary" style="display:block;color:#78350f;margin:4px 0 8px;"></small>
+                            <select id="bo-data-mode-select">
+                                <option value="auto">Auto (recommended)</option>
+                                <option value="full">Use all rows (exact GP)</option>
+                                <option value="representative">Use representative rows (exact GP)</option>
+                            </select>
+                            <small id="bo-data-mode-note" aria-live="polite" style="display:block;color:#78350f;margin-top:5px;"></small>
                         </div>
                     </div>
                 </div>

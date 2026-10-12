@@ -8,6 +8,23 @@ NODE_AVAILABLE = shutil.which('node') is not None
 
 @unittest.skipUnless(NODE_AVAILABLE, 'Node.js is required for JavaScript utility tests')
 class ImportanceRebalancingTests(unittest.TestCase):
+    def test_automatic_rebalance_keeps_equal_objectives_identical(self):
+        utils_uri = (pathlib.Path(__file__).parents[1] / 'static/js/utils.js').resolve().as_uri()
+        script = f"""
+globalThis.window = {{ objectiveConfigs: {{A:{{included:true}},B:{{included:true}},C:{{included:true}}}} }};
+const mod = await import('{utils_uri}');
+mod.rebalanceObjectiveConfigs();
+const values = Object.values(window.objectiveConfigs).map(config => config.importance);
+if (new Set(values).size !== 1) throw new Error(`Expected identical weights, received ${{values}}`);
+"""
+        completed = subprocess.run(
+            ['node', '--input-type=module', '--eval', script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_included_importances_sum_to_exactly_100(self):
         utils_uri = (pathlib.Path(__file__).parents[1] / 'static/js/utils.js').resolve().as_uri()
         script = f"""

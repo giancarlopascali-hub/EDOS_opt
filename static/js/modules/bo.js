@@ -7,10 +7,67 @@ import {
     rangePlaceholderForType,
     submitAndPollJob,
     cancelBackgroundJob,
+    waitForJobTerminal,
     escapeHtmlAttribute,
     parseCategoricalChoices
 } from '../utils.js';
 import { updateAllConstraintsDropdowns } from './constraints.js';
+import {
+    estimateBOWorkload,
+    objectiveWeightsAreEqual,
+    recommendedMultiObjectiveMethod
+} from './bo_workload.js';
+
+let activeBOJobId = sessionStorage.getItem('autoedosActiveBOJobId');
+let activeBORunToken = 0;
+
+export async function abortBO() {
+    const jobId = activeBOJobId;
+    const controller = window.currentAbortController;
+    const loadingText = document.getElementById('loading-text');
+    const overlay = document.getElementById('loading-overlay');
+    let terminalConfirmed = false;
+    activeBORunToken += 1; // Prevent an older poll from rendering after cancellation.
+
+    if (!jobId) {
+        controller?.abort();
+        window.currentAbortController = null;
+        overlay?.classList.add('hidden');
+        return;
+    }
+
+    if (loadingText) loadingText.textContent = 'Requesting cancellation…';
+    try {
+        // Send the server request first, then stop the current polling loop.
+        await cancelBackgroundJob(jobId, { throwOnError: true });
+        controller?.abort();
+        const terminal = await waitForJobTerminal(jobId, {
+            timeoutMilliseconds: 12000,
+            onProgress: status => {
+                if (loadingText) {
+                    loadingText.textContent = `${status.phase || 'Stopping optimization'} · ${status.elapsed_seconds || 0}s`;
+                }
+            }
+        });
+        terminalConfirmed = ['completed', 'failed', 'cancelled', 'lost'].includes(terminal.status);
+        if (terminal.status === 'cancelling') {
+            alert('Cancellation was accepted and the server is still stopping the worker. You can check again shortly.');
+        }
+    } catch (error) {
+        alert(`Unable to confirm cancellation: ${error.message}`);
+    } finally {
+        controller?.abort();
+        window.currentAbortController = null;
+        if (terminalConfirmed) {
+            sessionStorage.removeItem('autoedosActiveBOJobId');
+            activeBOJobId = null;
+            overlay?.classList.add('hidden');
+        } else {
+            if (loadingText) loadingText.textContent = 'Cancellation requested; waiting for the server to confirm the worker stopped.';
+            overlay?.classList.remove('hidden');
+        }
+    }
+}
 
 /**
  * Wires a "select all / deselect all" header checkbox to a set of row checkboxes.
@@ -36,6 +93,27 @@ function renderBOFeasibilityStatus(status) {
     banner.id = 'bo-feasibility-warning';
     banner.style.cssText = 'margin:0.75rem 0;padding:0.8rem 1rem;border-radius:8px;background:#fff7ed;border:1px solid #fdba74;color:#9a3412;font-weight:600;';
     banner.textContent = status.message || '⚠️ The returned candidate has low predicted feasibility for one or more objective constraints.';
+    document.getElementById('bo-results-container')?.prepend(banner);
+}
+
+function renderBODataWarnings(diagnostics) {
+    document.getElementById('bo-data-quality-warning')?.remove();
+    const warnings = diagnostics?.data_warnings;
+    if (!Array.isArray(warnings) || warnings.length === 0) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'bo-data-quality-warning';
+    banner.style.cssText = 'margin:0.75rem 0;padding:0.8rem 1rem;border-radius:8px;background:#fffbeb;border:1px solid #fde68a;color:#92400e;';
+    const title = document.createElement('strong');
+    title.textContent = 'Data-quality notes';
+    const list = document.createElement('ul');
+    list.style.cssText = 'margin:0.45rem 0 0 1.2rem;padding:0;';
+    warnings.forEach(message => {
+        const item = document.createElement('li');
+        item.textContent = String(message);
+        list.appendChild(item);
+    });
+    banner.append(title, list);
     document.getElementById('bo-results-container')?.prepend(banner);
 }
 
@@ -138,36 +216,137 @@ export function updateAcqSelectForMultiObj() {
     const activeObjs   = includedObjs.length;
     const acqSelect    = document.getElementById('acq-type-select');
     const acqItem      = acqSelect ? acqSelect.closest('.tweak-item') : null;
+    const methodItem   = document.getElementById('bo-mo-method-item');
+    const methodSelect = document.getElementById('bo-mo-method-select');
+    const methodNote   = document.getElementById('bo-mo-method-note');
     if (!acqSelect) return;
 
     const isMultiObj = activeObjs > 1;
     acqSelect.disabled       = isMultiObj;
     acqSelect.style.opacity  = isMultiObj ? '0.45' : '1';
     acqSelect.style.cursor   = isMultiObj ? 'not-allowed' : '';
+    acqItem?.classList.toggle('hidden', isMultiObj);
+    methodItem?.classList.toggle('hidden', !isMultiObj);
 
-    if (acqItem) {
-        let note = acqItem.querySelector('.mo-note');
-        if (isMultiObj) {
-            const weights  = includedObjs.map(cb => parseFloat(cb.closest('tr').querySelector('.bo-o-importance').value) || 0);
-            const allEqual = weights.every(v => Math.abs(v - weights[0]) < 0.1);
-
-            if (!note) {
-                note = document.createElement('small');
-                note.className   = 'mo-note';
-                note.style.cssText = 'color: var(--text-secondary); font-size: 0.75rem; margin-top: 3px; display: block; border-left: 2px solid var(--accent-color); padding-left: 6px;';
-                acqItem.appendChild(note);
-            }
-            note.innerHTML = allEqual
-                ? `<span style="color:var(--accent-color)">Discovery Mode:</span> Exploring full Pareto front via NEHVI.`
-                : `<span style="color:var(--accent-color)">Priority Mode:</span> Focus on weighted sum (Scalarized EI).`;
+    const weights = includedObjs.map(cb => (
+        parseFloat(cb.closest('tr').querySelector('.bo-o-importance').value) || 0
+    ));
+    const equalWeights = objectiveWeightsAreEqual(weights);
+    const recommended = recommendedMultiObjectiveMethod(activeObjs, weights);
+    const nParEGOOption = methodSelect?.querySelector('option[value="qLogNParEGO"]');
+    if (nParEGOOption) {
+        nParEGOOption.disabled = isMultiObj && !equalWeights;
+        nParEGOOption.title = nParEGOOption.disabled
+            ? 'NParEGO is unavailable when objective importance values are unequal.'
+            : '';
+    }
+    if (methodSelect && nParEGOOption?.disabled && methodSelect.value === 'qLogNParEGO') {
+        methodSelect.value = 'auto';
+    }
+    if (isMultiObj && methodSelect && methodNote) {
+        const selected = methodSelect.value;
+        const labels = {
+            qLogNEHVI: 'qLogNEHVI',
+            qLogNParEGO: 'qLogNParEGO',
+            'scalarized-qLogEI': 'Scalarized qLogEI'
+        };
+        if (selected === 'auto') {
+            methodNote.innerHTML = `<span style="color:var(--accent-color)">Recommended:</span> ${labels[recommended]}. The server records the final choice.`;
+        } else if (selected === recommended) {
+            methodNote.textContent = `${labels[selected]} is the recommended method for the current objectives.`;
+        } else if (selected === 'qLogNEHVI') {
+            methodNote.innerHTML = '<span style="color:#b45309">Higher compute:</span> qLogNEHVI can become much slower as objectives increase.';
+        } else if (selected === 'scalarized-qLogEI') {
+            methodNote.innerHTML = '<span style="color:#b45309">Different goal:</span> this seeks one weighted compromise rather than broad Pareto discovery.';
         } else {
-            if (note) note.remove();
+            methodNote.innerHTML = '<span style="color:#b45309">Manual override:</span> computation and recommendations may differ from Auto.';
         }
     }
 
     if (!acqSelect.dataset.explorationListenerAttached) {
         acqSelect.dataset.explorationListenerAttached = 'true';
         acqSelect.addEventListener('change', updateBOExplorationControlAvailability);
+    }
+    if (methodSelect && !methodSelect.dataset.policyListenerAttached) {
+        methodSelect.dataset.policyListenerAttached = 'true';
+        methodSelect.addEventListener('change', updateAcqSelectForMultiObj);
+    }
+    const batchInput = document.getElementById('batch-size');
+    if (batchInput && !batchInput.dataset.workloadListenerAttached) {
+        batchInput.dataset.workloadListenerAttached = 'true';
+        batchInput.addEventListener('input', updateAcqSelectForMultiObj);
+    }
+    const dataModeSelect = document.getElementById('bo-data-mode-select');
+    if (dataModeSelect && !dataModeSelect.dataset.workloadListenerAttached) {
+        dataModeSelect.dataset.workloadListenerAttached = 'true';
+        dataModeSelect.addEventListener('change', updateAcqSelectForMultiObj);
+    }
+
+    const featureCount = document.querySelectorAll('#bo-features-list .bo-f-include:checked').length;
+    const rowCount = window.currentData?.length || 0;
+    const manualMethod = methodSelect?.value || 'auto';
+    const effectiveMethod = activeObjs <= 1
+        ? (acqSelect.value === 'LCB' ? 'qUCB' : 'qLogEI')
+        : (manualMethod === 'auto' ? recommended : manualMethod);
+    const constrainedObjectives = new Set(
+        Array.from(document.querySelectorAll('#bo-objective-constraints-list .objective-constraint-objective'))
+            .map(select => select.value)
+            .filter(Boolean)
+    );
+    const workload = estimateBOWorkload({
+        rowCount,
+        featureCount,
+        objectiveCount: Math.max(1, activeObjs),
+        batchSize: document.getElementById('batch-size')?.value || 1,
+        method: effectiveMethod,
+        additionalModelCount: constrainedObjectives.size
+    });
+    const workloadPanel = document.getElementById('bo-large-data-options');
+    const workloadBadge = document.getElementById('bo-workload-badge');
+    const workloadSummary = document.getElementById('bo-workload-summary');
+    const dataModeNote = document.getElementById('bo-data-mode-note');
+    const selectedDataMode = dataModeSelect?.value || 'auto';
+    const showWorkloadControls = rowCount > 0 && activeObjs > 0
+        && (workload.controlsRequired || selectedDataMode !== 'auto');
+    workloadPanel?.classList.toggle('hidden', !showWorkloadControls);
+
+    const hosted = document.body?.dataset.hostedEnvironment === 'true';
+    const fullOption = dataModeSelect?.querySelector('option[value="full"]');
+    const representativeOption = dataModeSelect?.querySelector('option[value="representative"]');
+    if (fullOption) {
+        fullOption.disabled = hosted && workload.tier === 'unsafe';
+        fullOption.title = fullOption.disabled
+            ? 'The hosted server blocks unsafe full exact-GP jobs.'
+            : '';
+    }
+    if (representativeOption) {
+        representativeOption.disabled = !workload.representativeFeasible
+            || workload.recommendedRows >= rowCount;
+        representativeOption.title = !workload.representativeFeasible
+            ? 'Even the minimum representative set is unsafe with this method.'
+            : '';
+    }
+    if (dataModeSelect && dataModeSelect.selectedOptions[0]?.disabled) {
+        dataModeSelect.value = 'auto';
+    }
+    if (showWorkloadControls && workloadBadge && workloadSummary && dataModeNote) {
+        workloadBadge.textContent = workload.tier === 'unsafe' ? 'High' : 'Review';
+        workloadBadge.className = `badge ${workload.tier === 'unsafe' ? 'poor' : 'limited'}`;
+        workloadSummary.textContent = `Planning score ${workload.riskScore.toFixed(2)} for ${rowCount.toLocaleString()} rows, ${featureCount} features, ${activeObjs} objectives and batch ${document.getElementById('batch-size')?.value || 1}.`;
+        const mode = dataModeSelect?.value || 'auto';
+        if (!workload.representativeFeasible && mode === 'full' && !hosted) {
+            dataModeNote.textContent = 'Representative mode cannot make this method light enough. Standalone full-data execution remains available; increase the server runtime and memory budgets if needed.';
+        } else if (!workload.representativeFeasible) {
+            dataModeNote.textContent = 'This combination remains too heavy even after row reduction. Choose Auto acquisition, fewer objectives, or a smaller batch.';
+        } else if (mode === 'representative') {
+            dataModeNote.textContent = `The server will select about ${workload.recommendedRows.toLocaleString()} real rows, seek the fidelity target, and use the best safe subset found if the target cannot be reached.`;
+        } else if (mode === 'full') {
+            dataModeNote.textContent = 'All valid rows will train exact GP models. This may require substantially more time and memory.';
+        } else if (workload.tier === 'unsafe') {
+            dataModeNote.textContent = `Auto will use about ${workload.recommendedRows.toLocaleString()} representative rows, seek the fidelity target, and clearly report any best-safe-subset fallback.`;
+        } else {
+            dataModeNote.textContent = 'Auto will currently use all rows; representative mode is available before the workload becomes unsafe.';
+        }
     }
     updateBOExplorationControlAvailability();
 }
@@ -226,6 +405,10 @@ export async function runBO() {
     const tweaks = {
         batch_size:            document.getElementById('batch-size').value,
         acq_type:              document.getElementById('acq-type-select').value,
+        multi_objective_method: objectives.length > 1
+            ? (document.getElementById('bo-mo-method-select')?.value || 'auto')
+            : 'auto',
+        data_mode:             document.getElementById('bo-data-mode-select')?.value || 'auto',
         kernel:                document.getElementById('kernel-select').value,
         exploration:           document.getElementById('style-slider').value,
         noiseless:             document.getElementById('bo-noiseless').checked,
@@ -238,20 +421,47 @@ export async function runBO() {
         objective_constraints: objectiveConstraints
     };
 
-    document.getElementById('loading-text').textContent = "Optimizing...";
-    document.getElementById('loading-overlay').classList.remove('hidden');
+    const loadingText = document.getElementById('loading-text');
+    const loadingOverlay = document.getElementById('loading-overlay');
+    loadingText.textContent = 'Submitting Bayesian optimization…';
+    loadingOverlay.classList.remove('hidden');
 
-    window.currentAbortController = new AbortController();
+    const runToken = ++activeBORunToken;
+    const controller = new AbortController();
+    window.currentAbortController = controller;
+    let reachedTerminalState = false;
     try {
-        const res    = await fetch('/optimize', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ data: window.currentData, columns: window.currentColumns, features, objectives, tweaks }),
-            signal: window.currentAbortController.signal
+        const completed = await submitAndPollJob('/bo_submit', {
+            data: window.currentData,
+            columns: window.currentColumns,
+            features,
+            objectives,
+            tweaks,
+            compute_performance: Boolean(document.getElementById('bo-compute-performance')?.checked)
+        }, {
+            signal: controller.signal,
+            onSubmitted: jobId => {
+                activeBOJobId = jobId;
+                sessionStorage.setItem('autoedosActiveBOJobId', jobId);
+            },
+            onProgress: status => {
+                if (runToken !== activeBORunToken) return;
+                const elapsed = status.elapsed_seconds ?? status.details?.elapsed_seconds;
+                const algorithm = status.algorithm || status.details?.algorithm_label || status.details?.algorithm;
+                loadingText.textContent = [
+                    status.phase || 'Running optimization',
+                    elapsed != null ? `${elapsed}s` : null,
+                    algorithm || null
+                ].filter(Boolean).join(' · ');
+            }
         });
-        const result = await safeJson(res);
-        document.getElementById('loading-overlay').classList.add('hidden');
-        if (result.error) return alert("Optimization Error: " + result.error);
+        if (runToken !== activeBORunToken) return;
+        reachedTerminalState = true;
+        const result = completed.result;
+        activeBOJobId = null;
+        sessionStorage.removeItem('autoedosActiveBOJobId');
+        loadingOverlay.classList.add('hidden');
+        renderBODataWarnings(result.diagnostics);
 
         // Handle exhaustion: all optimal conditions have already been tested
         if (result.exhausted) {
@@ -262,17 +472,34 @@ export async function runBO() {
         window.suggestionsData = result.suggestions;
         renderBOFeasibilityStatus(result.constraint_status);
 
-        if (result.performance) renderBOPerformanceTable(result.performance);
+        if (result.performance && Object.keys(result.performance).length) {
+            renderBOPerformanceTable(result.performance);
+        } else if (perfInfo) {
+            perfInfo.textContent = 'Predictive cross-validation was not requested for this run.';
+        }
         renderBOEstimator();
 
         const boResContainer = document.getElementById('bo-results-container');
         if (boResContainer) boResContainer.classList.remove('hidden');
     } catch (err) {
-        document.getElementById('loading-overlay').classList.add('hidden');
         if (err.name === 'AbortError') return console.log('BO calculation aborted by user.');
-        return alert("A critical error occurred during optimization: " + err.message);
+        if (err.terminal || err.code === 'job_lost') {
+            reachedTerminalState = true;
+            activeBOJobId = null;
+            sessionStorage.removeItem('autoedosActiveBOJobId');
+        }
+        if (activeBOJobId && !reachedTerminalState) {
+            loadingText.textContent = 'Connection lost; the server job may still be running. Abort to stop it safely.';
+            loadingOverlay.classList.remove('hidden');
+            return alert(`Optimization connection error: ${err.message}\n\nThe job ID was retained so it can still be cancelled.`);
+        }
+        loadingOverlay.classList.add('hidden');
+        return alert("Optimization Error: " + err.message);
     } finally {
-        window.currentAbortController = null;
+        if (runToken === activeBORunToken) {
+            window.currentAbortController = null;
+            if (reachedTerminalState) activeBOJobId = null;
+        }
     }
 
     if (!window.objectiveConfigs) window.objectiveConfigs = {};
@@ -1426,4 +1653,5 @@ window.syncBOFeatureConfig = (col, field) => {
     }
     if (field === 'include' || !field) window.boFeatureConfigs[col].included = tr.querySelector('.bo-f-include').checked;
     updateAllConstraintsDropdowns('bo');
+    updateAcqSelectForMultiObj();
 };

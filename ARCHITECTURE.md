@@ -78,7 +78,8 @@ All templates and static assets are served from the `templates/` and `static/` d
     *   **`static/js/utils.js`**: Contains helper functions for event-listener binding, spreadsheet CSV exports, Pareto-front index detection, and configuration rebalancing.
 *   **Feature Modules (`static/js/modules/`)**:
     *   **`static/js/modules/doe.js`**: Controls the Design of Experiments UI. Captures input configurations (factors/levels/types), dispatches requests to `/doe`, and displays the generated design tables and design properties.
-    *   **`static/js/modules/bo.js`**: Manages the Bayesian Optimization UI. Captures parameter bounds, optimization objectives, custom hyperparameters (acquisition function, noise, strategy), posts to `/optimize` or `/estimate_bo`, and visualizes trends and Pareto fronts using Plotly.
+    *   **`static/js/modules/bo.js`**: Manages the Bayesian Optimization UI. Captures parameter bounds, optimization objectives, custom hyperparameters (acquisition method, noise, strategy and workload handling), submits proposal work to `/bo_submit`, polls progress, supports cancellation, and visualizes trends and Pareto fronts using Plotly.
+    *   **`static/js/modules/bo_workload.js`**: Mirrors the server's conservative exact-GP planning score so advanced row-handling controls remain hidden for ordinary jobs and appear before risky workloads are submitted.
     *   **`static/js/modules/sa.js`**: Handles the Statistical Analysis UI. Allows selection of target features/objectives, executes analysis via `/sa`, and builds interactive Plotly charts showing correlation matrices, feature importances, and SHAP-like impact analysis.
     *   **`static/js/modules/constraints.js`**: Manages frontend interaction for constraints definition, including handling formulas, custom rules, and UI updates.
 
@@ -94,7 +95,7 @@ All templates and static assets are served from the `templates/` and `static/` d
         *   `GET /guide`: Serves `guide.html`.
         *   `POST /upload`: Standardizes upload of custom CSV datasets.
         *   `POST /doe`: Calls `generate_doe(...)` to produce new experimental designs.
-        *   `POST /optimize`: Calls `run_bo_optimization(...)` to compute recommendations using Gaussian Processes and acquisition functions.
+        *   `POST /bo_submit`: Validates and queues process-isolated BO work with progress, cancellation and a hard deadline. `/optimize` remains a compatibility endpoint for small local/API jobs.
         *   `POST /estimate_bo`: Predicts values for specified conditions using the GP models trained on current data.
         *   `POST /sa`: Performs statistical analysis and returns correlation matrices and feature importance details.
         *   `POST /shutdown`: Allows local users to shutdown the server gracefully.
@@ -111,7 +112,10 @@ These modules perform the underlying mathematical operations:
     *   **Details**: Generates classical experimental layouts (Full/Fractional Factorial, Box-Behnken, Central Composite, Definitive Screening Designs). It also computes quality metrics like Orthogonality, Resolution, and D-Efficiency.
 *   **`src/core/bo.py`**:
     *   **Role**: Bayesian Optimization Engine.
-    *   **Details**: Constructs Gaussian Process regression models (using GPyTorch and BoTorch) representing objectives as a function of the features. Recommends subsequent experimental points by optimizing acquisition functions (e.g. Expected Improvement, Upper Confidence Bound, qExpectedHypervolumeImprovement) while handling mixed continuous/discrete search spaces and user constraints.
+    *   **Details**: Constructs double-precision Gaussian Process models with bounded fitting and acquisition budgets. It selects qLogNEHVI, qLogNParEGO, or scalarized qLogEI according to objective count and importance, while permitting explicit compatible overrides. For unsafe exact-GP workloads it trains on real representative rows selected by `bo_sampling.py`; bounded deterministic variants seek the configured fidelity target and otherwise return the highest-fidelity safe subset with an explicit diagnostic. All uploaded rows remain active for duplicate avoidance.
+*   **`src/core/bo_policy.py`**: Owns server-side acquisition, runtime, memory, and row-handling limits. Request payloads cannot increase these budgets.
+*   **`src/core/bo_sampling.py`**: Selects representative real rows while preserving feature coverage, objective distributions, trade-off anchors, and missing-value patterns.
+*   **`src/api/bo_worker.py`**: Runs BO in a supervised child process so cancellation and hard timeouts can terminate numerical work without leaving the web worker blocked.
 *   **`src/core/sa.py`**:
     *   **Role**: Statistical Analysis Engine (Note: SA in this context refers to Statistical Analysis, not Simulated Annealing).
     *   **Details**: Trains Random Forest or Gradient Boosting regression/classification models on loaded datasets. Extracts feature importances, builds correlation matrices, and calculates custom SHAP-like model prediction impacts to let users inspect factor effects.
@@ -126,11 +130,11 @@ These modules perform the underlying mathematical operations:
 To illustrate how these files interact, here is the lifecycle of a **Bayesian Optimization** request:
 
 1.  **User Action**: The user uploads their past experimental data in `index.html` (routed to `routes.py /upload` via `main.js`), configures the features/objectives in the settings panel, and clicks "Generate Suggestions".
-2.  **Frontend Gathering**: `static/js/modules/bo.js` reads the parameter configurations from the DOM and state object (`static/js/state.js`), bundles them into a JSON payload, and posts it to the `/optimize` endpoint.
-3.  **Route Handling**: `src/api/routes.py` parses the JSON, reads the columns, formats the data into a Pandas DataFrame, detects GPU/CPU resources, and forwards the parameters to `src/core/bo.py`.
+2.  **Frontend Gathering**: `static/js/modules/bo.js` reads the parameter configurations from the DOM and state object (`static/js/state.js`), bundles them into a JSON payload, and posts it to `/bo_submit`.
+3.  **Route Handling**: `src/api/routes.py` validates the request before reserving the shared analysis slot. `src/api/bo_worker.py` then supervises a process-isolated calculation while the browser polls job status.
 4.  **Backend Calculation**:
     *   `src/core/bo.py` fits a multi-output or single-output Gaussian Process model.
     *   It defines the search space bounds and integrates user-defined rules using `src/core/constraints.py`.
     *   It optimizes the chosen acquisition function (e.g. Expected Improvement) to find the best candidate points.
-5.  **JSON Response**: `routes.py` cleans any invalid math values (e.g., converts any `NaN` values to `None`) and sends the data back to the client browser.
+5.  **JSON Response**: `routes.py` cleans invalid math values, returns the suggestions and diagnostics through the background-job result, and records any representative-subset warning.
 6.  **Rendering UI**: `static/js/modules/bo.js` receives the candidates, lists them in the suggestions table in `index.html`, and uses Plotly to redraw interactive Pareto-front and optimization trend charts.

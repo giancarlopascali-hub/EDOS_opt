@@ -32,6 +32,18 @@ class HostedUiTests(unittest.TestCase):
             response = client.get('/', base_url='https://example.hf.space')
         self.assertNotIn(b'id="shutdown-btn"', response.data)
 
+    def test_advanced_bo_controls_exist_but_start_hidden(self):
+        with app.test_client() as client:
+            response = client.get('/')
+        self.assertIn(b'id="bo-mo-method-item" class="tweak-item hidden"', response.data)
+        self.assertIn(b'id="bo-large-data-options" class="tweak-item full-width hidden"', response.data)
+        self.assertIn(b'Auto (recommended)', response.data)
+
+    def test_hosted_profile_is_exposed_to_disable_unsafe_full_mode(self):
+        with patch.dict(os.environ, {'SPACE_ID': 'realgcp/autoEDOS'}, clear=True), app.test_client() as client:
+            response = client.get('/')
+        self.assertIn(b'data-hosted-environment="true"', response.data)
+
 
 if __name__ == '__main__':
     unittest.main()

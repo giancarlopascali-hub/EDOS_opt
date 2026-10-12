@@ -1,7 +1,7 @@
 import './state.js';
 import { safeAddListener, exportData, detectParetoIndices, rebalanceRemaining, rebalanceObjectiveConfigs, updateRangePlaceholder, formatCategoricalChoices, uniqueCategoricalChoices } from './utils.js';
 import { runDoE, renderDoEResults, rebalanceDoEDOM, attachDeleteEvents } from './modules/doe.js';
-import { renderBOSetup, runBO, runBOEstimate, renderTrendPlot, renderParetoPlot, updateAcqSelectForMultiObj } from './modules/bo.js';
+import { abortBO, renderBOSetup, runBO, runBOEstimate, renderTrendPlot, renderParetoPlot, updateAcqSelectForMultiObj } from './modules/bo.js';
 import { renderSASetup, runSA, runEstimate, exportSAReport, abortSA } from './modules/sa.js';
 import { updateAllConstraintsDropdowns } from './modules/constraints.js';
 
@@ -30,13 +30,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initStrategyToggle();
 
     // Abort button listener
-    safeAddListener('abort-calc-btn', 'click', () => {
-        if (window.currentAbortController) {
-            window.currentAbortController.abort();
-            window.currentAbortController = null;
-        }
-        document.getElementById('loading-overlay').classList.add('hidden');
-    });
+    safeAddListener('abort-calc-btn', 'click', () => { void abortBO(); });
     safeAddListener('sa-abort-btn', 'click', abortSA);
 
     // Clear Data button listener

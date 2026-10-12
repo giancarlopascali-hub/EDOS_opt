@@ -124,7 +124,9 @@
             </ol>
             <table class="guide-table"><thead><tr><th>BO control</th><th>What it changes</th></tr></thead><tbody>
                 <tr><td><b>Batch Size</b></td><td>How many new conditions to propose for the next campaign.</td></tr>
-                <tr><td><b>Acquisition</b></td><td>For one objective, choose EI or LCB. With multiple objectives, EDOS automatically uses a multi-objective strategy: equal importance explores the Pareto front; unequal importance prioritizes the weighted objectives.</td></tr>
+                <tr><td><b>Optimization Strategy</b></td><td>Gradient-based is suited to continuous spaces. Exhaustive Grid evaluates an enumerated grid and converts continuous features to a regular 10-step grid.</td></tr>
+                <tr><td><b>Acquisition</b></td><td>For one objective, choose EI or LCB. With multiple objectives, Auto is recommended. qLogNEHVI emphasizes hypervolume and can be much heavier; qLogNParEGO explores Pareto trade-offs and is disabled for unequal importance; Scalarized qLogEI seeks one importance-weighted compromise.</td></tr>
+                <tr><td><b>Workload protection</b></td><td>This control remains hidden for ordinary jobs. When rows, features, objectives, batch size and acquisition method cross the safety threshold, choose Auto, all rows, or representative rows. Hosted EDOS uses actual source rows and seeks the fidelity target. If the bounded search cannot reach it, optimization continues with the best safe subset found and displays an explicit quality warning; it never reduces data silently.</td></tr>
                 <tr><td><b>Kernel Function</b></td><td>The model's smoothness assumption. Matérn 5/2 is the default; Matérn 3/2 is less smooth and RBF is smoother.</td></tr>
                 <tr><td><b>Exploration / Exploitation</b></td><td>0 favours predicted best-known areas; 1 spends more suggestions learning uncertain areas.</td></tr>
                 <tr><td><b>Noiseless</b></td><td>Use only when measurements have essentially no experimental variation.</td></tr>

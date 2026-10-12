@@ -28,7 +28,7 @@ verification and source-revision traceability.
 
 - **DoE Module**: Generate Box-Behnken, Central Composite, Fractional Factorial, mixed-level Full Factorial, Definitive Screening, LHS, and D-Optimal designs. Reduced budgets prioritize unique combinations; Exact counts add flagged repeats only after unique conditions are exhausted.
 - **Scientific Quality Metrics**: Real-time calculation of Orthogonality, D-Efficiency, Resolution, and Curvature detection with a visual "Quality Dashboard".
-- **Bayesian Optimizer**: Suggest the best experiments to perform next and improve your peformance, visualizing objective trends and Pareto front. It supports categorical parameters and multi-objective optimization.
+- **Bayesian Optimizer**: Suggest the next experiments with bounded, observable background jobs and double-precision GP fitting. Multi-objective runs default to the recommended qLogNEHVI, qLogNParEGO, or scalarized qLogEI policy, while advanced users can select an alternative explicitly. Large hosted workloads use reported representative source rows, seek a 90/100 fidelity target, and continue with a clearly flagged best-safe-subset fallback when that target cannot be reached.
 - **Statistical Analysis**: Perform basic analysis on experimental data, including feature importance, correlation, and success-based optimization.
 - **Standalone Capability**: Bundled into a Windows executable for easy deployment.
 

@@ -1,8 +1,23 @@
 import unittest
 
 import torch
+from botorch.acquisition.acquisition import AcquisitionFunction
 
-from src.core.feasibility import constraint_probability
+from src.core.feasibility import (
+    ProbabilityOfFeasibilityAcquisition,
+    constraint_probability,
+)
+
+
+class _LogAcquisition(AcquisitionFunction):
+    _log = True
+
+    def __init__(self, pending):
+        super().__init__(torch.nn.Identity())
+        self.set_X_pending(pending)
+
+    def forward(self, x_value):
+        return torch.zeros(x_value.shape[:-2])
 
 
 class ProbabilityOfFeasibilityTests(unittest.TestCase):
@@ -21,6 +36,18 @@ class ProbabilityOfFeasibilityTests(unittest.TestCase):
         probability = constraint_probability(torch.tensor(11.0), torch.tensor(0.0), '>=', 10.0)
         self.assertTrue(torch.isfinite(probability))
         self.assertGreater(float(probability), 0.999)
+
+    def test_wrapper_infers_log_space_and_forwards_pending_points(self):
+        pending = torch.tensor([[0.25]])
+        base = _LogAcquisition(pending)
+        wrapped = ProbabilityOfFeasibilityAcquisition(base, {}, [])
+        self.assertTrue(wrapped.logarithmic)
+        self.assertTrue(torch.equal(wrapped.X_pending, pending))
+
+        replacement = torch.tensor([[0.75]])
+        wrapped.set_X_pending(replacement)
+        self.assertTrue(torch.equal(wrapped.X_pending, replacement))
+        self.assertTrue(torch.equal(base.X_pending, replacement))
 
 
 if __name__ == '__main__':

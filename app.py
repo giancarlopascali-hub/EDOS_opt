@@ -79,9 +79,12 @@ if not getattr(sys, 'frozen', False):
     os.makedirs(STATIC_DIR, exist_ok=True)
 
 if __name__ == '__main__':
+    import multiprocessing
     import threading
     import webbrowser
     import time
+
+    multiprocessing.freeze_support()
 
     # Port selection: Standalone matches README (5000), deployment uses environment PORT
     default_port = 5000

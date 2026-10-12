@@ -206,17 +206,12 @@ export function rebalanceObjectiveConfigs() {
 
     if (includedCols.length === 0) return;
 
-    const total = 1000;
-    const share = Math.floor(total / includedCols.length);
-    let currentSum = 0;
-
-    includedCols.forEach((col, idx) => {
-        if (idx === includedCols.length - 1) {
-            window.objectiveConfigs[col].importance = ((total - currentSum) / 10).toFixed(1);
-        } else {
-            window.objectiveConfigs[col].importance = (share / 10).toFixed(1);
-            currentSum += share;
-        }
+    // Keep automatically balanced values numerically identical. Assigning a
+    // one-decimal remainder to the last objective (33.3, 33.3, 33.4) makes an
+    // equal three-objective setup look like a deliberate priority weighting.
+    const equalShare = (100 / includedCols.length).toFixed(4);
+    includedCols.forEach(col => {
+        window.objectiveConfigs[col].importance = equalShare;
     });
 }
 
@@ -253,7 +248,15 @@ export function waitForAbortableDelay(milliseconds, signal) {
 }
 
 export async function submitAndPollJob(
-    submitUrl, payload, { signal, onProgress, pollMilliseconds = 1500 } = {}
+    submitUrl,
+    payload,
+    {
+        signal,
+        onProgress,
+        onSubmitted,
+        pollMilliseconds = 1500,
+        maxTransientErrors = 4
+    } = {}
 ) {
     const submitResponse = await fetch(submitUrl, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -264,20 +267,80 @@ export async function submitAndPollJob(
         throw new Error(submitted.error || 'Unable to start background job.');
     }
     const jobId = submitted.job_id;
+    onSubmitted?.(jobId);
     onProgress?.({ status: submitted.status || 'queued', phase: 'Queued', percent: 0 }, jobId);
+    let transientErrors = 0;
     while (true) {
         await waitForAbortableDelay(pollMilliseconds, signal);
-        const statusResponse = await fetch(`/job_status/${encodeURIComponent(jobId)}`, { signal });
-        const status = await safeJson(statusResponse);
-        if (!statusResponse.ok) throw new Error(status.error || 'Unable to read background job status.');
-        onProgress?.(status, jobId);
-        if (status.status === 'completed') return { jobId, result: status.result };
-        if (status.status === 'failed') throw new Error(status.error || 'Background job failed.');
-        if (status.status === 'cancelled') throw new DOMException(status.error || 'Cancelled', 'AbortError');
+        try {
+            const statusResponse = await fetch(`/job_status/${encodeURIComponent(jobId)}`, { signal });
+            const status = await safeJson(statusResponse);
+            if (statusResponse.status === 404) {
+                const error = new Error('The background job was lost or expired, possibly because the server restarted. Please run it again.');
+                error.code = 'job_lost';
+                throw error;
+            }
+            if (!statusResponse.ok) {
+                const error = new Error(status.error || 'Unable to read background job status.');
+                error.transient = statusResponse.status >= 500 || statusResponse.status === 429;
+                throw error;
+            }
+            transientErrors = 0;
+            onProgress?.(status, jobId);
+            if (status.status === 'completed') return { jobId, result: status.result };
+            if (status.status === 'failed') {
+                const error = new Error(status.error || 'Background job failed.');
+                error.code = status.error_code || 'job_failed';
+                error.terminal = true;
+                throw error;
+            }
+            if (status.status === 'cancelled') {
+                throw new DOMException(status.error || 'Cancelled', 'AbortError');
+            }
+        } catch (error) {
+            if (error.name === 'AbortError' || error.code === 'job_lost' || error.terminal) throw error;
+            transientErrors += 1;
+            if (error.transient === false || transientErrors > maxTransientErrors) throw error;
+            onProgress?.({
+                status: 'reconnecting',
+                phase: `Connection interrupted; retrying (${transientErrors}/${maxTransientErrors})`,
+                percent: null
+            }, jobId);
+            await waitForAbortableDelay(
+                Math.min(5000, pollMilliseconds * (2 ** (transientErrors - 1))),
+                signal
+            );
+        }
     }
 }
 
-export async function cancelBackgroundJob(jobId, { waitForTerminal = false, pollMilliseconds = 250 } = {}) {
+export async function waitForJobTerminal(
+    jobId,
+    { timeoutMilliseconds = 12000, pollMilliseconds = 300, onProgress } = {}
+) {
+    const deadline = Date.now() + timeoutMilliseconds;
+    while (Date.now() < deadline) {
+        const response = await fetch(`/job_status/${encodeURIComponent(jobId)}`);
+        const status = await safeJson(response);
+        if (response.status === 404) return { status: 'lost', error: status.error };
+        if (!response.ok) throw new Error(status.error || 'Unable to read background job status.');
+        onProgress?.(status);
+        if (['completed', 'failed', 'cancelled'].includes(status.status)) return status;
+        await waitForAbortableDelay(pollMilliseconds);
+    }
+    return { status: 'cancelling', error: 'The server is still stopping the calculation.' };
+}
+
+export async function cancelBackgroundJob(
+    jobId,
+    {
+        waitForTerminal = false,
+        pollMilliseconds = 250,
+        timeoutMilliseconds = 12000,
+        throwOnError = false,
+        onProgress
+    } = {}
+) {
     if (!jobId) return null;
     try {
         const response = await fetch(`/job_cancel/${encodeURIComponent(jobId)}`, { method: 'POST' });
@@ -286,15 +349,12 @@ export async function cancelBackgroundJob(jobId, { waitForTerminal = false, poll
             throw new Error(result.error || 'Unable to cancel background job.');
         }
         if (!waitForTerminal) return null;
-        while (true) {
-            const statusResponse = await fetch(`/job_status/${encodeURIComponent(jobId)}`);
-            const status = await safeJson(statusResponse);
-            if (statusResponse.status === 404 || ['completed', 'failed', 'cancelled'].includes(status.status)) return status;
-            if (!statusResponse.ok) throw new Error(status.error || 'Unable to read background job status.');
-            await waitForAbortableDelay(pollMilliseconds);
-        }
+        return await waitForJobTerminal(jobId, {
+            timeoutMilliseconds, pollMilliseconds, onProgress
+        });
     } catch (error) {
         console.warn('Unable to send background cancellation request:', error);
+        if (throwOnError) throw error;
         return null;
     }
 }

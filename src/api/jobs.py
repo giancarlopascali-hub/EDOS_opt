@@ -18,6 +18,31 @@ _JOBS_LOCK = threading.Lock()
 _JOB_TTL_SECONDS = 3600
 
 
+def _run_background_target(job_id, payload, target):
+    """Ensure a stopped supervisor can never leave an active slot behind."""
+
+    try:
+        target(job_id, payload)
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job is not None and job.get("status") in {
+                "queued", "running", "cancelling"
+            }:
+                job.update({
+                    "status": "failed",
+                    "phase": "Supervisor stopped unexpectedly",
+                    "error": "The background supervisor stopped unexpectedly. Please retry.",
+                    "error_code": "supervisor_exit",
+                    "finished_at": time.time(),
+                    "updated_at": time.time(),
+                })
+
+
 def _max_jobs() -> int:
     return max(1, int(os.environ.get(
         "MAX_CONCURRENT_ANALYSIS_JOBS",
@@ -62,12 +87,16 @@ def queue_background_job(
             "cancel_event": threading.Event(),
         }
 
-    threading.Thread(
-        target=target,
-        args=(job_id, payload),
+    worker = threading.Thread(
+        target=_run_background_target,
+        args=(job_id, payload, target),
         name=f"{kind}-{job_id[:8]}",
         daemon=True,
-    ).start()
+    )
+    with _JOBS_LOCK:
+        if job_id in _JOBS:
+            _JOBS[job_id]["supervisor_thread"] = worker
+    worker.start()
     return job_id
 
 
@@ -97,11 +126,25 @@ def get_background_job_response(job_id: str) -> dict[str, Any] | None:
             "status": job.get("status"),
             "phase": job.get("phase"),
             "percent": job.get("percent", 0),
+            "elapsed_seconds": round(
+                max(
+                    0.0,
+                    (job.get("finished_at") or time.time())
+                    - (job.get("started_at") or job.get("created_at", time.time())),
+                ),
+                1,
+            ),
         }
+        if job.get("algorithm"):
+            response["algorithm"] = job["algorithm"]
+        if job.get("details"):
+            response["details"] = job["details"]
         if job.get("status") == "completed":
             response["result"] = job.get("result")
         elif job.get("status") in {"failed", "cancelled"}:
             response["error"] = job.get("error")
+            if job.get("error_code"):
+                response["error_code"] = job["error_code"]
         return response
 
 
