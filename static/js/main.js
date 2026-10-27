@@ -4,6 +4,7 @@ import { runDoE, renderDoEResults, rebalanceDoEDOM, attachDeleteEvents } from '.
 import { abortBO, renderBOSetup, runBO, runBOEstimate, renderTrendPlot, renderParetoPlot, updateAcqSelectForMultiObj } from './modules/bo.js';
 import { renderSASetup, runSA, runEstimate, exportSAReport, abortSA } from './modules/sa.js';
 import { updateAllConstraintsDropdowns } from './modules/constraints.js';
+import { initSetupCSV } from './modules/setup_csv.js';
 
 // Bind utilities to window for inline calls
 window.rebalanceRemaining = rebalanceRemaining;
@@ -24,6 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     initModuleSwitcher();
     initFileUpload();
+    initSetupCSV();
     initTabs();
     initButtons();
     initSettingsListeners();

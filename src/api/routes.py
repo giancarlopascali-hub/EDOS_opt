@@ -1,10 +1,11 @@
 import os
+import json
 import sys
 import threading
 import time
 import torch
 import pandas as pd
-from flask import Blueprint, request, jsonify, render_template
+from flask import Blueprint, Response, request, jsonify, render_template
 
 # Import core modules
 from src.core.doe import generate_doe
@@ -41,6 +42,7 @@ from src.core.constraints import (
     validate_feature_ranges,
     validate_objective_constraints,
 )
+from src.core.setup_csv import parse_setup_csv, serialize_setup_csv
 
 # Create the blueprint
 api_bp = Blueprint('api', __name__)
@@ -420,6 +422,43 @@ def upload():
         return jsonify(clean_json_data(data))
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/setup_csv/export', methods=['POST'])
+def export_setup_csv():
+    """Download the currently displayed setup, separate from experiment data."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        module = payload.get('module')
+        csv_text = serialize_setup_csv(payload.get('setup') or {}, module)
+        filename = f'EDOS_{"DoE" if module == "doe" else module.upper()}_setup.csv'
+        return Response(csv_text, mimetype='text/csv', headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+        })
+    except (TypeError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@api_bp.route('/setup_csv/import', methods=['POST'])
+def import_setup_csv():
+    """Parse a setup file without persisting data or changing experiment rows."""
+    try:
+        file = request.files.get('file')
+        if file is None or not file.filename:
+            raise ValueError('Select a setup CSV file.')
+        raw = file.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise ValueError('The setup CSV must be smaller than 2 MB.')
+        try:
+            content = raw.decode('utf-8-sig')
+        except UnicodeDecodeError as exc:
+            raise ValueError('The setup CSV must use UTF-8 text.') from exc
+        columns = json.loads(request.form.get('columns', '[]'))
+        if not isinstance(columns, list) or any(not isinstance(col, str) for col in columns):
+            raise ValueError('Dataset column names are invalid.')
+        return jsonify(parse_setup_csv(content, request.form.get('module'), columns))
+    except (TypeError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
 
 
 @api_bp.route('/optimize', methods=['POST'])

@@ -1,4 +1,4 @@
-import { parseCategoricalChoices } from '../utils.js';
+import { escapeHtmlAttribute, parseCategoricalChoices } from '../utils.js';
 
 function escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -51,11 +51,11 @@ export function addNumericalConstraintRow(modulePrefix, equation = "") {
     tr.className = 'constraint-row';
     
     const numFeatures = getNumericalFeatures(modulePrefix);
-    const options = numFeatures.map(f => `<option value="${f}">${f}</option>`).join('');
+    const options = numFeatures.map(f => `<option value="${escapeHtmlAttribute(f)}">${escapeHtmlAttribute(f)}</option>`).join('');
     
     tr.innerHTML = `
         <td>
-            <input type="text" class="constraint-equation" value="${equation}" placeholder="e.g. A + B <= 10" style="width: 100%;" oninput="window.validateNumericalConstraintRow(this, '${modulePrefix}')">
+            <input type="text" class="constraint-equation" placeholder="e.g. A + B <= 10" style="width: 100%;" oninput="window.validateNumericalConstraintRow(this, '${modulePrefix}')">
             <span class="constraint-error" style="display: none; color: var(--danger-color); font-size: 0.8rem; margin-top: 3px;"></span>
         </td>
         <td>
@@ -69,6 +69,7 @@ export function addNumericalConstraintRow(modulePrefix, equation = "") {
         </td>
     `;
     list.appendChild(tr);
+    tr.querySelector('.constraint-equation').value = equation;
 }
 
 export function validateNumericalConstraintRow(inputEl, modulePrefix) {
@@ -153,11 +154,11 @@ function addConditionMarkup(container, modulePrefix, selectedFeature = "", selec
     conditionDiv.className = 'condition-item';
     conditionDiv.style.cssText = 'display: flex; align-items: center; gap: 4px; background: var(--bg-secondary); padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border-color);';
     
-    const featureOptions = catFeatures.map(f => `<option value="${f.name}" ${f.name === selectedFeature ? 'selected' : ''}>${f.name}</option>`).join('');
+    const featureOptions = catFeatures.map(f => `<option value="${escapeHtmlAttribute(f.name)}" ${f.name === selectedFeature ? 'selected' : ''}>${escapeHtmlAttribute(f.name)}</option>`).join('');
     
     const currentFeatureName = selectedFeature || catFeatures[0].name;
     const currentFeature = catFeatures.find(f => f.name === currentFeatureName);
-    const valOptions = currentFeature ? currentFeature.choices.map(c => `<option value="${c}" ${c === selectedValue ? 'selected' : ''}>${c}</option>`).join('') : '';
+    const valOptions = currentFeature ? currentFeature.choices.map(c => `<option value="${escapeHtmlAttribute(c)}" ${c === selectedValue ? 'selected' : ''}>${escapeHtmlAttribute(c)}</option>`).join('') : '';
     
     const andLabel = container.children.length > 0 ? '<span class="and-label" style="font-weight: bold; color: var(--accent-color); margin-right: 4px;">AND</span>' : '';
     
@@ -181,7 +182,7 @@ export function updateConditionValues(selectEl, modulePrefix) {
     const feat = catFeatures.find(f => f.name === featureName);
     const valSelect = selectEl.parentNode.querySelector('.condition-value');
     if (feat && valSelect) {
-        valSelect.innerHTML = feat.choices.map(c => `<option value="${c}">${c}</option>`).join('');
+        valSelect.innerHTML = feat.choices.map(c => `<option value="${escapeHtmlAttribute(c)}">${escapeHtmlAttribute(c)}</option>`).join('');
     }
 }
 
@@ -203,7 +204,7 @@ export function updateAllConstraintsDropdowns(modulePrefix) {
     helperSelects.forEach(select => {
         const currentVal = select.value;
         select.innerHTML = `<option value="">-- Insert Feature --</option>` + 
-            numFeatures.map(f => `<option value="${f}">${f}</option>`).join('');
+            numFeatures.map(f => `<option value="${escapeHtmlAttribute(f)}">${escapeHtmlAttribute(f)}</option>`).join('');
         select.value = currentVal;
     });
 
@@ -221,12 +222,12 @@ export function updateAllConstraintsDropdowns(modulePrefix) {
             const currentFeat = featSelect.value;
             const currentVal = valSelect.value;
             
-            featSelect.innerHTML = catFeatures.map(f => `<option value="${f.name}">${f.name}</option>`).join('');
+            featSelect.innerHTML = catFeatures.map(f => `<option value="${escapeHtmlAttribute(f.name)}">${escapeHtmlAttribute(f.name)}</option>`).join('');
             
             if (catFeatures.some(f => f.name === currentFeat)) {
                 featSelect.value = currentFeat;
                 const featObj = catFeatures.find(f => f.name === currentFeat);
-                valSelect.innerHTML = featObj.choices.map(c => `<option value="${c}">${c}</option>`).join('');
+                valSelect.innerHTML = featObj.choices.map(c => `<option value="${escapeHtmlAttribute(c)}">${escapeHtmlAttribute(c)}</option>`).join('');
                 if (featObj.choices.includes(currentVal)) {
                     valSelect.value = currentVal;
                 }

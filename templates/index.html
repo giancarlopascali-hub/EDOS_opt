@@ -78,6 +78,12 @@
         <div id="doe-module" class="module-view">
             <section class="card">
                 <h2>DoE Setup</h2>
+                <div class="setup-csv-actions" style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;margin-bottom:1rem;">
+                    <button id="doe-setup-download-btn" type="button" class="btn secondary small">Download setup CSV</button>
+                    <button id="doe-setup-upload-btn" type="button" class="btn secondary small">Upload setup CSV</button>
+                    <input id="doe-setup-upload-input" type="file" accept=".csv,text/csv" class="hidden">
+                    <span id="doe-setup-csv-status" class="text-secondary" role="status" aria-live="polite"></span>
+                </div>
                 <div class="setup-tabs">
                     <button class="tab-btn active" data-tab="doe-features-tab">Features</button>
                     <button class="tab-btn" data-tab="doe-objectives-tab">Objectives</button>
@@ -260,6 +266,12 @@
 
             <section class="card">
                 <h2>BO Setup</h2>
+                <div class="setup-csv-actions" style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;margin-bottom:1rem;">
+                    <button id="bo-setup-download-btn" type="button" class="btn secondary small">Download setup CSV</button>
+                    <button id="bo-setup-upload-btn" type="button" class="btn secondary small">Upload setup CSV</button>
+                    <input id="bo-setup-upload-input" type="file" accept=".csv,text/csv" class="hidden">
+                    <span id="bo-setup-csv-status" class="text-secondary" role="status" aria-live="polite"></span>
+                </div>
                 
                 <!-- Optimization Strategy Toggle -->
                 <div id="bo-strategy-container" style="margin-bottom: 1.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 1.25rem;">
@@ -468,6 +480,12 @@
         <div id="sa-module" class="module-view hidden">
             <section class="card">
                 <h2>SA Setup</h2>
+                <div class="setup-csv-actions" style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;margin-bottom:1rem;">
+                    <button id="sa-setup-download-btn" type="button" class="btn secondary small">Download setup CSV</button>
+                    <button id="sa-setup-upload-btn" type="button" class="btn secondary small">Upload setup CSV</button>
+                    <input id="sa-setup-upload-input" type="file" accept=".csv,text/csv" class="hidden">
+                    <span id="sa-setup-csv-status" class="text-secondary" role="status" aria-live="polite"></span>
+                </div>
                 <div class="setup-tabs">
                     <button class="tab-btn active" data-tab="sa-features-tab">Features</button>
                     <button class="tab-btn" data-tab="sa-objectives-tab">Objectives</button>

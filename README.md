@@ -24,6 +24,12 @@ verification and source-revision traceability.
 
 **EDOS** (Experimental Design and Optimization System) is a powerful platform designed for researchers to perform **Design of Experiments (DoE)**, **Bayesian Optimization (BO)** and **Statistical Analysis (SA)** with ease.
 
+## Setup CSV files
+
+Each DoE, BO, and SA Setup has its own **Download setup CSV** and **Upload setup CSV** controls. A download saves the current Features and Objectives controls, including applicable feature and objective constraints, in one module-specific file. The files share a versioned CSV schema, so a file can also be uploaded to another module; unsupported settings are reported and skipped.
+
+Uploading a setup CSV changes Setup controls only. It does not add, remove, or edit rows or columns in the experimental dataset. BO and SA require a loaded dataset with matching feature and objective column names. Configured ranges and categorical choices may extend beyond values already observed in that dataset.
+
 ## Key Features
 
 - **DoE Module**: Generate Box-Behnken, Central Composite, Fractional Factorial, mixed-level Full Factorial, Definitive Screening, LHS, and D-Optimal designs. Reduced budgets prioritize unique combinations; Exact counts add flagged repeats only after unique conditions are exhausted.
